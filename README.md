@@ -19,20 +19,20 @@
 ---
 
 > [!IMPORTANT]
-> **项目已停止维护（2026-10-21）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.0.0-pro`**。
 >
-> 原因有三：
-> 1. **上游已开始禁用反代**——WorkBuddy 对非官方客户端的识别与拦截正在收紧（通道校验、账号限制等），反代通道的稳定性与存活周期已不可控，继续做适配意义有限；
-> 2. **个人精力有限**——本项目本就是个人自用工具，无力长期跟进协议变化与风控对抗；
-> 3. **非法转卖泛滥**——发现大量批量注册小号、对外售卖额度、二次加壳 / 卡密分发的滥用行为，与本项目初衷完全相悖。
+> 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
+> 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
+> 2. **移除「官方补偿」前后端**：面板「官方补偿」卡片、`compensation` 状态查询/领取接口、签到排程内的补偿调用全部删除——网关不再调用 `claim-compensation`，打开面板不再逐号请求上游；
+> 3. **列表分页与筛选补齐**：账号池 / 运行日志 / 请求日志 / 积分历史 / 模型锁池 / 任务队列；
+> 4. **单账号「做任务」按钮 + 接口**：`POST /panel/api/accounts/{uid}/tasks/run`。
 >
-> 仓库保持现状可用（已合入的修复不会回退），但请自行评估风险：**上游随时可能彻底收紧导致不可用**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
+> 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
-> **维护方式披露**：本仓库近期的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（自动化编码 agent），合并与发布决策由维护者作出。请知悉后再使用或参与贡献。
+> **维护方式披露**：本仓库的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（自动化编码 agent），合并与发布决策由维护者作出。
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
-> 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
+> **血统**：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（原始项目，仓库已删除）→ [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)（上游最终版 `73a7560`，已停止维护）→ 本仓库 **workbuddy2api-pro**（Lei-rr 继续维护）。
+> 本仓库在上游最终版基础上保留并增强可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。Pro 版变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
 
@@ -57,7 +57,7 @@
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API Pro 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions` 服务。
 
 - 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
@@ -82,6 +82,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🚀 **Pro 增强** | 项目更名 `workbuddy2api-pro`；移除官方补偿前后端；账号池与各列表**分页 + 筛选**；账号行「**做任务**」一键按钮 + `tasks/run` 接口；详见 [CHANGELOG.md](CHANGELOG.md) |
 
 ## 🎯 成长任务一键完成（17/18）
 
@@ -130,6 +131,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 - **执行队列**：把待办按账号排队执行——账号内串行（与单任务/一键完成共用互斥锁），账号间可选并发（1-3）；执行进度实时更新到每个条目
 - **开学季独立状态卡**：每账号 5 任务（分享/桌面/对话×3/专家/学生认证）的状态矩阵 + 剩余抽奖次数，一键触发全账号闭环
 - **日志分频道**：运行日志按「任务 / 对话 / 系统」三个频道筛选——对话流量再大，任务结果也不会被冲掉；日志条目带频道徽标与时间
+- **单账号「做任务」（Pro）**：账号池每行也有「做任务」按钮，直接对该账号执行全部可自动任务（accept → 执行 → 回读 → 自动领奖），返回逐项结果与汇总；等价接口 `POST /panel/api/accounts/{uid}/tasks/run`（企业版账号自动跳过）
 
 <details>
 <summary><b>🎒 开学季活动（5/5 全自动）</b>——活动期至 2026-09-24，已结束；逆向成果存档，点击展开</summary>
@@ -174,7 +176,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
-| **限时补偿可观测（issue #189）** | 官方补偿（例：「模型服务异常额外补偿 500 积分」）在账号侧可见，网关改为**先查 `compensation-status` 再决定是否领**：面板「官方补偿」卡片列出待领账号 + 领取截止倒计时（≤48h 标红）+ 逐号/全量领取按钮；**查询失败的账号在卡片上显形为红色行，不会与「没有补偿」混为一谈**；每日签到排程同步走「查→领」，**状态查询失败与领取失败一律显式告警**（旧实现把「没有 / 已领 / 领取失败」三态压成同一形态，带截止日的补偿会静默过期） |
+| **列表分页与筛选（Pro）** | 账号池（搜索 / 状态 / 版本 + 50/100/200/全部）、运行日志（频道 + 关键词 + 分页）、请求日志（关键词 / 结果 / 时间范围 + 分页）、积分历史（账号筛选 + 分页）、模型锁池（搜索 / 状态 / 地区 + 分页）、任务中心队列（状态 / 关键词 + 分页/分批渲染）——1000+ 账号下面板不再一次渲染全表 |
+| **单账号「做任务」（Pro）** | 账号池每行新增「做任务」按钮：一键对该账号执行全部可自动任务（接受 → 执行 → 回读 → 自动领奖），返回逐项结果与汇总；接口 `POST /panel/api/accounts/{uid}/tasks/run`；企业版账号自动跳过 |
+| **移除官方补偿（Pro）** | 上游最终版新增的「官方补偿」卡片、`compensation` 状态查询与领取接口、签到排程内的补偿调用**全部删除**：网关不再调用 `claim-compensation`，打开面板不再逐号请求上游（旧版在 1000+ 账号池下会显著拖慢首屏并触发上游风控） |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
@@ -208,7 +212,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 flowchart LR
     Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
 
-    subgraph GWI["WorkBuddy2API 网关 :7863"]
+    subgraph GWI["WorkBuddy2API Pro 网关 :7863"]
         H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
         H --> S
         P["账号池\n快过期加权 · 成本分层 · 熔断 · 冷却 · 租约"] --> U
@@ -589,11 +593,10 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 端点 | 企业版响应 |
 |---|---|
 | `POST /v2/billing/meter/daily-checkin`（签到） | `400 code 10001`「企业账号不支持该操作」 |
-| `POST /billing/meter/claim-gift` / `claim-compensation`（夜猫子领奖） | `400 code 10001` 同上 |
-| `POST /billing/meter/compensation-status`（补偿状态查询） | 网关**在门控处一并跳过**（与 claim-compensation 同属无补偿体系的调用） |
+| `POST /billing/meter/claim-gift`（夜猫子领奖） | `400 code 10001` 同上 |
 | `GET /activity/growth/*`（连登 / 旅行 / 热力图 / 抽奖）与 `GET /v2/activity/growth/tasks`（成长任务） | `403`「growth system is only available for personal users」 |
 
-因此网关对企业号**不发起**这五类调用（签到 / 活跃上报 / 猫猫旅行 / 夜猫子 / 连登管家），面板也不渲染「签到」「任务」按钮（只留「额度」）。判定（`auth.Auth.IsEnterprise()`）与既有 `IsGlobal()`（D4 门控）在**同一批引用处并列书写**，`upstream` 侧零改动。
+因此网关对企业号**不发起**这五类调用（签到 / 活跃上报 / 猫猫旅行 / 夜猫子 / 连登管家），面板也不渲染「签到」「任务」「做任务」按钮（只留「额度」）。判定（`auth.Auth.IsEnterprise()`）与既有 `IsGlobal()`（D4 门控）在**同一批引用处并列书写**，`upstream` 侧零改动。
 
 **企业版照常的能力**：选号派发、保活（token 刷新仍必需——不刷新同样会过期失效）、额度查询。
 
@@ -726,13 +729,13 @@ http://127.0.0.1:7863/panel/
 
 | 视图 | 功能 |
 |---|---|
-| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
+| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / **做任务** / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」+「**重新扫描**」（热对齐 `auths/` 目录）；**搜索 / 状态 / 版本筛选 + 分页（50/100/200/全部）**；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
-| **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
+| **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围，以及**客户端分页**（50/100/200/全部）；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，支持**关键词筛选 + 分页**、可开关自动滚动；**积分历史**（每次真实查到余额与上次比对，变动即留痕）支持**账号筛选 + 分页** |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
@@ -755,6 +758,22 @@ http://127.0.0.1:7863/panel/
 - 用量侧由 `usage.Window` 统一三种窗口口径，并在响应里回显实际生效区间（`window_from` / `window_to`），总览右上角因此会显示形如 `9-30 00:00 → 9-30 15:02 · 14 个分桶 · 数据自 …` 的口径说明；
 - 请求记录的时间过滤在**归档侧**完成（`reqlog.Filter.From/To`，而不是筛已拉取的条目），所以区间落在更早时段时也能取到记录。
 
+### 分页与筛选（Pro）
+
+1000+ 账号池下，面板所有长列表默认只渲染当前页；筛选与页码在 5s 轮询刷新后保持不变（轮询只换数据，不重置交互状态）：
+
+| 列表 | 筛选 | 分页 |
+|---|---|---|
+| 账号池 | 关键词（昵称 / UID）、状态（可用 / 冷却 / 暂停 / 禁用）、版本（国内 / 国际 / 企业） | 50 / 100 / 200 / 全部 |
+| 积分到期 | — | 50 / 100 / 200 / 全部（独立分页，不影响账号池） |
+| 运行日志 | 频道（任务 / 对话 / 系统）+ 关键词 | 50 / 100 / 200 / 全部 |
+| 请求日志 | 关键词（IP / UA / 模型 / 账号 / 请求 ID，空格分词 AND）、结果、时间范围 | 50 / 100 / 200 / 全部（先筛选后分页） |
+| 积分历史 | 账号 | 50 / 100 / 200 / 全部 |
+| 模型锁池 | 模型关键词、状态、地区 | 分页 |
+| 任务中心队列 | 状态、账号关键词 | 分页 / 分批渲染 |
+
+> 本版分页为**纯前端**：`overview` / `request_logs` 等接口协议未改，5s 轮询仍按既有口径取数。服务端分页、增量推送（SSE/ETag）等列入 [UPGRADE_PROPOSALS.md](UPGRADE_PROPOSALS.md) 的后续建议。
+
 ### 调用来源（客户端 IP / User-Agent）
 
 请求记录表会显示每次调用的来源：IP 取 `X-Forwarded-For` 首段 → `X-Real-IP` → 回落 TCP 对端（直连部署下这是唯一线索）；User-Agent 截断 200 字节入库，stdout 流水行同时追加压缩后的客户端标签（`src=203.0.113.7 ua="Chrome/120.0.0.0"`，浏览器 UA 不会整段铺开）。
@@ -775,12 +794,13 @@ http://127.0.0.1:7863/panel/
 |---|---|
 | 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
-| 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
-| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
+| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
+
+> **「做任务」接口说明**：`POST accounts/{uid}/tasks/run` 无请求体、**同步**返回（全部可自动任务串行执行，可能耗时数分钟）。状态码：`200`（`ok:true` + `results`/`summary`）；未知 uid `404`；企业版 / 企业切换会话 / 无凭证 → `200 + ok:false + message`（**不发起任何上游请求**）；同账号已有任务动作在跑 `409`；执行超时 `504`（后台继续跑、锁自动释放）。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
@@ -830,7 +850,6 @@ http://127.0.0.1:7863/panel/
 | `plugin/auth/token/refresh` | POST | token 刷新 |
 | `billing/meter/daily-checkin` | POST | 每日签到 |
 | `billing/meter/get-user-resource` | POST | 余额查询 |
-| `billing/meter/compensation-status` | POST | **补偿活动状态**（`active` / `claimed` / `credit_num` / `validity_period` / `end_time`）；`active=false` 是「当前无活动」的正常 200，不算错误 |
 | `report` | POST | 对话活跃上报（`chat_request_send` 事件数组，必须含 `userId`；点亮连登 / 解锁领养） |
 | `plugin/auth/state?platform=CLI` | POST | OAuth 取授权 URL |
 | `plugin/auth/token?state=` | GET | OAuth 轮询取 token |
@@ -1035,6 +1054,12 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:21` |
 | 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:146` |
 
+## 维护与后续优化（Pro）
+
+- **[MAINTAINERS.md](MAINTAINERS.md)**：基线 / 关键版本决策 / 部署链路（含从旧 fork 迁移步骤）/ 实测基线 / 已知坑 / 跟随上游与发布流程——接手维护先读这页。
+- **[CHANGELOG.md](CHANGELOG.md)**：v2.0.0-pro 变更清单 + 上游最终版 60 个提交吸收内容（防止误以为“只删了补偿”）。
+- **[UPGRADE_PROPOSALS.md](UPGRADE_PROPOSALS.md)**：后续优化建议（性能 / 安全 / 可观测 / 账号运维 / 可靠性 / 工程质量 / 体验），按 P0/P1/P2 分级并注明工作量，供按优先级采纳。
+
 ## 免责声明
 
 本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
@@ -1044,7 +1069,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 本项目采用 [MIT License](LICENSE) 开源协议。
 
 - 允许任意使用、复制、修改、合并、发布、分发、再授权及销售
-- 再分发（源码或二进制形式）时，请保留原仓库的 MIT 版权声明与许可声明（如在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`）
+- 再分发（源码或二进制形式）时，请保留原仓库的 MIT 版权声明与许可声明：原始出处 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 与上游最终版 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（见 [LICENSE](LICENSE)）
 - 本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利；使用者仍需自行遵守上游服务条款
 
 ### 按地区配置账号池调度
