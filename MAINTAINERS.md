@@ -142,6 +142,9 @@ services:
 - v2.4.0 会话仅内存（重启重登）；Cookie 会话无 CSRF token（SameSite=Lax + JSON API，取舍已文档化）；多实例部署各自维护会话。
 - v2.4.0 SSE 为进程内推送（单实例语义）：多实例/反代需注意 `X-Accel-Buffering: no` 与空闲超时；慢客户端断开会由重连 snapshot 自愈。
 - v2.4.0 角色门禁两处加严：`GET /panel/api/config` 与 `POST accounts/rescan` 仅 admin（前者回显密钥/口令哈希，后者等价危险操作）；新增写端点记得同步 `roleAllowed` 矩阵与 rbac_test。
+- v2.4.0 SSE 心跳固定 15s：反代/网关的空闲超时须 >15s（否则会被断开后自动重连，功能不受影响但会反复握手）；首帧即 snapshot，断线重连以新 snapshot 自愈（无 Last-Event-ID 回放）。
+- v2.4.0 authcrypt **只覆盖 auths/**：`state.json` / `account-meta.json` / 审计/任务历史仍是明文；主密钥丢失 = 加密凭证不可恢复，必须与 auths 分开离线备份。
+- v2.4.0 面板用户密码：生产建议用 `password_hash`（`sha256:<salt>:<hex>`），配置里的 `password` 明文仅便捷用法（config.json 需 0600）；登录失败与 API 鉴权共用 20/min/IP 限速桶。
 - v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。
 - v2.3.1 `meta/tags` 展示拼写取 uid 升序首个出现的写法（如 VIP），匹配本身大小写不敏感；如需统一小写展示可后续归一。
 - v2.3.1 `schedule.checkin_concurrency` 热更新只影响**下一轮**签到（在途 worker 不打断）；`notify.channel` 未知值仅 WARN 关闭通知，而 telegram 缺 chat_id 是启动 fail-fast（口径差异，见 config.normalize）。

@@ -49,7 +49,7 @@
 
 - 新增/扩展测试：SSE 12 + RBAC 13 测试函数 + auth 加密 16 + authcrypt + 前端 4 组；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
 - Lead E2E 冒烟 29/29：加密启动/缺密钥 fail-fast/authcrypt 往返、多用户 login 三角色矩阵/403/logout/限速、SSE snapshot、单密钥兼容、version/frontend 标记
-- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v240.md`）
+- QA 独立验证（HEAD `c7be4bd`）：**287 项检查全 PASS，P0=0 / P1=0**——verify-pro 28/28、v2.0.1/v2.1/v2.2/v2.3/v2.3.1 回归 28/42/25/24/28 全 PASS、新增 verify-v240 35/35（SSE headers/gzip 绕过/snapshot 字段/jobs 增量/心跳/双客户端/401/disabled 404；RBAC 单密钥零破坏+三角色矩阵+logout 双通道+失败 429+audit；加密 authcrypt 五场景+缺/错密钥 fail-fast+密文加载）、单测 auth 13/panel 30/前端 73 PASS、前端 harness 53/53（0 warning）、真实浏览器 11/11、320px/375px 各 13/13；详见 `D:\dsh\tmp\verify-final-v240.md`
 
 ---
 
