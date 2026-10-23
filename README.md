@@ -19,13 +19,14 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.0.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.0.1-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
 > 2. **移除「官方补偿」前后端**：面板「官方补偿」卡片、`compensation` 状态查询/领取接口、签到排程内的补偿调用全部删除——网关不再调用 `claim-compensation`，打开面板不再逐号请求上游；
 > 3. **列表分页与筛选补齐**：账号池 / 运行日志 / 请求日志 / 积分历史 / 模型锁池 / 任务队列；
-> 4. **单账号「做任务」按钮 + 接口**：`POST /panel/api/accounts/{uid}/tasks/run`。
+> 4. **单账号「做任务」按钮 + 接口**：`POST /panel/api/accounts/{uid}/tasks/run`；
+> 5. **v2.0.1 P0 优化**：面板 gzip / 静态缓存 / 轮询治理、面板密钥与网关密钥分离、鉴权失败限速、余额刷新有界并发与启动首刷保护、批量任务单飞（409）、调度补跑窗口。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -386,6 +387,9 @@ curl -s http://localhost:7863/v1/search/messages \
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
+| `panel.api_key` | 空 | **面板专用密钥**（v2.0.1）：空 = 回落 `api_key`（面板与网关共用）；设置后仅面板使用此 key，`/v1/*` 仍只认 `api_key`。改动需重启 |
+| `panel.poll_interval_sec` | `5` | 面板轮询间隔（秒，2–60，热生效）；前端按约 ±20% 抖动，页面隐藏时暂停 |
+| `security.allow_anonymous` | `false` | **匿名访问逃生门**（v2.0.1）：`false` 时「非回环监听 + api_key/panel.api_key 均为空」会**拒绝启动**；`true` = 明确接受无鉴权 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
@@ -402,6 +406,10 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `schedule.catch_up_minutes` | `120` | **调度补跑窗口**（v2.0.1）：批次跨过后续时点 / 重启错过时点后，若窗口内存在今天错过的计划时点且该族今天未成功执行 → 自动补跑（每族每天一次）；`0` = 关闭 |
+| `schedule.balance_refresh_concurrency` | `8` | 全量余额刷新并发上限（v2.0.1，1–32，热生效）；替代旧的无上限 goroutine |
+| `schedule.balance_refresh_startup_delay` | `30s` | 启动首次余额刷新延迟（v2.0.1，Go duration，`0` = 不延迟）；改动需重启 |
+| `schedule.balance_refresh_startup_force` | `false` | 账号数 > 200 时默认**跳过启动首刷**（避免 1146 并发打上游）；`true` 强制刷。改动需重启 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -446,7 +454,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
 
 ## 核心行为语义
 
@@ -800,6 +808,10 @@ http://127.0.0.1:7863/panel/
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
+> **批量端点语义（v2.0.1）**：`checkin_all` / `travel_all` / `activity_all` / `keepalive_all` / `balance_all` 同类任务**单飞**——空闲时立即返回 `{ok:true,started:true}`（`balance_all` 已异步化，后台有界并发执行，不再返回 `accounts`），同类正在执行时返回 `409 {"ok":false,"error":"…正在执行中…"}`。
+
+> **传输与缓存（v2.0.1）**：面板响应在客户端支持时自动 gzip（`Accept-Encoding: gzip` + `Vary`；`/v1/*` 与 SSE 不受影响）；压缩阈值为 body >1KB，因此小响应（空池 overview、401/429 等）不压缩属预期，大池 overview 与 `app.js` 等静态资源才明显受益（实测 `app.js` 222 KB → 74 KB wire）。`app.js`/`mobile.js`/`mobile.css` 带 SHA-256 ETag 与 `Cache-Control`（命中 304），`index.html` 弱 ETag + `no-cache`；`overview` 返回 `poll_interval_sec` 供前端轮询节奏使用。
+
 > **「做任务」接口说明**：`POST accounts/{uid}/tasks/run` 无请求体、**同步**返回（全部可自动任务串行执行，可能耗时数分钟）。状态码：`200`（`ok:true` + `results`/`summary`）；未知 uid `404`；企业版 / 企业切换会话 / 无凭证 → `200 + ok:false + message`（**不发起任何上游请求**）；同账号已有任务动作在跑 `409`；执行超时 `504`（后台继续跑、锁自动释放）。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
@@ -963,6 +975,10 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
+- **面板密钥分离（v2.0.1）**：建议设置 `panel.api_key`，把「后台管理」与「API 调用」两把钥匙分开——下游客户端只拿 `api_key` 时无法调用 `/panel/api/*` 的删号 / 改配置等管理接口
+- **空密钥阻断（v2.0.1）**：`listen` 为非回环地址且 `api_key` / `panel.api_key` 全空 → 启动直接失败（`security.allow_anonymous: true` 可显式放行）；保存配置也不允许把 `api_key` 清空
+- **登录失败限速（v2.0.1）**：面板鉴权失败按来源 IP 限速（20 次/分钟 → `429` + `Retry-After`），成功一次即清桶；静态页面不受影响。实现为**进程内 best-effort**（重启清零；`X-Forwarded-For` 可被伪造用于分散计数），应部署在可信反代之后
+- **面板密钥改动需重启（v2.0.1）**：`panel.api_key` 属装配期字段，面板保存后会在 `restart_required` 中提示；重启后面板需用新密钥登录（旧浏览器保存的是网关 key 时会 401 并提示重新输入）
 
 ### 3. 发布来源与合规边界
 
@@ -1013,6 +1029,16 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 ```
 
 报错信息里自带这条指引；compose 的 `user` 已参数化为 `${PUID:-10001}:${PGID:-10001}`。
+
+### 升级 v2.0.1 后启动失败：`startup security check: listen=... 绑定非回环地址，但 api_key 与 panel.api_key 均为空`？
+
+v2.0.1 起，非回环监听 + 双空密钥会被**拒绝启动**（防止面板/网关裸奔）。任选一种修法：
+
+1. `config.json` 设置 `api_key`（随机值可用 `openssl rand -hex 24`）与建议分离的 `panel.api_key`；
+2. 仅本机使用：`listen` 改为 `127.0.0.1:7863`；
+3. 明确接受无鉴权（可信内网）：`security.allow_anonymous` 设为 `true`。
+
+> 删除 `config.json` 让程序重新生成时，会自动写入随机 `api_key`。
 
 ### 账号被 Disable 后如何恢复？
 

@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.0.0-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.0.1-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -46,13 +46,14 @@ node --check internal/panel/mobile.js
 
 质量门禁：以上全部通过才算可提交。
 
-## 版本关键决策（v2.0.0-pro）
+## 版本关键决策
 
 1. **更名**：Go module `github.com/lei-rr/workbuddy2api-pro`；镜像 `ghcr.io/lei-rr/workbuddy2api-pro`；容器名 `workbuddy2api-pro`；`/healthz` 的 `service` / `X-Service` 为 `workbuddy2api-pro`；面板标题 `WorkBuddy2API Pro`；版本 `2.0.0-pro`；发布产物 `wb2api-pro-v*`。
 2. **官方补偿整个删除**（用户明确要求，含后台静默领取）：网关不再调用 `claim-compensation`。不要重新引入（`ClaimGift` 新手礼包属另一功能，保留）。
 3. **分页/筛选为纯前端**：`overview` / `request_logs` 等接口协议未改，5s 轮询仍全量取数；服务端分页/增量推送列入 `UPGRADE_PROPOSALS.md`。
 4. **单账号「做任务」**：`POST /panel/api/accounts/{uid}/tasks/run` = 复用 `auto_all` 执行器，返回 `results + summary{total,done,skipped,error,claimed}`。
 5. **保留原 fork 定制**：账号池筛选/分页、三 tab（账号池/模型锁池/积分到期）、到期独立分页、单号积分弹窗、重新扫描按钮、`packages?uid=` 单号必填。
+6. **v2.0.1 P0 优化**（2026-10-24）：面板 gzip/ETag/轮询治理；`panel.api_key` 与网关 key 分离 + 空密钥非回环阻断 + 鉴权失败限速；余额刷新有界并发（默认 8）+ 启动首刷保护（>200 号默认跳过）；5 个 `*_all` 单飞（409）且 `balance_all` 异步；调度补跑窗口 `schedule.catch_up_minutes`（默认 120）。
 
 ## 部署链路
 
@@ -60,6 +61,7 @@ node --check internal/panel/mobile.js
 - 容器名：`workbuddy2api-pro`；端口默认 `7863`（对外常见映射如 `7800:7863`）
 - 运行数据（**不在仓库里，升级时必须保留**）：`auths/`、`data/`、`config.json`
 - 从旧 `workbuddy2api-panel` 迁移：停旧容器 → 部署目录改 `image:` / `container_name:` → `docker pull ghcr.io/lei-rr/workbuddy2api-pro:latest` → `docker compose up -d`。配置 schema 未变，无需改 `config.json`；宿主健康探测若按旧 `service == "workbuddy2api"` 判据需同步改名。
+- **v2.0.1 升级注意**：① 若 `listen` 为非回环（如 `:7863`）且 `api_key` / `panel.api_key` 均为空，新版本会**拒绝启动**——先配置 key（或 `security.allow_anonymous: true`，或改回环监听）；② 建议设置 `panel.api_key` 把面板密钥与网关 API key 分开；③ `balance_all` 已异步化、批量端点会返回 409，外部脚本/监控需适配；④ 新增 7 个配置键（见 `config.example.json` 与 README「字段速查」）。
 
 参考 `docker-compose.yml`（仓库内已改名）：
 
@@ -96,13 +98,16 @@ services:
 
 ## 已知注意点 / 坑
 
-- 页面顶部「刷新」按钮 = `balance_all` → 对全池**无并发上限**打上游（1000+ 并发请求）。后台余额刷新 `balance_refresh_enabled=false` 时手动点它反而更激进，**非必要不点**。
+- 页面顶部「刷新」按钮 = `balance_all`（v2.0.1 起**异步 + 有界并发**，默认 8，可配 `schedule.balance_refresh_concurrency`）：大池下一次点击仍会向每个账号发起一次余额 RPC（约 1146 个，受并发上限约束），非必要不点；重复点击会 409。启动首刷延迟 30s，账号数 > 200 时默认跳过（`schedule.balance_refresh_startup_force` 可强制）。
 - 签到是**串行**执行，1146 号一轮约 1 小时；新增账号较多时注意排程窗口。
 - `state.json` 会落后于池（官方设计：新增账号不置 dirty，只有剔除才落盘）；重启后按零值重建，不影响使用。
 - `auths/` 若出现属主混杂（如部分 `root:root`，容器以 10001 运行），可能 token 刷新失败：`chown -R 10001:10001 auths`。
 - 面板只有单 `api_key` 鉴权，**公网部署必须置于 HTTPS 反代之后**并加访问限流；`auths/` 内是明文 access/refresh token，勿泄露。
 - 单号积分构成弹窗为按需 1 次上游请求；整池全量查询入口已刻意封闭，不要恢复成页面自动全量查询（1000+ 账号时会触发风控）。
 - 前端分页依赖 `overview`/`request_logs` 全量返回；若将来改服务端分页，需同步改 `renderAccounts`/`renderRequestTable` 等纯前端切片逻辑与测试。
+- v2.0.1 面板 gzip 有 **1KB 阈值**：空池 overview / 401 / 429 等小响应不压缩属预期；大池 overview 与静态资源才受益（实测 app.js 222 KB → 74 KB wire）。
+- v2.0.1 鉴权失败限速是**进程内 best-effort**（重启清零；XFF 可伪造分散计数），依赖可信反代；如需强防护需外置 WAF/反代限流。
+- `panel.api_key` 改动**需重启**（已列入 `restart_required`）；`panel.poll_interval_sec`/`catch_up_minutes`/`balance_refresh_concurrency` 热生效。
 
 ## 跟随上游（如果上游/fork 恢复更新）
 
@@ -129,7 +134,7 @@ git merge upstream/main
 ```bash
 git clone https://github.com/Lei-rr/workbuddy2api-pro.git
 cd workbuddy2api-pro
-git log --oneline -3     # 确认 HEAD 与本文档一致（v2.0.0-pro）
+git log --oneline -3     # 确认 HEAD 与本文档一致（v2.0.1-pro 起）
 ```
 
 部署目录只需 `docker-compose.yml`（或 `docker run` 一条命令）+ `auths/`、`data/`、`config.json` 运行数据。

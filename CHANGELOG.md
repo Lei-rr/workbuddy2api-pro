@@ -8,6 +8,52 @@
 
 ---
 
+## v2.0.1-pro（2026-10-24）
+
+P0 优化批次（对应 `UPGRADE_PROPOSALS.md` 的 #2 / #4 / #10 子项 / #11 子项）。
+
+### ⚠️ 升级注意（行为变更）
+
+- **非回环监听 + 空密钥将拒绝启动**：`listen` 不是 127.0.0.1/::1/localhost 且 `api_key`、`panel.api_key` 都为空 → 启动失败（`security.allow_anonymous: true` 可显式放行）。Docker / 公网部署请务必配置 key；本机回环调试不受影响。
+- **`balance_all` 改为异步**：立即返回 `{ok:true,started:true}`，不再同步等待全池刷新完成，也不再返回 `accounts`；外部脚本需要全量账号请改拉 `GET /panel/api/overview`。
+- **批量端点单飞**：`checkin_all` / `travel_all` / `activity_all` / `keepalive_all` / `balance_all` 同类正在执行时返回 `409`（旧版会并发叠跑两轮）。
+- 建议分离「面板密钥」与「网关密钥」：设置 `panel.api_key` 后，下游 API 客户端只拿 `api_key` 无法调用面板管理接口；不设置时保持旧行为（回落共用）。
+
+### #2 面板性能（P0）
+
+- 面板响应 **gzip**（JSON/HTML/JS/CSS，body >1KB；`Vary: Accept-Encoding`；`/v1/*` 与 SSE 不受影响）——overview 689 KB 的传输量预计降一个数量级
+- 静态资源 **SHA-256 ETag + Cache-Control**：`app.js`/`mobile.js`/`mobile.css` 强 ETag 可 304；`index.html` 弱 ETag + `no-cache` 保证改版即更新
+- 新增 `X-Robots-Tag: noindex`
+- 压缩阈值 1KB：小响应（空池 overview、401/429）有意不压缩；大池 overview 与 app.js 等静态资源才明显受益（实测 app.js 222 KB → 74 KB wire）
+- 前端**轮询治理**：间隔由 `overview.poll_interval_sec` 下发（默认 5s，2–60，可配置）、页面隐藏暂停 / 恢复立即刷新、失败退避 5→10→30→60s、±20% 抖动、401 停止自动重试且密钥框只自动弹一次
+
+### #4 安全（P0）
+
+- `panel.api_key` 与网关 `api_key` **分离**（空 = 回落共用；改动需重启；面板配置页可编辑）
+- **空密钥非回环启动阻断** + 保存配置拒绝清空 `api_key`（`security.allow_anonymous` 逃生门）
+- 面板鉴权失败按 IP **限速**：20 次/分钟 → `429 + Retry-After`（成功一次清桶，内存 LRU 1 万 IP）
+- 面板配置页新增 7 个字段：`panel.api_key` / `panel.poll_interval_sec` / `security.allow_anonymous` / `schedule.catch_up_minutes` / `schedule.balance_refresh_concurrency` / `schedule.balance_refresh_startup_delay` / `schedule.balance_refresh_startup_force`
+
+### #10 子项：批量操作闸门（P0）
+
+- `RunBalanceRefreshNow` 改为**有界并发**（`schedule.balance_refresh_concurrency`，默认 8，1–32，热生效），彻底移除 1146 无上限 goroutine
+- **启动首刷保护**：延迟 `schedule.balance_refresh_startup_delay`（默认 30s）后执行；账号数 > 200 且 `balance_refresh_startup_force=false` 时跳过启动首刷（周期刷新照常）
+- 5 个 `*_all` 批量端点**同类单飞**（手动/定时共用 gate）：执行中重复触发 → 409
+- `balance_all` **异步化**（立即返回，后台跑）
+
+### #11 子项：调度补跑（P0）
+
+- 新增 `schedule.catch_up_minutes`（默认 120，0=关）：批次跨过后续时点 / 重启错过时点后，若窗口内存在今天错过的计划时点且该族今天未成功执行 → 自动补跑，只补一次/天/族（修复「签到批次跑 1 小时吞掉 10:00 活跃 / 22:00 保活 / 23:00 夜猫子」）
+- 手动/定时任务共用单飞 gate，不再叠加两轮全池任务
+- `RunCheckin` / `RunTravel` 内部等待改为 ctx 感知（为优雅停机铺垫）
+
+### 测试与验证
+
+- 新增测试函数 54 个（后端 A 28 + 后端 B 18 + 前端 8）；`go build` / `go vet` / `go test -count=1 ./...` 全绿（20 包）
+- QA 独立验证（HEAD `55963fb`）：**107 项检查全 PASS，P0=0 / P1=0**——verify-pro.ps1 28/28、verify-v201.ps1 28/28（gzip/ETag/304、安全三件套、429 限速、异步 balance_all、改名/补偿残留 0）、独立前端 harness 30/30（0 warning）、真实浏览器 10/10、真实 320px/375px 各 11/11；详见 `D:\dsh\tmp\verify-final-v201.md`
+
+---
+
 ## v2.0.0-pro（2026-10-24）
 
 首个 Pro 版本。基数 = 上游最终版 `73a7560` + 原 fork 面板定制（合并提交 `f9e654c`）。
