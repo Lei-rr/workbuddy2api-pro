@@ -1,23 +1,28 @@
-// accountmeta.go 账号备注/标签的服务端持久化（v2.3.0 #12）。
+// accountmeta.go 账号备注/标签的服务端持久化（v2.3.0 #12；v2.3.1 增加标签索引/筛选）。
 //
 // 背景：备注此前只存在浏览器 localStorage（键还是 uid 前 8 位，跨浏览器/清缓存即丢、
 // 前缀还有极低概率碰撞）。本文件把「备注 + 标签」提升为服务端权威数据：
 //   - 落盘 <data>/account-meta.json（与 state 文件同目录；0600、tmp+rename 原子写、
 //     互斥串行、首次使用时懒加载；文件缺失=空，损坏=隔离 .corrupt-* 后空启动）；
 //   - 键是**完整 uid**（与 auths/、state.json 同源，不参与选号/计费/鉴权）；
-//   - 限制：note ≤500 字符、tags ≤10 个且每个 ≤32 字符（按 rune 计），去空白/去重。
+//   - 限制：note ≤500 字符、tags ≤10 个且每个 ≤32 字符（按 rune 计），去空白/去重；
+//   - 内存标签反向索引（小写标签 → uid 集合，加载/变更后整体重建）：供
+//     accounts?tag= 服务端筛选与 GET /panel/api/meta/tags 计数复用，筛选不读盘。
 //
-// 设计约束（不改 panel.go）：
+// 设计约束（不改 panel.go 的 Panel struct）：
 //   - Panel 已有 dataDir 字段（v2.2.0 审计/任务历史同源），本文件直接复用；
 //   - 存储对象用包级注册表按 dataDir 懒加载单例（多个 Panel 共享同一数据目录时天然
 //     共享内存状态；不同目录/测试临时目录互不干扰），因此无需给 Panel struct 加字段。
 //
-// 接口（路由由 W2-A 在 panel.go routes() 注册，本文件只提供 handler/方法）：
+// 接口（路由在 panel.go routes() 注册，本文件只提供 handler/方法）：
 //   - p.accountMetaList(w,r)           GET    /panel/api/meta
 //   - p.accountMetaGet(w,r)            GET    /panel/api/accounts/{uid}/meta
 //   - p.accountMetaPut(w,r)            PUT    /panel/api/accounts/{uid}/meta
 //   - p.accountMetaDelete(w,r)         DELETE /panel/api/accounts/{uid}/meta（便利 handler）
+//   - p.accountMetaTags(w,r)           GET    /panel/api/meta/tags（v2.3.1 标签索引）
 //   - p.accountMetaForget(uid)         账号移除后清理由 accountRemove 调用（无 HTTP 路由）
+//   - p.accountMetaMatchesTag / accountMetaUIDsForTag / accountMetaTagCounts
+//     panel 侧 accounts?tag= 筛选与计数用的只读查询 helper。
 package panel
 
 import (
@@ -28,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +90,11 @@ type accountMetaStore struct {
 	path     string
 	loaded   bool
 	accounts map[string]accountMetaRecord // 懒加载后的内存权威副本
+	// 标签反向索引（v2.3.1 #12 扩展）：小写标签 → uid 集合；变更/加载后整体重建。
+	// 供 accounts?tag= 服务端筛选与 /panel/api/meta/tags 计数复用，避免每次筛全量读盘。
+	tagIndex map[string]map[string]struct{}
+	// tagDisplay 小写标签 → 展示用原始拼写（稳定：按 uid 排序后首个出现的拼写）。
+	tagDisplay map[string]string
 }
 
 // 包级注册表：dataDir → *accountMetaStore。键为空（未装配数据目录）时返回 nil。
@@ -122,6 +133,8 @@ func (s *accountMetaStore) loadLocked() {
 	}
 	s.loaded = true
 	s.accounts = map[string]accountMetaRecord{}
+	s.tagIndex = map[string]map[string]struct{}{}
+	s.tagDisplay = map[string]string{}
 
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
@@ -146,6 +159,38 @@ func (s *accountMetaStore) loadLocked() {
 	for uid, rec := range s.accounts {
 		if !validUID(uid) || (rec.Note == "" && len(rec.Tags) == 0) {
 			delete(s.accounts, uid)
+		}
+	}
+	s.rebuildTagIndexLocked()
+}
+
+// rebuildTagIndexLocked 从内存 records 重建标签反向索引（调用方须持 s.mu）。
+// 标签匹配统一按「TrimSpace + 小写」归一（大小写不敏感）；展示拼写取 uid 升序遍历下
+// 首个出现值——保证同一份数据多次查询输出稳定（map 遍历随机，不能用来定拼写）。
+func (s *accountMetaStore) rebuildTagIndexLocked() {
+	s.tagIndex = map[string]map[string]struct{}{}
+	s.tagDisplay = map[string]string{}
+	uids := make([]string, 0, len(s.accounts))
+	for uid := range s.accounts {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	for _, uid := range uids {
+		for _, tag := range s.accounts[uid].Tags {
+			display := strings.TrimSpace(tag)
+			key := strings.ToLower(display)
+			if key == "" {
+				continue
+			}
+			set := s.tagIndex[key]
+			if set == nil {
+				set = map[string]struct{}{}
+				s.tagIndex[key] = set
+			}
+			set[uid] = struct{}{}
+			if _, ok := s.tagDisplay[key]; !ok {
+				s.tagDisplay[key] = display
+			}
 		}
 	}
 }
@@ -214,6 +259,7 @@ func (s *accountMetaStore) put(uid string, rec accountMetaRecord) (accountMetaRe
 		}
 		return accountMetaRecord{}, err
 	}
+	s.rebuildTagIndexLocked() // 落盘成功才更新标签索引：与内存/磁盘保持同一版本
 	if effective.Tags != nil {
 		effective.Tags = append([]string(nil), effective.Tags...)
 	}
@@ -238,6 +284,7 @@ func (s *accountMetaStore) remove(uid string) error {
 		s.accounts[uid] = prev
 		return err
 	}
+	s.rebuildTagIndexLocked() // 落盘成功才更新标签索引
 	return nil
 }
 
@@ -424,4 +471,97 @@ func (p *Panel) accountMetaForget(uid string) {
 	if err := store.remove(uid); err != nil {
 		log.Printf("WARN: [panel] 清理账号元数据失败 uid=%s: %v（账号已移除，元数据残留）", uid, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 标签索引/筛选（v2.3.1 #12 扩展）
+// ---------------------------------------------------------------------------
+
+// accountMetaTagCount 标签索引的一行（GET /panel/api/meta/tags 响应元素）。
+type accountMetaTagCount struct {
+	Tag   string `json:"tag"`
+	Count int    `json:"count"`
+}
+
+// accountMetaMatchesTag 单个账号是否带指定标签（大小写不敏感、TrimSpace；O(tags)）。
+// 未装配存储/空标签/未知账号 → false。批量筛选（1146 号）请用 accountMetaUIDsForTag：
+// 一次加锁查反向索引，避免逐号加锁遍历。
+func (p *Panel) accountMetaMatchesTag(uid, tag string) bool {
+	key := strings.ToLower(strings.TrimSpace(tag))
+	if uid == "" || key == "" {
+		return false
+	}
+	store := accountMetaStoreFor(p.dataDir)
+	if store == nil {
+		return false
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.loadLocked()
+	for _, t := range store.accounts[uid].Tags {
+		if strings.ToLower(strings.TrimSpace(t)) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// accountMetaUIDsForTag 返回带指定标签的账号 uid 集合（只读副本；一次加锁 + 索引查表）。
+// 供 accounts?tag= 服务端筛选使用：1146 账号场景下避免逐号加锁/遍历元数据。
+// 未装配存储或空标签 → nil（调用方按「不筛选」语义处理）；标签无匹配 → 空 map。
+func (p *Panel) accountMetaUIDsForTag(tag string) map[string]struct{} {
+	key := strings.ToLower(strings.TrimSpace(tag))
+	if key == "" {
+		return nil
+	}
+	store := accountMetaStoreFor(p.dataDir)
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.loadLocked()
+	set := store.tagIndex[key]
+	out := make(map[string]struct{}, len(set))
+	for uid := range set {
+		out[uid] = struct{}{}
+	}
+	return out
+}
+
+// accountMetaTagCounts 返回标签索引：{tag,count} 按 count 降序、同 count 按 tag 字典序。
+// 数据来自内存反向索引（加载/变更后整体重建，不读盘）；只统计非空标签；
+// 未装配存储 → 空切片（调用方序列化为 []）。
+func (p *Panel) accountMetaTagCounts() []accountMetaTagCount {
+	store := accountMetaStoreFor(p.dataDir)
+	if store == nil {
+		return []accountMetaTagCount{}
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.loadLocked()
+	out := make([]accountMetaTagCount, 0, len(store.tagIndex))
+	for key, set := range store.tagIndex {
+		if len(set) == 0 {
+			continue
+		}
+		out = append(out, accountMetaTagCount{Tag: store.tagDisplay[key], Count: len(set)})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Tag < out[j].Tag
+	})
+	return out
+}
+
+// accountMetaTags GET /panel/api/meta/tags：标签索引（count 降序、同 count 字典序）。
+// 未装配数据目录时返回 200 + 空数组（与 accounts?tag= 的「无匹配返回空 rows」语义一致）。
+func (p *Panel) accountMetaTags(w http.ResponseWriter, r *http.Request) {
+	tags := p.accountMetaTagCounts()
+	if tags == nil {
+		tags = []accountMetaTagCount{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tags": tags})
 }

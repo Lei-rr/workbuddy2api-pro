@@ -444,7 +444,9 @@ let expAll = [];                              // 到期快照（按最近到期�
 let expPage = 1;
 let expPageSize = 100;                        // 0 = 全部
 let accAll = [];
-let accFilters = { q: '', state: '', ver: '' };
+// tag 为 v2.3.1 #12 的标签筛选（服务端 accounts?tag=）；空串 = 全部标签。
+let accFilters = { q: '', state: '', ver: '', tag: '' };
+let accTagOptions = [];                       // [{tag,count}]：标签下拉数据（loadAccTags 填充）
 let accPageSize = 100;                        // 0 = 全部
 let accPage = 1;
 
@@ -504,17 +506,98 @@ function accStateParam(state) {
    realm 与 enterprise 是两个正交维度，所以国内/国际都要再带 enterprise=0
    把企业版排除掉（否则国际版筛选会把海外企业号也带出来）。 */
 function accQueryString(filters, page, pageSize) {
-  filters = filters || { q: '', state: '', ver: '' };
+  filters = filters || { q: '', state: '', ver: '', tag: '' };
   const p = new URLSearchParams();
   p.set('page', String(Math.max(1, Math.floor(Number(page) || 1))));
   p.set('page_size', String(Math.max(0, Math.floor(Number(pageSize) || 0))));
   const st = accStateParam(filters.state);
   if (st) p.set('state', st);
   if (filters.q) p.set('q', filters.q);
+  // v2.3.1：标签筛选（服务端 tag= 精确匹配）。URLSearchParams 统一编码一次，
+  // 调用方不要把 tag 预编码，避免 %E4%B8%AD 被编码成 %25E4...
+  if (filters.tag) p.set('tag', filters.tag);
   if (filters.ver === 'enterprise') p.set('enterprise', '1');
   else if (filters.ver === 'global') { p.set('realm', 'global'); p.set('enterprise', '0'); }
   else if (filters.ver === 'cn') { p.set('realm', 'cn'); p.set('enterprise', '0'); }
   return p.toString();
+}
+
+/* ── 标签筛选（v2.3.1，服务端 meta/tags）────────────────────────────────
+   后端契约：GET /panel/api/meta/tags → {ok,tags:[{tag,count}]}；账号列表接口
+   追加 tag= 做服务端精确筛选。标签只是辅助筛选，任何失败都静默降级，不打断
+   账号列表/轮询。 */
+const ACC_TAG_LIMIT = 50;
+
+/* normalizeAccTags 把 /meta/tags 响应归一化成 [{tag,count}]：兼容数组
+   [{tag,count}] / 对象 {tag:count} / 字符串数组；同名合并 count、过滤空标签、
+   按 count 降序（同频按 tag 升序），最多展示 50 个。 */
+function normalizeAccTags(d) {
+  const raw = Array.isArray(d) ? d : ((d && (d.tags || d.items || d.rows)) || []);
+  const byTag = new Map();
+  const add = (tag, count) => {
+    const t = String(tag == null ? '' : tag).trim().slice(0, 32);
+    if (!t) return;
+    const n = Number(count);
+    byTag.set(t, (byTag.get(t) || 0) + (Number.isFinite(n) ? n : 0));
+  };
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item == null) continue;
+      if (typeof item === 'string') add(item, 0);
+      else add(item.tag != null ? item.tag : item.name, item.count);
+    }
+  } else if (raw && typeof raw === 'object') {
+    for (const k of Object.keys(raw)) add(k, raw[k]);
+  }
+  return Array.from(byTag, ([tag, count]) => ({ tag: tag, count: count }))
+    .sort((a, b) => (b.count - a.count) || (a.tag < b.tag ? -1 : a.tag > b.tag ? 1 : 0))
+    .slice(0, ACC_TAG_LIMIT);
+}
+
+/* accTagOptionsFromMeta /meta/tags 不可用时的降级：从 /meta 快照聚合标签频次
+   （与 normalizeAccTags 同口径）。metaAll 由备注功能维护。 */
+function accTagOptionsFromMeta(meta) {
+  const src = meta || metaAll || {};
+  const counts = new Map();
+  for (const uid of Object.keys(src)) {
+    const tags = (src[uid] && src[uid].tags) || [];
+    for (const t of tags) counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  return normalizeAccTags(Array.from(counts, ([tag, count]) => ({ tag: tag, count: count })));
+}
+
+/* renderAccTagOptions 填充 #accTagFilter：保留当前选择；所选 tag 不在列表时补一条
+   （避免下拉显示与筛选条件不一致）。无数据时只有「全部标签」。 */
+function renderAccTagOptions(options) {
+  accTagOptions = Array.isArray(options) ? options : [];
+  const sel = $('accTagFilter');
+  if (!sel) return;
+  const cur = String((accFilters && accFilters.tag) || '');
+  const opts = ['<option value="">全部标签</option>'];
+  let found = false;
+  for (const o of accTagOptions) {
+    if (o.tag === cur) found = true;
+    opts.push('<option value="' + esc(o.tag) + '">' + esc(o.tag) + '（' + o.count + '）</option>');
+  }
+  if (cur && !found) opts.push('<option value="' + esc(cur) + '">' + esc(cur) + '</option>');
+  sel.innerHTML = opts.join('');
+  sel.value = cur;
+}
+
+/* loadAccTags 拉标签下拉数据。调用点：start（loadMeta 成功后）/备注保存后/
+   账号集合变化后——不进 5s 轮询（标签是低频数据）。失败静默降级到 metaAll 聚合，
+   再不行保持现有下拉（至少「全部标签」）。 */
+async function loadAccTags(quiet) {
+  let options = null;
+  try {
+    const d = await api('meta/tags');
+    options = normalizeAccTags(d);
+  } catch (e) {
+    // 静默降级：后端未就绪/网络失败时用 /meta 快照聚合；不 toast、不影响账号池轮询。
+    options = accTagOptionsFromMeta(metaAll);
+  }
+  renderAccTagOptions(options);
+  return options;
 }
 
 /* etagCachePut 把 {etag,data} 放进按查询串索引的小 LRU（只保留最近 32 个查询，
@@ -749,9 +832,13 @@ function renderAccounts(list, meta) {
     pages = pr.pages;
   } else if (!accAll.length) {
     // 服务端模式空页：可能是池为空，也可能是筛选无命中——用 meta.total 区分。
+    // v2.3.1：带标签筛选且池子里有账号时，明确提示「无账号使用该标签」（比笼统的
+    // 「没有符合筛选条件的账号」更能定位到是标签条件的问题）。
     const total = Number(meta.total) || 0;
+    const tag = String((accFilters && accFilters.tag) || '');
     tb.innerHTML = '<tr><td colspan="9"><div class="empty">' +
-      (total > 0 ? '没有符合筛选条件的账号' : '账号池是空的') + '</div></td></tr>';
+      (tag ? '无账号使用该标签「' + esc(tag) + '」'
+           : (total > 0 ? '没有符合筛选条件的账号' : '账号池是空的')) + '</div></td></tr>';
     updateAccPagerMeta(meta, 0);
     return;
   }
@@ -875,6 +962,12 @@ if ($('accState')) $('accState').addEventListener('change', () => {
 });
 if ($('accVer')) $('accVer').addEventListener('change', () => {
   accFilters.ver = $('accVer').value;
+  accPage = 1;
+  reloadAccountPage();
+});
+// v2.3.1 标签筛选：选择后回第 1 页并带 tag= 重新请求（全部标签 = 空值清空筛选）。
+if ($('accTagFilter')) $('accTagFilter').addEventListener('change', () => {
+  accFilters.tag = $('accTagFilter').value;
   accPage = 1;
   reloadAccountPage();
 });
@@ -1147,10 +1240,12 @@ function refreshFullOverviewInBackground() {
 }
 
 /* refreshAccountPoolAfterMutation 账号集合变更（增/删/重扫/导入/登录成功）后的
-   统一收尾：先刷新 summary + 当前页，再后台补拉完整 overview（见上）。 */
+   统一收尾：先刷新 summary + 当前页，再后台补拉完整 overview（见上）；标签计数
+   随账号集合变化，顺带刷新标签下拉（静默）。 */
 function refreshAccountPoolAfterMutation(quiet) {
   refreshAccountPool(quiet);
   refreshFullOverviewInBackground();
+  loadAccTags(true);
 }
 
 
@@ -4943,6 +5038,7 @@ async function loadMeta(quiet) {
     metaLoaded = true;
     mergeServerNotesToLocal();
     maybeMigrateRemarks();
+    loadAccTags(true);   // v2.3.1：备注/标签加载后同步标签筛选下拉（静默）
     return true;
   } catch (e) {
     // 接口未就绪/网络失败：界面继续用 localStorage（remarkOf 已回落），不阻塞面板。
@@ -5102,6 +5198,10 @@ async function saveRemarkForm() {
   if (failed) toast('已保存 ' + ok + ' 条，失败 ' + failed + ' 条（本机缓存已保留，可重试）', 'err');
   else toast('备注/标签已保存到服务端（' + ok + ' 条）', 'ok');
   renderAfterMetaChange();
+  // v2.3.1：标签集合/计数可能变化——刷新标签下拉；若正按标签筛选，列表也要重取，
+  // 避免选中标签已被删掉却还显示旧筛选结果。
+  loadAccTags(true);
+  if (view === 'accounts') refreshAccountPool(true);
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;

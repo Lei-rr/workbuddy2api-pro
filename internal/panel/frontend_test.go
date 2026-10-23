@@ -2852,14 +2852,25 @@ const out = {
     ctx.accQueryString({ q: 'nick&x', state: '', ver: 'global' }, 1, 100),
     ctx.accQueryString({ q: '', state: '', ver: 'cn' }, 1, 200),
     ctx.accQueryString({ q: '', state: '', ver: '' }, 0, -5),
+    // v2.3.1 标签筛选：tag 只编码一次，可与 q/state/ver 组合
+    ctx.accQueryString({ q: '', state: '', ver: '', tag: '采购A' }, 1, 100),
+    ctx.accQueryString({ q: 'x', state: 'ok', ver: 'global', tag: 'a b&c' }, 3, 50),
+    ctx.accQueryString({ q: '', state: '', ver: 'enterprise', tag: '待补签' }, 1, 100),
   ],
 };
+// 服务端收到的 tag 必须与用户所选完全一致（防止 URLSearchParams 之前又手工 encodeURIComponent）
+out.tagRoundTrip = new URLSearchParams(out.query[6]).get('tag');
+out.tagRoundTrip2 = new URLSearchParams(out.query[7]).get('tag');
 process.stdout.write(JSON.stringify(out));`
 	want := `{"state":["healthy","cooling","paused","disabled","",""],` +
 		`"query":["page=1&page_size=100","page=2&page_size=0&state=healthy",` +
 		`"page=1&page_size=50&state=cooling&enterprise=1",` +
 		`"page=1&page_size=100&q=nick%26x&realm=global&enterprise=0",` +
-		`"page=1&page_size=200&realm=cn&enterprise=0","page=1&page_size=0"]}`
+		`"page=1&page_size=200&realm=cn&enterprise=0","page=1&page_size=0",` +
+		`"page=1&page_size=100&tag=%E9%87%87%E8%B4%ADA",` +
+		`"page=3&page_size=50&state=healthy&q=x&tag=a+b%26c&realm=global&enterprise=0",` +
+		`"page=1&page_size=100&tag=%E5%BE%85%E8%A1%A5%E7%AD%BE&enterprise=1"],` +
+		`"tagRoundTrip":"采购A","tagRoundTrip2":"a b&c"}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("账号池服务端参数=%s\nwant %s", got, want)
 	}
@@ -2983,9 +2994,11 @@ const sinks = {};
 const sinkIds = ['accBody', 'accCount', 'accPageInfo', 'accPrev', 'accNext', 'sTotal', 'sHealthy',
   'sCooling', 'sDisabled', 'sPaused', 'sCredits', 'sSticky', 'navSub', 'navVer', 'navRedis',
   'navState', 'navPulse', 'accNote', 'subMeta', 'expBox', 'expList', 'expNote', 'expPad', 'cfgForm',
-  'accTruncHint', 'btnRescan'];
+  'accTruncHint', 'btnRescan', 'accTagFilter'];
 for (const id of sinkIds) sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false,
   className: '', value: '', dataset: {}, children: [], addEventListener() {}, style: {} };
+// 标签下拉的 change 监听要能触发（其余控件保持 inert）。
+sinks.accTagFilter.addEventListener = function (ev, fn) { this.onchange = fn; };
 const fetchStub = url => {
   const u = String(url);
   calls.push(u);
@@ -3100,6 +3113,21 @@ const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0)
   out.emptyFiltered = { html: sinks.accBody.innerHTML, count: sinks.accCount.textContent };
   R.renderAccounts([], { total: 0, filtered: 0, page: 1, pages: 1, now: now });
   out.emptyPool = { html: sinks.accBody.innerHTML };
+  // v2.3.1：带标签筛选且池里有账号 → 明确提示「无账号使用该标签」。
+  R.setFilters({ q: '', state: '', ver: '', tag: 'vip' });
+  R.renderAccounts([], { total: 5, filtered: 0, page: 1, pages: 1, now: now });
+  out.emptyTag = { html: sinks.accBody.innerHTML, count: sinks.accCount.textContent };
+  // 标签下拉 change：回第 1 页并带 tag= 重新请求（URLSearchParams 只编码一次）。
+  const aTag = accCount();
+  sinks.accTagFilter.value = '采购A';
+  sinks.accTagFilter.onchange();
+  await wait(() => accCount() > aTag);
+  const tagUrl = calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0).pop() || '';
+  out.tagChange = { requests: accCount() - aTag,
+                    hasTag: tagUrl.indexOf('tag=%E9%87%87%E8%B4%ADA') >= 0,
+                    page1: tagUrl.indexOf('page=1') >= 0 };
+  R.setFilters({ q: '', state: '', ver: '', tag: '' });
+  sinks.accTagFilter.value = '';
   // P2-1：账号集合变更（重新扫描）后，除当前页外还后台补拉一次完整 overview，
   // 让积分历史下拉 / 积分条基准 / 到期快照立刻跟上（不再等切到期 tab 或整页刷新）。
   const f4 = fullCount(), l4 = liteCount(), a4 = accCount();
@@ -3140,6 +3168,9 @@ const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0)
 		`"emptyFiltered":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">没有符合筛选条件的账号</div></td></tr>",` +
 		`"count":"命中 0 / 共 5 个"},` +
 		`"emptyPool":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">账号池是空的</div></td></tr>"},` +
+		`"emptyTag":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">无账号使用该标签「vip」</div></td></tr>",` +
+		`"count":"命中 0 / 共 5 个"},` +
+		`"tagChange":{"requests":1,"hasTag":true,"page1":true},` +
 		`"mutationRefetch":{"fullRefetched":true,"liteRefreshed":true,"pageRefreshed":true,"overviewAccounts":2},` +
 		`"truncHint":{"hidden":false,"text":"仅显示前 2 个（服务端上限 2000，建议用筛选或分页）","count":"共 2500 个"},` +
 		`"truncFiltered":{"hidden":true,"text":""},` +
@@ -3727,6 +3758,7 @@ const ctx = {
   get view() { return state.view; },
   renderAccounts: () => { state.renders++; },
   renderUsage: () => {},
+  loadAccTags: () => {},   // v2.3.1：loadMeta 成功后会刷新标签下拉
   usageData: null, accAll: [], accPageMeta: null,
   Date, Number, String, Object, Array, Math, JSON, Promise,
 };
@@ -3839,7 +3871,7 @@ const toasts = [];
 const apiCalls = [];
 let apiImpl = async () => ({ ok: true });
 let pool = [];
-const state = { view: 'accounts', renders: 0, usageRenders: 0 };
+const state = { view: 'accounts', renders: 0, tagsLoads: 0, poolRefreshes: 0 };
 const ctx = {
   LS_REMARKS: 'wb2api.remarks.v1',
   esc: s => String(s == null ? '' : s),
@@ -3855,6 +3887,9 @@ const ctx = {
   get view() { return state.view; },
   renderAccounts: () => { state.renders++; },
   renderUsage: () => { state.usageRenders++; },
+  // v2.3.1：保存备注/标签后要刷新标签下拉与当前页（这里只计数，行为在标签用例里测）
+  loadAccTags: () => { state.tagsLoads++; },
+  refreshAccountPool: () => { state.poolRefreshes++; },
   usageData: null, accAll: [], accPageMeta: null,
   Date, Number, String, Object, Array, Math, JSON, Promise,
 };
@@ -3888,6 +3923,7 @@ const row = (uid, note, tags, legacy) => ({
   sinks.remarkBody = { innerHTML: '', querySelectorAll: () => rows };
   apiImpl = async () => ({ ok: true });
   apiCalls.length = 0; toasts.length = 0; state.renders = 0;
+  state.tagsLoads = 0; state.poolRefreshes = 0;
   await M.saveRemarkForm();
   out.save = {
     calls: apiCalls.map(c => [c[0], c[1], c[2] ? JSON.parse(c[2]) : null]),
@@ -3896,6 +3932,7 @@ const row = (uid, note, tags, legacy) => ({
     u4: M.metaFor('u4'),
     local: M.remarksAll(), toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1],
     btn: sinks.btnRemarkSave.disabled, renders: state.renders,
+    tagsLoads: state.tagsLoads, poolRefreshes: state.poolRefreshes,   // v2.3.1 保存后刷新标签下拉+列表
   };
   M.reset(); M.setLoaded(true); M.setMeta({ u1: { note: 'old', tags: [], updated_at: 1 } });
   pool = [{ uid: 'u1', nickname: 'A' }];
@@ -3944,7 +3981,8 @@ const row = (uid, note, tags, legacy) => ({
 		`["accounts/u4/meta","DELETE",null],["accounts/u3/meta","PUT",{"note":"新账号备注","tags":["vip"]}]],` +
 		`"u1":{"note":"new1","tags":["a","b"]},"u3":{"note":"新账号备注","tags":["vip"]},"u4":null,` +
 		`"local":{"u1":"new1","u3":"新账号备注","legacy12":"本机改"},` +
-		`"toast":"备注/标签已保存到服务端（3 条）","cls":"ok","btn":false,"renders":1},` +
+		`"toast":"备注/标签已保存到服务端（3 条）","cls":"ok","btn":false,"renders":1,` +
+		`"tagsLoads":1,"poolRefreshes":1},` +
 		`"saveFail":{"calls":1,"u1":"old","local":{"u1":"changed"},` +
 		`"toast":"已保存 0 条，失败 1 条（本机缓存已保留，可重试）","cls":"err"},` +
 		`"saveNoop":{"calls":0,"toast":"没有需要保存的改动"},` +
@@ -4038,6 +4076,209 @@ func TestPanelJobMetaWiring(t *testing.T) {
 	} {
 		if !strings.Contains(c, want) {
 			t.Errorf("mobile.css 缺少 %q", want)
+		}
+	}
+}
+
+// TestAppJSAccTagFilter v2.3.1 标签筛选：/meta/tags 归一化、50 上限、选中项保留、
+// 失败静默降级（metaAll 聚合 / 只剩「全部标签」）。
+func TestAppJSAccTagFilter(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const ACC_TAG_LIMIT = 50;');
+const end = src.indexOf('/* etagCachePut');
+if (start < 0 || end < 0 || end < start) throw new Error('tag filter section not found');
+const sinks = {};
+const sel = { innerHTML: '', value: '' };
+sinks.accTagFilter = sel;
+const apiCalls = [];
+let apiImpl = async () => ({ ok: true, tags: [] });
+const ctx = {
+  esc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+  $: id => sinks[id] || null,
+  api: async (p, o) => { apiCalls.push([p, o && o.method]); return apiImpl(p, o); },
+  accFilters: { tag: '' },
+  metaAll: {},
+  Array, Map, String, Number,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.__tag = {' +
+  ' normalizeAccTags, accTagOptionsFromMeta, renderAccTagOptions, loadAccTags,' +
+  ' state: () => ({ opts: accTagOptions }),' +
+  '};', ctx);
+const T = ctx.__tag;
+(async () => {
+  const out = {};
+  out.normArray = T.normalizeAccTags({ ok: true, tags: [{ tag: 'b', count: 2 }, { tag: 'a', count: 5 },
+    { tag: 'b', count: 1 }, { tag: '', count: 9 }, { tag: 'c' }] });
+  out.normObj = T.normalizeAccTags({ tags: { x: 2, y: 1 } });
+  const many = Array.from({ length: 60 }, (_, i) => ({ tag: 't' + String(i).padStart(2, '0'), count: 1 }));
+  const capped = T.normalizeAccTags({ tags: many });
+  out.cap = { len: capped.length, first: capped[0].tag, last: capped[capped.length - 1].tag };
+  ctx.metaAll = { u1: { tags: ['m1', 'm2'] }, u2: { tags: ['m1'] }, u3: { note: 'x', tags: [] } };
+  out.fromMeta = T.accTagOptionsFromMeta();
+  // 选中项保留；选中项已不在列表时补一条，避免下拉与筛选条件不一致
+  ctx.accFilters.tag = 'vip';
+  T.renderAccTagOptions([{ tag: 'a', count: 3 }, { tag: 'vip', count: 1 }]);
+  out.render1 = { options: (sel.innerHTML.match(/<option/g) || []).length, value: sel.value,
+                  hasVip: sel.innerHTML.indexOf('vip（1）') >= 0,
+                  hasAll: sel.innerHTML.indexOf('全部标签') >= 0 };
+  T.renderAccTagOptions([{ tag: 'a', count: 3 }]);
+  out.render2 = { options: (sel.innerHTML.match(/<option/g) || []).length, value: sel.value,
+                  hasVip: sel.innerHTML.indexOf('vip') >= 0 };
+  ctx.accFilters.tag = '';
+  T.renderAccTagOptions([]);
+  out.renderEmpty = { options: (sel.innerHTML.match(/<option/g) || []).length, value: sel.value };
+  apiCalls.length = 0;
+  apiImpl = async () => ({ ok: true, tags: [{ tag: 'x', count: 2 }] });
+  await T.loadAccTags(true);
+  out.loadOk = { path: apiCalls[0] && apiCalls[0][0], opts: T.state().opts,
+                 html: sel.innerHTML.indexOf('x（2）') >= 0 };
+  apiImpl = async () => { throw new Error('HTTP 404'); };
+  await T.loadAccTags(true);
+  out.loadFailFallback = { opts: T.state().opts, html: sel.innerHTML.indexOf('m1（2）') >= 0 };
+  ctx.metaAll = {};
+  await T.loadAccTags(true);
+  out.loadFailEmpty = { options: (sel.innerHTML.match(/<option/g) || []).length, value: sel.value };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"normArray":[{"tag":"a","count":5},{"tag":"b","count":3},{"tag":"c","count":0}],` +
+		`"normObj":[{"tag":"x","count":2},{"tag":"y","count":1}],` +
+		`"cap":{"len":50,"first":"t00","last":"t49"},` +
+		`"fromMeta":[{"tag":"m1","count":2},{"tag":"m2","count":1}],` +
+		`"render1":{"options":3,"value":"vip","hasVip":true,"hasAll":true},` +
+		`"render2":{"options":3,"value":"vip","hasVip":true},` +
+		`"renderEmpty":{"options":1,"value":""},` +
+		`"loadOk":{"path":"meta/tags","opts":[{"tag":"x","count":2}],"html":true},` +
+		`"loadFailFallback":{"opts":[{"tag":"m1","count":2},{"tag":"m2","count":1}],"html":true},` +
+		`"loadFailEmpty":{"options":1,"value":""}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("标签筛选=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelTagFilterWiring v2.3.1 标签筛选的源码/HTML/CSS 接线。
+func TestPanelTagFilterWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		"function normalizeAccTags(",
+		"function accTagOptionsFromMeta(",
+		"function renderAccTagOptions(",
+		"async function loadAccTags(",
+		"api('meta/tags')",
+		"p.set('tag', filters.tag)",
+		"无账号使用该标签「",
+		"$('accTagFilter')",
+		"const ACC_TAG_LIMIT = 50;",
+		"loadAccTags(true);   // v2.3.1：备注/标签加载后同步标签筛选下拉（静默）",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 标签筛选接线缺少 %q", want)
+		}
+	}
+	// 标签下拉刷新点：loadMeta / refreshAccountPoolAfterMutation / saveRemarkForm
+	if n := strings.Count(j, "loadAccTags(true);"); n < 3 {
+		t.Errorf("loadAccTags 静默刷新只有 %d 处（loadMeta/账号集合变更/备注保存后至少 3 处）", n)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="accTagFilter"`, `全部标签`, `按标签筛选`} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 标签筛选控件缺少 %q", want)
+		}
+	}
+	css, err := os.ReadFile("mobile.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(css), "#accTagFilter") {
+		t.Error("mobile.css 缺少 320px 标签筛选下拉限宽规则")
+	}
+}
+
+// TestPanelFrontendCheckScript v2.3.1 #18：前端工程化检查脚本必须存在且 exit 0。
+// 检查项：app.js/mobile.js 解析、DOM id 交叉契约、API 路径白名单、体积预算。
+func TestPanelFrontendCheckScript(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; frontend check script test skipped")
+	}
+	script, err := filepath.Abs(filepath.Join("..", "..", "scripts", "panel_frontend_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(script); err != nil {
+		t.Fatalf("scripts/panel_frontend_check.mjs 不存在：%v", err)
+	}
+	out, err := exec.Command(node, script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("前端工程化检查失败（exit != 0）：%v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(got, "panel frontend check: OK") {
+		t.Fatalf("前端工程化检查输出异常：%s", got)
+	}
+	for _, want := range []string{"app.js=", "mobile.js=", "index.html="} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("前端工程化检查结果缺少指标 %q：%s", want, got)
+		}
+	}
+}
+
+// TestPanelFrontendCheckScriptFailsClosed 检查脚本必须「失败即非 0」：
+// 语法错误 / DOM id 契约缺失 / 体积超预算任意一项都必须 exit 1 并打印 FAIL。
+func TestPanelFrontendCheckScriptFailsClosed(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; frontend check script test skipped")
+	}
+	repoScript, err := filepath.Abs(filepath.Join("..", "..", "scripts", "panel_frontend_check.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(repoScript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	panelDir := filepath.Join(root, "internal", "panel")
+	if err := os.MkdirAll(panelDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "panel_frontend_check.mjs"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// app.js：合法语法 + 引用不存在的 id + 超过 350KB 预算；mobile.js：解析错误；
+	// index.html：只含一个未被引用的 id（双向契约都要报错）。
+	appJs := "function boot(){ $('missingId'); }\nvar pad = '" + strings.Repeat("a", 360*1024) + "';\n"
+	if err := os.WriteFile(filepath.Join(panelDir, "app.js"), []byte(appJs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(panelDir, "mobile.js"), []byte("function broken( {"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(panelDir, "index.html"), []byte("<div id=\"present\"></div>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, filepath.Join(root, "scripts", "panel_frontend_check.mjs")).CombinedOutput()
+	if err == nil {
+		t.Fatalf("错误输入下检查脚本应 exit 1，实际通过：%s", out)
+	}
+	got := string(out)
+	for _, want := range []string{"FAIL:", "解析失败", "不存在的 id", "体积超预算", "panel frontend check: FAILED"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("失败输出缺少 %q：%s", want, got)
 		}
 	}
 }

@@ -589,6 +589,8 @@ func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
 }
 
 // TestSetIncludeDisabledInTasksHot setter 热更新立即生效（面板保存配置走这条路径）。
+// v2.3.1 #11 起签到有「本进程当日已签跳过」语义：第二次运行 u1 不再重复打签到
+// RPC（skip），新纳入的禁用号 u2 照常签到 → 累计调用 1 + 1 = 2。
 func TestSetIncludeDisabledInTasksHot(t *testing.T) {
 	f := &fakeUpstream{resourceRemain: 500}
 	srv := f.server()
@@ -605,8 +607,14 @@ func TestSetIncludeDisabledInTasksHot(t *testing.T) {
 
 	s.SetIncludeDisabledInTasks(true)
 	s.RunCheckinNow()
-	if got := f.checkinCalls.Load(); got != 3 {
-		t.Errorf("热更新后 checkin calls=%d want 3（1 + u1 + u2）", got)
+	if got := f.checkinCalls.Load(); got != 2 {
+		t.Errorf("热更新后 checkin calls=%d want 2（u1 当日已签跳过 + 禁用号 u2 首签）", got)
+	}
+	if !s.checkinDoneToday("u1") {
+		t.Error("u1 首签成功应标记当日已签（进程内）")
+	}
+	if !s.checkinDoneToday("u2") {
+		t.Error("热点开关打开后 u2 已签到成功，应标记当日已签")
 	}
 }
 
@@ -673,7 +681,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
 	}
 }
-
 
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的

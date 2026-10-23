@@ -87,8 +87,8 @@ func TestRunCheckinCtxProgress(t *testing.T) {
 	}
 }
 
-// TestRunCheckinCtxCancelStopsLoop ctx 在进度回调里被取消：下一轮循环即退出，
-// 剩余账号不再处理（进度只到 1）。
+// TestRunCheckinCtxCancelStopsLoop ctx 在进度回调里被取消：派发即停，剩余账号
+// 不再处理（v2.3.1 #11 worker pool；并发固定 1 让「取消后不再处理」可确定断言）。
 func TestRunCheckinCtxCancelStopsLoop(t *testing.T) {
 	f := &fakeUpstream{resourceRemain: 100}
 	srv := f.server()
@@ -96,7 +96,7 @@ func TestRunCheckinCtxCancelStopsLoop(t *testing.T) {
 
 	p := newProgressPool(5)
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p, Upstream: up, CheckinConcurrency: 1})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -234,6 +234,8 @@ func (p *Panel) routes() {
 	// v2.3.0 #12 账号备注/标签（handler 由 backend-c 的 accountmeta.go 提供）：
 	// 列表与单号读取为只读，写操作在下方写分区。数据落 <data>/account-meta.json。
 	p.mux.HandleFunc("GET /panel/api/meta", p.withAuth(p.accountMetaList))
+	// v2.3.1 #12 扩展：标签索引（accounts?tag= 下拉数据源；count 降序、同 count 字典序）。
+	p.mux.HandleFunc("GET /panel/api/meta/tags", p.withAuth(p.accountMetaTags))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaGet))
 
 	// ---- 写操作 ----
@@ -508,8 +510,11 @@ type accountsQuery struct {
 	State      string `json:"state"`      // "" | healthy | cooling | paused | disabled
 	Realm      string `json:"realm"`      // "" | cn | global
 	Enterprise string `json:"enterprise"` // "" | "1" | "0"
-	Sort       string `json:"sort"`       // uid（默认）| credits | last_success | cool_remaining
-	Fields     string `json:"fields"`     // light（默认）| full
+	// Tag 标签筛选（v2.3.1 #12 扩展）：已 TrimSpace + ToLower，按 data/account-meta.json
+	// 中该账号的 tags 大小写不敏感精确匹配；空 = 不筛选。
+	Tag    string `json:"tag"`
+	Sort   string `json:"sort"`   // uid（默认）| credits | last_success | cool_remaining
+	Fields string `json:"fields"` // light（默认）| full
 }
 
 // parseAccountsQuery 解析并归一化查询参数。非法值一律回落默认（不 400）：
@@ -523,6 +528,7 @@ func parseAccountsQuery(r *http.Request) accountsQuery {
 		State:      normalizeAccountsState(qv.Get("state")),
 		Realm:      normalizeAccountsRealm(qv.Get("realm")),
 		Enterprise: normalizeAccountsEnterprise(qv.Get("enterprise")),
+		Tag:        strings.ToLower(strings.TrimSpace(qv.Get("tag"))),
 		Sort:       normalizeAccountsSort(qv.Get("sort")),
 		Fields:     normalizeAccountsFields(qv.Get("fields")),
 	}
@@ -811,7 +817,12 @@ func accountsETag(in accountsETagInput) (etag string, ok bool) {
 // 数据源与 /overview 的 accounts 相同（pool.List() 快照，锁外筛选/排序/序列化），
 // 但只序列化当前页——旧接口默认行为完全不变，本接口供账号页按需拉取：
 //
-//	GET /panel/api/accounts?page=1&page_size=100&q=&state=&realm=&enterprise=&sort=&fields=
+//	GET /panel/api/accounts?page=1&page_size=100&q=&state=&realm=&enterprise=&tag=&sort=&fields=
+//
+// tag（v2.3.1 #12 扩展）：按 account-meta.json 中该账号 tags 大小写不敏感精确匹配，
+// 与 q/state/realm/enterprise AND；未知标签返回空 rows（200），未装配元数据存储时
+// 同样视为无匹配。ETag 输入是归一化 accountsQuery（含 tag），因此同 tag 稳定 304、
+// 不同 tag/改 meta 后 ETag 变化。
 //
 // 响应：{"ok":true,"now":<unix秒>,"total":N,"filtered":M,"page":1,"page_size":100,
 // "pages":P,"rows":[Status...]}。now 供前端校正时钟后在本地按 until 倒计时。
@@ -822,6 +833,14 @@ func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	q := parseAccountsQuery(r)
 
+	// 标签筛选：一次查内存反向索引拿 uid 集合（不逐号加锁、不读盘）。
+	// q.Tag 为空时 tagUIDs 为 nil = 不筛选；有 tag 但无存储/无匹配时为空/nil map
+	// → 后续 map 取值为零值 false → 空 rows（符合「未知标签返回空」契约）。
+	var tagUIDs map[string]struct{}
+	if q.Tag != "" {
+		tagUIDs = p.accountMetaUIDsForTag(q.Tag)
+	}
+
 	var snapshot []pool.Status
 	if p.cfg.Pool != nil {
 		snapshot = p.cfg.Pool.List()
@@ -829,6 +848,11 @@ func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
 	total := len(snapshot)
 	filtered := make([]pool.Status, 0, len(snapshot))
 	for _, st := range snapshot {
+		if q.Tag != "" {
+			if _, ok := tagUIDs[st.UID]; !ok {
+				continue
+			}
+		}
 		if accountsMatch(st, q, now) {
 			filtered = append(filtered, st)
 		}

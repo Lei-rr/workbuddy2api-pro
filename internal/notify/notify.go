@@ -1,25 +1,35 @@
-// Package notify 事件通知渠道（v2.3.0 #19：Webhook 最小闭环）。
+// Package notify 事件通知渠道（v2.3.0 #19 Webhook 最小闭环；v2.3.1 扩展多渠道）。
 //
-// 定位：把网关里"需要人知道"的事件异步推送到一个 HTTP(S) Webhook（群机器人 /
-// 自建告警网关都可以），不引入任何第三方依赖（纯标准库）。
+// 定位：把网关里"需要人知道"的事件异步推送到一个 HTTP(S) 目标，不引入任何第三方
+// 依赖（纯标准库）。渠道（notify.channel）：
+//   - webhook（默认）：通用 JSON `{"event","ts","data"}`，交给自建告警网关/脚本消费；
+//   - wecom：企业微信群机器人 markdown 消息（body errcode==0 才视为成功）；
+//   - telegram：Bot sendMessage 纯文本（2xx 且 ok:true 才视为成功；需 telegram_chat_id）；
+//   - bark：iOS Bark 推送（2xx 即成功）。
 //
-// 设计约束：
-//   - 不阻塞调用方：Emit 只做「序列化 + 入有界队列」然后立即返回，真正的 HTTP
-//     发送在单个 worker goroutine 里完成；队列满（默认 64）直接丢弃并计数/告警，
-//     绝不反向拖慢签到/任务等主流程；
+// 设计约束（与 v2.3.0 一致）：
+//   - 不阻塞调用方：Emit 只做「编码 + 入有界队列」然后立即返回，真正的 HTTP 发送在
+//     单个 worker goroutine 里完成；队列满（默认 64）直接丢弃并计数/告警，绝不反向
+//     拖慢签到/任务等主流程；
 //   - 失败不致命：单事件最多尝试 2 次（首发 + 短退避重试 1 次），仍失败只记 WARN
 //     与失败计数，不 panic、不重排；
 //   - 关闭可排空：Close(ctx) 关闭队列后 worker 会把缓冲里的事件发完才退出，超时
 //     （ctx 取消）则放弃等待由进程退出兜底；
-//   - 安全：日志只打印脱敏后的目标地址（scheme://host + path 前 12 字符），永不
-//     打印完整 URL/query（Webhook URL 常自带 token）；payload 固定为
-//     {"event","ts","data"} 三个字段，绝不回传任何 token/凭证（由调用方保证 data
-//     里不放凭证，本包不读取也不追加任何请求头到 payload）。
+//   - 安全：日志只打印脱敏后的目标地址（webhook 保留 scheme://host + path 前 12
+//     字符；wecom/telegram/bark 的 path 常直接带 key/token，只保留 scheme://host），
+//     永不打印完整 URL/query；payload 只含事件数据/概要文本，绝不回传 token/凭证
+//     （由调用方保证 data 里不放凭证，本包不读取也不追加任何请求头到 payload）。
 //
-// 典型接线（main.go）：
+// 典型接线（main.go，v2.3.1）：
 //
-//	notifier := notify.New(cfg.Notify.WebhookURL, cfg.NotifyTimeoutDur, cfg.Notify.Events)
+//	notifier := notify.NewFromConfig(notify.Config{
+//	    WebhookURL: cfg.Notify.WebhookURL, Timeout: cfg.NotifyTimeoutDur, Events: cfg.Notify.Events,
+//	    Channel: cfg.Notify.Channel, TelegramChatID: cfg.Notify.TelegramChatID, Title: cfg.Notify.Title,
+//	})
 //	defer notifier.Close(context.Background()) // 优雅停机时带超时排空
+//
+// 兼容性：`New(webhookURL, timeout, events)` 等价于 channel=webhook 的 NewFromConfig，
+// 行为/payload 与 v2.3.0 完全一致（既有 webhook 消费方零影响）。
 //
 // 事件钩子（由 main / panel / scheduler 在对应位置调用）：
 //   - notifier.JobDone(map[string]any{...})        → job_done
@@ -57,7 +67,7 @@ var defaultEvents = []string{EventJobDone, EventAccountDisabled, EventCheckinFai
 const (
 	// queueSize 异步发送队列容量：签到大批次连续失败时最多积压 64 条，超出入队即丢。
 	queueSize = 64
-	// maxDataBytes payload 里 data 字段序列化后的上限（64KB）；超出降级为摘要。
+	// maxDataBytes webhook payload 里 data 字段序列化后的上限（64KB）；超出降级为摘要。
 	maxDataBytes = 64 * 1024
 	// maxAttempts 单事件总尝试次数（首发 + 重试 1 次）。
 	maxAttempts = 2
@@ -67,23 +77,32 @@ const (
 	defaultTimeout = 10 * time.Second
 	// userAgent 出站 User-Agent，便于接收端识别来源。
 	userAgent = "workbuddy2api-pro/notify"
+	// maxRespRead 读取响应体的上限（用于渠道业务级成功判定；防异常大响应占内存）。
+	maxRespRead = 8 << 10
 )
 
-// Config 通知配置（与 cmd/server 的 notify 段同构；New 直接接收三个字段，
-// 保留本类型供接线/文档/测试使用）。
+// Config 通知配置（与 cmd/server 的 notify 段同构；NewFromConfig 按其选择渠道，
+// New 等价于 Channel=webhook 的简写）。
 type Config struct {
-	WebhookURL string        // 空 = 关闭通知
+	WebhookURL string        // 目标地址；空 = 关闭通知
 	Timeout    time.Duration // 单次 HTTP 超时；<=0 回落 10s
 	Events     []string      // 订阅事件；空 = 默认三件套
+
+	// Channel 渠道类型："webhook"（默认/空）/ "wecom" / "telegram" / "bark"。
+	Channel string
+	// TelegramChatID telegram 渠道目标 chat_id（@channel 或数字 id）；telegram 必填。
+	TelegramChatID string
+	// Title 渠道消息标题（wecom/telegram/bark 展示；空 = 默认标题）。
+	Title string
 }
 
-// wireEvent 已序列化、待发送的一条事件（入队后 data map 不再被引用，无数据竞争）。
+// wireEvent 已编码、待发送的一条事件（入队后 data map 不再被引用，无数据竞争）。
 type wireEvent struct {
 	name string
 	body []byte
 }
 
-// payload 出站 JSON 结构（固定三字段，绝不夹带其它键）。
+// payload webhook 渠道出站 JSON 结构（固定三字段，绝不夹带其它键）。
 type payload struct {
 	Event string         `json:"event"`
 	TS    int64          `json:"ts"` // unix 秒（事件产生时刻，不是发送时刻）
@@ -101,6 +120,7 @@ type Stats struct {
 type Notifier struct {
 	cfg        Config
 	enabled    bool
+	adapter    channelAdapter // 渠道适配器（编码 + 成功判定）；enabled=false 时为 nil
 	subscribed map[string]struct{}
 	client     *http.Client
 
@@ -115,27 +135,80 @@ type Notifier struct {
 	dropped atomic.Int64
 }
 
-// New 构建通知器。webhookURL 为空（或非法/非 http(s)）时返回"关闭"实例：
-// Enabled()=false，Emit/Close 等全部 no-op（调用方无需各处分叉判断）。
-//
-// timeout<=0 回落 10s（配置侧已 clamp 1..60s，这里只做最后兜底）；events 为空
-// 使用默认集合 job_done/account_disabled/checkin_failed。
+// New 构建 webhook 渠道通知器（v2.3.0 兼容入口）。
+// webhookURL 为空（或非法/非 http(s)）时返回"关闭"实例：Enabled()=false，所有方法
+// no-op。timeout<=0 回落 10s；events 为空使用默认集合。
 func New(webhookURL string, timeout time.Duration, events []string) *Notifier {
-	webhookURL = strings.TrimSpace(webhookURL)
-	if webhookURL == "" {
+	return NewFromConfig(Config{
+		WebhookURL: webhookURL,
+		Timeout:    timeout,
+		Events:     events,
+		Channel:    ChannelWebhook,
+	})
+}
+
+// NewFromConfig 按配置构建通知器（v2.3.1 多渠道路径）。
+//
+// 防御性校验（config.normalize 已 fail fast，这里兜底"绕过 Load 的裸用/测试"）：
+//   - 未知 channel、telegram 缺 chat_id、目标 URL 为空/非法 → 返回关闭实例并 WARN；
+//   - channel 为空 → webhook；Title 为空 → "WorkBuddy2API Pro"。
+func NewFromConfig(cfg Config) *Notifier {
+	channel := strings.ToLower(strings.TrimSpace(cfg.Channel))
+	if channel == "" {
+		channel = ChannelWebhook
+	}
+	cfg.Channel = channel
+	cfg.Title = strings.TrimSpace(cfg.Title)
+	if cfg.Title == "" {
+		cfg.Title = defaultTitle
+	}
+	cfg.Events = normalizeEventNames(cfg.Events)
+
+	rawURL := strings.TrimSpace(cfg.WebhookURL)
+	if rawURL == "" {
+		// webhook 渠道为空是"正常关闭"（默认部署形态）；其它渠道为空是配置遗漏，给 WARN。
+		if channel != ChannelWebhook {
+			log.Printf("WARN: notify: 渠道 %s 未配置 notify.webhook_url，通知已关闭", channel)
+		}
 		return &Notifier{}
 	}
-	u, err := url.Parse(webhookURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		log.Printf("WARN: notify: webhook_url 非法或非 http(s)，通知已关闭 target=%s", maskWebhookURL(webhookURL))
+	if _, err := parseHTTPURL(rawURL); err != nil {
+		log.Printf("WARN: notify: notify.webhook_url 非法或非 http(s)（渠道 %s），通知已关闭 target=%s",
+			channel, maskURL(channel, rawURL))
 		return &Notifier{}
-	}
-	if timeout <= 0 {
-		timeout = defaultTimeout
 	}
 
-	subscribed := make(map[string]struct{}, len(events))
-	for _, e := range events {
+	var ad channelAdapter
+	switch channel {
+	case ChannelWebhook:
+		ad = webhookAdapter{u: rawURL}
+	case ChannelWecom:
+		ad = wecomAdapter{u: rawURL, title: cfg.Title}
+	case ChannelTelegram:
+		chatID := strings.TrimSpace(cfg.TelegramChatID)
+		if chatID == "" {
+			log.Printf("WARN: notify: 渠道 telegram 缺少 notify.telegram_chat_id，通知已关闭 target=%s",
+				maskURL(channel, rawURL))
+			return &Notifier{}
+		}
+		cfg.TelegramChatID = chatID
+		ad = telegramAdapter{u: rawURL, chatID: chatID, title: cfg.Title}
+	case ChannelBark:
+		ad = barkAdapter{u: rawURL, title: cfg.Title}
+	default:
+		log.Printf("WARN: notify: 未知 notify.channel=%q（可选 webhook/wecom/telegram/bark），通知已关闭", channel)
+		return &Notifier{}
+	}
+	return newNotifier(cfg, ad)
+}
+
+// newNotifier 渠道无关的通用构造：事件订阅归一化、队列/worker 启动、启动日志。
+func newNotifier(cfg Config, ad channelAdapter) *Notifier {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
+	subscribed := make(map[string]struct{}, len(cfg.Events))
+	for _, e := range cfg.Events {
 		if e = strings.TrimSpace(e); e != "" {
 			subscribed[e] = struct{}{}
 		}
@@ -145,31 +218,24 @@ func New(webhookURL string, timeout time.Duration, events []string) *Notifier {
 			subscribed[e] = struct{}{}
 		}
 	}
+	cfg.Events = sortedKeys(subscribed)
 
 	n := &Notifier{
-		cfg: Config{
-			WebhookURL: webhookURL,
-			Timeout:    timeout,
-			Events:     sortedKeys(subscribed),
-		},
+		cfg:        cfg,
 		enabled:    true,
+		adapter:    ad,
 		subscribed: subscribed,
-		client:     &http.Client{Timeout: timeout},
+		client:     &http.Client{Timeout: cfg.Timeout},
 		queue:      make(chan wireEvent, queueSize),
 		workerDone: make(chan struct{}),
 	}
 	go n.worker()
-	log.Printf("notify: webhook 通知已启用 target=%s timeout=%s events=%v",
-		maskWebhookURL(webhookURL), timeout, n.cfg.Events)
+	log.Printf("notify: 通知已启用 channel=%s target=%s timeout=%s title=%q events=%v",
+		ad.channel(), ad.target(), cfg.Timeout, cfg.Title, cfg.Events)
 	return n
 }
 
-// NewFromConfig 便于 main 一行接线（Config 与 config.json 的 notify 段同构）。
-func NewFromConfig(cfg Config) *Notifier {
-	return New(cfg.WebhookURL, cfg.Timeout, cfg.Events)
-}
-
-// Enabled 通知是否启用（webhook_url 非空且合法）。
+// Enabled 通知是否启用（目标地址非空且合法、渠道参数齐全）。
 func (n *Notifier) Enabled() bool { return n != nil && n.enabled }
 
 // Event 判断某事件名是否被订阅（关闭状态恒 false；订阅空=默认集合）。
@@ -190,10 +256,10 @@ func (n *Notifier) Stats() Stats {
 }
 
 // Emit 异步发送一条事件；未启用或事件未订阅时直接返回。调用方永不阻塞：
-// 序列化在调用方 goroutine 完成（保证 data 快照不被后续修改），HTTP 发送在 worker。
+// 编码在调用方 goroutine 完成（保证 data 快照不被后续修改），HTTP 发送在 worker。
 //
 // ctx 只表达"调用方生命周期"：已取消则不入队（计入 dropped）。真正发送使用
-// 独立的一次性超时（webhook 超时配置），不受调用方 ctx 取消影响——否则一次
+// 独立的一次性超时（notify.timeout），不受调用方 ctx 取消影响——否则一次
 // 请求取消就会让告警静默丢失。
 func (n *Notifier) Emit(ctx context.Context, event string, data map[string]any) {
 	if n == nil || !n.enabled || !n.Event(event) {
@@ -203,16 +269,16 @@ func (n *Notifier) Emit(ctx context.Context, event string, data map[string]any) 
 		n.drop(event, "context canceled")
 		return
 	}
-	body, err := buildPayload(event, time.Now().Unix(), data)
+	body, err := n.adapter.buildBody(event, time.Now().Unix(), data)
 	if err != nil {
-		n.drop(event, "序列化失败: "+err.Error())
+		n.drop(event, "编码失败: "+err.Error())
 		return
 	}
 	n.enqueue(wireEvent{name: event, body: body})
 }
 
 // JobDone 任务批次结束（event job_done）。job 建议携带：id/kind/trigger/total/done/
-// fail/skip/finished_at 等统计（由 #9 任务历史的数据源提供，不含凭证）。
+// fail/skip 等统计（由 #9 任务历史的数据源提供，不含凭证）。
 func (n *Notifier) JobDone(job map[string]any) {
 	n.Emit(context.Background(), EventJobDone, job)
 }
@@ -301,15 +367,17 @@ func (n *Notifier) send(ev wireEvent) {
 		return
 	}
 	n.failed.Add(1)
-	log.Printf("WARN: notify: 事件 %q 发送失败（已尝试 %d 次）: %v", ev.name, maxAttempts, lastErr)
+	log.Printf("WARN: notify: 事件 %q 发送失败（已尝试 %d 次，渠道 %s）: %v",
+		ev.name, maxAttempts, n.adapter.channel(), lastErr)
 }
 
-// post 单次 HTTP POST；2xx 视为成功，其它状态码/网络错误返回 error。
+// post 单次 HTTP POST：2xx 只代表传输成功，渠道业务级成功由 adapter.checkResponse
+// 二次判定（wecom errcode / telegram ok）。响应体只读取前 8KB 供解析。
 func (n *Notifier) post(body []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), n.cfg.Timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.cfg.WebhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.adapter.url(), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("构造请求: %w", err)
 	}
@@ -324,18 +392,20 @@ func (n *Notifier) post(body []byte) error {
 		if errors.As(err, &uerr) {
 			err = uerr.Err
 		}
-		return fmt.Errorf("webhook 请求失败: %w", err)
+		return fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	// 丢弃响应体（限读 4KB 防异常大响应占内存），保证连接可复用。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRespRead))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("webhook 返回 HTTP %d", resp.StatusCode)
+		return fmt.Errorf("接口返回 HTTP %d", resp.StatusCode)
+	}
+	if err := n.adapter.checkResponse(respBody); err != nil {
+		return err
 	}
 	return nil
 }
 
-// buildPayload 序列化 payload；data 序列化后超过 maxDataBytes 时降级为摘要
+// buildPayload 序列化 webhook payload；data 序列化后超过 maxDataBytes 时降级为摘要
 // （保留 truncated/original_bytes/keys），既保证告警可达又不阻塞主流程。
 func buildPayload(event string, ts int64, data map[string]any) ([]byte, error) {
 	if data == nil {
@@ -361,8 +431,8 @@ func buildPayload(event string, ts int64, data map[string]any) ([]byte, error) {
 	return json.Marshal(payload{Event: event, TS: ts, Data: data})
 }
 
-// maskWebhookURL 日志脱敏：只保留 scheme://host + path 前 12 个字符（按 rune 截断），
-// 丢弃 query/fragment/userinfo——Webhook URL 常把 token 放在 path/query 里。
+// maskWebhookURL 日志脱敏（webhook 渠道，保持 v2.3.0 语义）：只保留
+// scheme://host + path 前 12 个字符（按 rune 截断），丢弃 query/fragment/userinfo。
 func maskWebhookURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -389,5 +459,24 @@ func sortedKeys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// normalizeEventNames 事件订阅归一化：去空白/空项、去重、小写（与 config.normalize
+// 同口径：notify.events 里大小写混写不会造成"订阅了却收不到"）。
+func normalizeEventNames(events []string) []string {
+	out := make([]string, 0, len(events))
+	seen := make(map[string]struct{}, len(events))
+	for _, e := range events {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
+	}
 	return out
 }

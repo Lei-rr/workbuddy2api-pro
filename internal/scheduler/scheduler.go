@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/jobs"
 	"github.com/lei-rr/workbuddy2api-pro/internal/logfmt"
 	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
 	"github.com/lei-rr/workbuddy2api-pro/internal/upstream"
@@ -87,6 +88,17 @@ type Config struct {
 	// 时点落在 (now-catch_up_minutes, now] 内且今天尚未成功跑过 → 立即补跑一轮。
 	// 0 = 关闭（Config 零值 = 旧行为「错过就等明天」，对老调用方零影响）。
 	CatchUpMinutes int
+
+	// CheckinConcurrency 签到批次的账号级并发度（v2.3.1 #11）：<=0 回落默认 3，
+	// clamp 1..16。签到是「串行 1146 号≈1 小时」的旧瓶颈，worker pool 后单轮
+	// 约 10-20 分钟；并发过高会撞上游风控（默认 3 是保守值，面板可热改）。
+	CheckinConcurrency int
+
+	// Jobs 可选注入的 Job Registry（v2.3.1 #11）：非 nil 时定时/补跑批次会创建
+	// Job（trigger=schedule/catch_up）进 Job 历史，并支持面板取消（ctx 取消早停）。
+	// nil = 纯调度模式（老测试/嵌入式用法，行为与 v2.3.0 一致）。
+	// 通常经 New 装配；运行期热挂载用 SetJobsRegistry。
+	Jobs *jobs.Registry
 }
 
 const (
@@ -100,6 +112,11 @@ const (
 	balanceStartupSkipThreshold = 200
 	// maxCatchUpMinutes 补跑窗口上限 720 分钟（12h）；再宽等价于「全天都补」。
 	maxCatchUpMinutes = 720
+	// defaultCheckinConcurrency 签到 worker pool 默认并发（v2.3.1 #11）：3 是
+	// 「串行 1146 号≈1h」与「上游 WAF 风控」之间的保守折中（QA 观察 429 率再调高）。
+	defaultCheckinConcurrency = 3
+	// maxCheckinConcurrency 签到并发硬顶 16（配置 clamp 同口径）。
+	maxCheckinConcurrency = 16
 )
 
 // TaskKind 全池批量任务族标识（单飞 gate 键）。面板批量端点（*_all）与定时
@@ -174,6 +191,24 @@ type Scheduler struct {
 	// 配置经 SetBalanceRefreshConcurrency 热改，下一轮刷新生效。
 	balanceConcurrency atomic.Int64
 
+	// checkinConcurrency 签到 worker pool 账号级并发度（v2.3.1 #11）。atomic 读写：
+	// 面板保存配置经 SetCheckinConcurrency 热改，下一轮签到生效（在途 worker 不打断）。
+	checkinConcurrency atomic.Int64
+
+	// checkinMu/checkinDoneDay 当日已签标记（v2.3.1 #11）：uid → 本地日期
+	// "2006-01-02"。同一进程内同日再跑（手动/定时/补跑）跳过 checkin RPC、仍刷新
+	// 余额；进程重启清空（上游 already-checked 幂等，重跑安全，无需持久化）。
+	checkinMu      sync.Mutex
+	checkinDoneDay map[string]string
+
+	// batchWG 定时/补跑派发的任务族 goroutine（v2.3.1 #11 按族解耦后不再阻塞主
+	// 循环）：Run 退出前在此收敛（ctx 已取消，各任务体会尽快收尾）。
+	batchWG sync.WaitGroup
+
+	// jobsReg 可选 Job Registry（v2.3.1 #11）：定时/补跑批次写 Job 历史并支持取消。
+	// 由 schedMu 保护（SetJobsRegistry 可在运行期热挂载）。
+	jobsReg *jobs.Registry
+
 	// nowFn 可注入时钟（测试用；生产恒为 time.Now）。补跑窗口判定与 lastRun 记录
 	// 共用同一时钟，保证「窗口边界/跨天」用例可确定性复现（不随运行环境墙钟漂移）。
 	nowFn func() time.Time
@@ -207,23 +242,38 @@ func New(cfg Config) *Scheduler {
 	// 负值钳 0（=关闭）、上限 720。config 的 normalize 已做同一套夹取，这里兜底
 	// 直接构造 Config 的调用方（测试/嵌入式用法），保证运行期只见到合法值。
 	cfg.BalanceRefreshConcurrency = normalizeBalanceRefreshConcurrency(cfg.BalanceRefreshConcurrency)
+	cfg.CheckinConcurrency = normalizeCheckinConcurrency(cfg.CheckinConcurrency)
 	if cfg.CatchUpMinutes < 0 {
 		cfg.CatchUpMinutes = 0
 	} else if cfg.CatchUpMinutes > maxCatchUpMinutes {
 		cfg.CatchUpMinutes = maxCatchUpMinutes
 	}
 	s := &Scheduler{
-		cfg:           cfg,
-		adoptTried:    make(map[string]string),
-		rearmSchedule: make(chan struct{}, 1),
-		rearmBalance:  make(chan struct{}, 1),
-		rearmSweep:    make(chan struct{}, 1),
-		nowFn:         time.Now,
-		running:       make(map[TaskKind]bool),
-		lastRun:       make(map[taskKind]time.Time),
+		cfg:            cfg,
+		adoptTried:     make(map[string]string),
+		rearmSchedule:  make(chan struct{}, 1),
+		rearmBalance:   make(chan struct{}, 1),
+		rearmSweep:     make(chan struct{}, 1),
+		nowFn:          time.Now,
+		running:        make(map[TaskKind]bool),
+		lastRun:        make(map[taskKind]time.Time),
+		checkinDoneDay: make(map[string]string),
+		jobsReg:        cfg.Jobs,
 	}
 	s.balanceConcurrency.Store(int64(cfg.BalanceRefreshConcurrency))
+	s.checkinConcurrency.Store(int64(cfg.CheckinConcurrency))
 	return s
+}
+
+// normalizeCheckinConcurrency 归一跳过并发：<=0 回落默认 3，上限 16。
+func normalizeCheckinConcurrency(n int) int {
+	if n <= 0 {
+		return defaultCheckinConcurrency
+	}
+	if n > maxCheckinConcurrency {
+		return maxCheckinConcurrency
+	}
+	return n
 }
 
 // normalizeBalanceRefreshConcurrency 归一余额刷新并发：<=0 回落默认 8，上限 32。
@@ -410,6 +460,55 @@ func (s *Scheduler) BalanceRefreshConcurrency() int {
 		return int(v)
 	}
 	return defaultBalanceRefreshConcurrency
+}
+
+// SetCheckinConcurrency 热更新签到账号级并发度（v2.3.1 #11）：<=0 回落默认 3，上限 16。
+// 只影响下一轮签到（在途 worker 按旧并发跑完）；面板保存配置后立即生效。
+func (s *Scheduler) SetCheckinConcurrency(n int) {
+	s.checkinConcurrency.Store(int64(normalizeCheckinConcurrency(n)))
+}
+
+// CheckinConcurrency 当前签到账号级并发度（供日志/观测）。
+func (s *Scheduler) CheckinConcurrency() int {
+	if v := s.checkinConcurrency.Load(); v > 0 {
+		return int(v)
+	}
+	return defaultCheckinConcurrency
+}
+
+// SetJobsRegistry 运行期挂载/替换 Job Registry（v2.3.1 #11）：非 nil 后定时/
+// 补跑批次会创建 Job（trigger=schedule/catch_up）。传 nil 可关闭 Job 化（测试/嵌入式）。
+func (s *Scheduler) SetJobsRegistry(reg *jobs.Registry) {
+	s.schedMu.Lock()
+	s.jobsReg = reg
+	s.schedMu.Unlock()
+}
+
+// jobsRegistry 当前 Job Registry（可能为 nil）。
+func (s *Scheduler) jobsRegistry() *jobs.Registry {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.jobsReg
+}
+
+// checkinDayKey 进程内「当日已签」标记的日期键（本地时区自然日；与上游签到重置
+// 口径一致——上游按本地/业务日重置，用本地日期即可，不做 CST 特殊处理）。
+func checkinDayKey(t time.Time) string { return t.Format("2006-01-02") }
+
+// checkinDoneToday 该账号本进程内今天是否已签到成功（v2.3.1 #11 跳过已签）。
+func (s *Scheduler) checkinDoneToday(uid string) bool {
+	day := checkinDayKey(s.now())
+	s.checkinMu.Lock()
+	defer s.checkinMu.Unlock()
+	return s.checkinDoneDay[uid] == day
+}
+
+// markCheckinDone 标记该账号今天已签到成功（含上游 already-checked 幂等）。
+func (s *Scheduler) markCheckinDone(uid string) {
+	day := checkinDayKey(s.now())
+	s.checkinMu.Lock()
+	s.checkinDoneDay[uid] = day
+	s.checkinMu.Unlock()
 }
 
 func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
@@ -615,7 +714,17 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
+//
+// v2.3.1 #11 按族解耦：到点批次不再 wg.Wait 整批——每族独立 goroutine 派发，
+// 慢签到不阻塞同/后一时点的旅行/活跃/保活（修复「批次跨过后续时点导致整天漏跑」）。
+// 退出前等待本进程派发的任务族收敛（ctx 已取消，任务体内部会尽快收尾）。
 func (s *Scheduler) Run(ctx context.Context) {
+	s.runLoop(ctx)
+	s.batchWG.Wait()
+}
+
+// runLoop 是 Run 的排程循环主体（拆出便于退出收敛逻辑与测试）。
+func (s *Scheduler) runLoop(ctx context.Context) {
 	for {
 		// 补跑窗口（v2.0.1 #11）：启动后首轮、以及每批任务结束后（循环回到顶部）
 		// 先检查一次「今天错过的时点」。批次/补跑本身可能跨过后续时点（如 09:00
@@ -649,16 +758,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 			if !awaitWakeupGrace(ctx, next) {
 				return // ctx 取消：放弃本批，优雅退出
 			}
-			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
-			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
-			// 任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠的风险与
-			// 串行版相同——nextWake 只挑现在之后的时点）。
-			s.runBatch(ctx, kinds)
+			// 唤醒时每族**独立 goroutine** 派发（v2.3.1 #11 按族解耦）：不再等整批
+			// 跑完，慢签到（1146 号串行≈1h→worker pool 后 10-20min）不会阻塞同一
+			// 时点的旅行/活跃，也不会吞掉后一时点的批次；单飞 gate 保证同类不叠加。
+			s.dispatchBatch(ctx, kinds)
 		}
 	}
 }
 
-// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// runBatch 并行派发一批任务并**等待全部完成**（同步语义；补跑窗口/测试沿用）。
+// 定时主循环已改用 dispatchBatch（不等整批）。
 // ctx 取消时由各任务内部的可取消等待快速收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 	var wg sync.WaitGroup
@@ -672,26 +781,89 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 	wg.Wait()
 }
 
-// executeTaskKind 在单飞 gate 保护下执行一类任务；同类已在跑返回 false（本轮跳过）。
-// 定时批次与补跑共用本入口，保证「上一轮没跑完时不会叠加第二轮全池任务」。
-// 任务体自身负责在成功跑完后记录 lastRun（补跑窗口据此去重）。
-func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
-	if gk, gated := gateKindOf(k); gated {
-		if !s.BeginTask(gk) {
-			log.Printf("scheduler: %s 任务正在执行中，本轮跳过（同类单飞）", gk)
+// dispatchBatch 按族独立 goroutine 派发一批任务、**不等待完成**（v2.3.1 #11）：
+// 每族先同步抢单飞 gate（保证「同类不叠加」的判定在派发时即确定），再异步执行。
+// 派发的 goroutine 登记到 batchWG，Run 退出前统一收敛。
+func (s *Scheduler) dispatchBatch(ctx context.Context, kinds []taskKind) {
+	for _, k := range kinds {
+		if ctx.Err() != nil {
+			return
+		}
+		s.dispatchTaskKind(ctx, k, jobs.TriggerSchedule)
+	}
+}
+
+// dispatchTaskKind 派发单族任务（不等待完成）：先同步占 gate（同类在跑返回 false），
+// 再按是否注入 Job Registry 选择执行方式：
+//
+//   - 注入 Registry（生产）：创建 Job（trigger=schedule/catch_up）异步执行任务体，
+//     gate 在 Job 体内持有到结束——Job 出现在 /panel/api/jobs，面板 cancel → Job ctx
+//     取消 → 任务体提前停止；Job 失败不阻断后续调度；
+//   - 未注入（老测试/嵌入式）：起 goroutine 直接执行任务体，行为与 v2.3.0 一致。
+//
+// 无 gate 的族（夜猫子/成长）不建 Job（Job Kind 枚举只覆盖五类批量任务），直接异步。
+func (s *Scheduler) dispatchTaskKind(ctx context.Context, k taskKind, trigger jobs.Trigger) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	gk, gated := gateKindOf(k)
+	if gated && !s.BeginTask(gk) {
+		log.Printf("scheduler: %s 任务正在执行中，本轮跳过（同类单飞）", gk)
+		return false
+	}
+	if !gated {
+		// 夜猫子/成长：没有 Job Kind/批量 gate，直接异步执行。
+		s.batchWG.Add(1)
+		go func() {
+			defer s.batchWG.Done()
+			s.runTaskBody(ctx, k, nil)
+		}()
+		return true
+	}
+	if reg := s.jobsRegistry(); reg != nil {
+		total := len(s.cfg.Pool.List())
+		job, err := reg.Run(jobs.Kind(gk), trigger, total,
+			func(jobCtx context.Context, prog jobs.Progress) error {
+				defer s.EndTask(gk)
+				s.runTaskBody(jobCtx, k, ProgressFunc(prog))
+				return nil // 账号级失败只进 Job.Fail 计数，不把整轮标 failed
+			})
+		if err != nil {
+			// 理论上 gate 已保证同类单飞；Registry 内部异常/关闭时不阻塞调度。
+			s.EndTask(gk)
+			log.Printf("scheduler: %s 批次 Job 创建失败，回退直接执行: %v", gk, err)
+			s.batchWG.Add(1)
+			go func() {
+				defer s.batchWG.Done()
+				s.runTaskBody(ctx, k, nil)
+			}()
 			return false
 		}
-		defer s.EndTask(gk)
+		log.Printf("scheduler: %s 定时批次已启动 job=%s trigger=%s", gk, job.ID, trigger)
+		return true
 	}
+	s.batchWG.Add(1)
+	go func() {
+		defer s.batchWG.Done()
+		defer s.EndTask(gk)
+		s.runTaskBody(ctx, k, nil)
+	}()
+	return true
+}
+
+// runTaskBody 执行任务族主体（不含 gate）：统一从 executeTaskKind / dispatchTaskKind
+// 调用，保证手动、定时、补跑、Job 化四条路径的任务体完全一致。
+// progress 仅在 Job 化路径非 nil；growth 返回 false 表示回调未挂载。
+func (s *Scheduler) runTaskBody(ctx context.Context, k taskKind, progress ProgressFunc) bool {
 	switch k {
 	case taskCheckin:
-		s.runCheckin(ctx, nil)
+		s.runCheckin(ctx, progress)
 	case taskTravel:
-		s.runTravel(ctx, nil)
+		s.runTravel(ctx, progress)
 	case taskActivity:
-		s.runActivity(ctx, nil)
+		s.runActivity(ctx, progress)
 	case taskKeepalive:
-		s.runKeepalive(ctx, nil)
+		s.runKeepalive(ctx, progress)
 	case taskBlackcat:
 		s.RunBlackcatNow()
 	case taskGrowth:
@@ -706,9 +878,22 @@ func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
 		// 队列已启动（内部单飞）：标今天已跑，补跑窗口不再重复触发。
 		s.noteTaskDone(taskGrowth, s.now())
 	case taskBalance:
-		_ = s.RunBalanceRefreshCtx(ctx, nil)
+		_ = s.RunBalanceRefreshCtx(ctx, progress)
 	}
 	return true
+}
+
+// executeTaskKind 在单飞 gate 保护下**同步**执行一类任务（补跑/测试沿用）；
+// 同类已在跑返回 false（本轮跳过）。定时主循环改走 dispatchTaskKind（异步/Job 化）。
+func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
+	if gk, gated := gateKindOf(k); gated {
+		if !s.BeginTask(gk) {
+			log.Printf("scheduler: %s 任务正在执行中，本轮跳过（同类单飞）", gk)
+			return false
+		}
+		defer s.EndTask(gk)
+	}
+	return s.runTaskBody(ctx, k, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +945,11 @@ func (s *Scheduler) catchUpDue(now time.Time) []taskKind {
 		if f.off || s.taskRanOn(f.kind, now) {
 			continue
 		}
+		// 同类正在执行（手动 Job/定时批次/上一轮补跑）→ 本轮不补：单飞 gate 保证
+		// 不会叠加两轮全池任务；提前过滤避免「刚派发完就判补跑」的日志噪音。
+		if gk, gated := gateKindOf(f.kind); gated && s.TaskRunning(gk) {
+			continue
+		}
 		for _, h := range f.hours {
 			slot := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
 			// 窗口左开右闭：(now-catch_up, now]；恰好等于窗口起点的时点不补
@@ -786,6 +976,18 @@ func (s *Scheduler) runCatchUps(ctx context.Context, now time.Time) []taskKind {
 	}
 	log.Printf("scheduler: 补跑窗口命中 %v（%d 分钟内错过的时点，今天尚未跑过）",
 		due, s.catchUpWindow()/time.Minute)
+	// v2.3.1 #11：注入 Job Registry 时补跑批次也进 Job 历史（trigger=catch_up），
+	// 异步派发不阻塞主循环；未注入时保持 v2.3.0 同步语义（返回时任务已跑完，
+	// 既有确定性测试依赖该时序）。
+	if s.jobsRegistry() != nil {
+		var started []taskKind
+		for _, k := range due {
+			if s.dispatchTaskKind(ctx, k, jobs.TriggerCatchUp) {
+				started = append(started, k)
+			}
+		}
+		return started
+	}
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -843,95 +1045,186 @@ func (s *Scheduler) RunCheckinCtx(ctx context.Context, progress ProgressFunc) er
 	return nil
 }
 
-// runCheckin 签到遍历（ctx 感知）：ctx 取消后不再发起新的上游请求、不记「今天
-// 已跑」——剩余账号留给下一轮（优雅停机不把半轮当整轮）。
+// checkinRetryBackoff 签到/余额查询瞬态错误重试前的短退避（v2.3.1 #11：1-2s；
+// 测试可置 0，与 travelAccountDelay 同款「测试可缩短」口径）。
+var checkinRetryBackoff = 1500 * time.Millisecond
+
+// isTransientErr 报告 scheduler 层是否应对该错误再做 1 次重试（v2.3.1 #11）。
 //
-// 进度口径（v2.3.0 #10）：done = 已处理账号数（含失败/跳过，进度条单调前进），
-// fail = 签到或余额查询失败的账号数，skip = 域门控/无凭证/禁用跳过数。
+// 分层重试设计（避免重复放大——#11 的痛点之一就是「重试风暴」）：
+//   - 网络错误 / 超时 / 5xx：upstream.retryBillingTransient 已对签到/余额这类计费
+//     维护调用做过 1+2 次有界重试（2s/4s 退避），scheduler 不再叠加；
+//   - 429 软限流（ErrSoftRate）：上游计费路径**不重试**（isTransientBillingErr 只认
+//     ErrServer/网络错误），由 scheduler 层补 1 次短退避重试；
+//   - 其余 4xx 鉴权/凭证/业务/内容拦截/余额不足：确定性失败，不重试；
+//   - ctx 已取消：不重试（停机/取消立即收尾）。
+func isTransientErr(ctx context.Context, err error) bool {
+	if err == nil || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		return ue.Kind == upstream.ErrSoftRate
+	}
+	return false
+}
+
+// callWithRetry 对 scheduler 层负责的瞬态错误（当前：429 限流）重试 1 次，
+// 短退避、ctx 取消立即放弃并返回原始错误；网络/5xx 的重试由 upstream 客户端负责。
+func (s *Scheduler) callWithRetry(ctx context.Context, op func() error) error {
+	err := op()
+	if err == nil || !isTransientErr(ctx, err) {
+		return err
+	}
+	if !sleepCtx(ctx, checkinRetryBackoff) {
+		return err
+	}
+	return op()
+}
+
+// runCheckin 签到遍历（v2.3.1 #11：账号级 worker pool，默认并发 3）：
+//   - ctx 取消后不再派发新账号、等在途返回，且不记「今天已跑」；
+//   - 当日已签（本进程内成功/幂等标记过）跳过 checkin RPC，**仍刷新余额/解冻**
+//     （21:00 轮次仍需要最新积分；上游 already-checked 幂等也不重复打）；
+//   - 仅瞬态错误（网络/超时/5xx/429）重试 1 次（短退避）；4xx 鉴权/业务直接 fail；
+//   - 进度口径：done=已处理账号数（不含 skip、含 fail），fail=其中签到/余额失败数，
+//     skip=禁用/无凭证/域门控/当日已签跳过数。
+//
+// 末尾连登管家（RunStreakBonusNow）在整轮 worker 收敛后执行；ctx 取消则不执行。
 func (s *Scheduler) runCheckin(ctx context.Context, progress ProgressFunc) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	stList := s.cfg.Pool.List()
 	total := len(stList)
-	done, fail, skip := 0, 0, 0
-	for _, st := range stList {
-		// v2.0.1 #11：时间敏感循环内的可取消等待/检查（本循环无 sleep，但整轮
-		// 1146 号可能跑近一小时，停机信号要在账号之间及时生效）。
-		if ctx.Err() != nil {
-			return
+	var done, fail, skip atomic.Int64
+	report := func(msg string) {
+		reportProgress(progress, int(done.Load()), total, int(fail.Load()), int(skip.Load()), msg)
+	}
+	if total > 0 {
+		conc := s.CheckinConcurrency()
+		if conc > total {
+			conc = total
 		}
-		if st.Disabled && !includeDisabled {
-			skip++
-			reportProgress(progress, done, total, fail, skip, "")
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			skip++
-			reportProgress(progress, done, total, fail, skip, "")
-			continue
-		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			skip++
-			reportProgress(progress, done, total, fail, skip, "")
-			continue
-		}
-		acctFailed := false
-		msg := ""
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
-				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-					acctFailed = true
-					msg = fmt.Sprintf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		idxCh := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < conc; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range idxCh {
+					if ctx.Err() != nil {
+						continue // 取消：快速排空剩余索引，不再发上游请求
+					}
+					skipped, failed, msg := s.checkinAccount(ctx, stList[i], expiringSoon, includeDisabled)
+					if skipped {
+						skip.Add(1)
+					}
+					if failed {
+						fail.Add(1)
+					}
+					if !skipped {
+						done.Add(1)
+					}
+					report(msg)
 				}
-				// 其余业务错误也继续走余额查询
-			} else {
-				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-				// 重复触发时出现），成功也落一行。
-				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+			}()
+		}
+	dispatch:
+		for i := range stList {
+			select {
+			case idxCh <- i:
+			case <-ctx.Done():
+				break dispatch
 			}
 		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与
-		// 按自然日聚合的全部批次（首页快照与「检查」共用同一口径）。
-		remain, creditsTotal, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			acctFailed = true
-			msg = fmt.Sprintf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-		} else {
-			s.cfg.Pool.ReenableIfCredits(st.UID, remain, creditsTotal)
-			s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
-				Remain:            remain,
-				Total:             creditsTotal,
-				Expiring:          expiring,
-				EarliestAt:        earliestAt,
-				EarliestRemaining: earliestRemaining,
-				ExpiryBuckets:     poolExpiryBuckets(buckets),
-			})
-		}
-		if acctFailed {
-			fail++
-		}
-		done++
-		reportProgress(progress, done, total, fail, skip, msg)
+		close(idxCh)
+		wg.Wait()
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	s.RunStreakBonusNow()
-	if ctx.Err() == nil {
-		s.noteTaskDone(taskCheckin, s.now())
+	s.noteTaskDone(taskCheckin, s.now())
+}
+
+// checkinAccount 单账号签到 + 余额刷新（v2.3.1 #11 worker pool 调用；Pool/Upstream
+// 本身线程安全，worker 之间无共享可变状态）。返回 skipped=跳过签到（禁用/无凭证/
+// 域门控/当日已签）、failed=签到或余额查询失败、msg=失败摘要（写入 Job.LogTail）。
+func (s *Scheduler) checkinAccount(ctx context.Context, st pool.Status, expiringSoon time.Duration, includeDisabled bool) (skipped, failed bool, msg string) {
+	if st.Disabled && !includeDisabled {
+		return true, false, ""
 	}
+	a := s.cfg.Pool.AuthByUID(st.UID)
+	if a == nil || a.RefreshTokenValue() == "" {
+		return true, false, ""
+	}
+	// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+	// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+	// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+	if a.IsGlobal() {
+		return true, false, ""
+	}
+	// 当日已签（进程内标记）：跳过 checkin RPC，但**仍刷新余额**——21:00 轮次
+	// 仍需要最新积分/解冻；企业版本就不调签到 RPC（不算「已签跳过」）。
+	alreadySigned := !a.IsEnterprise() && s.checkinDoneToday(st.UID)
+	// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
+	// 400 code 10001「企业账号不支持该操作」。跳过签到，但余额查询照常跑
+	//（企业额度走 get-enterprise-user-usage 口径，是 credit_floor 判定与面板额度
+	// 展示的唯一数据源）。
+	if !a.IsEnterprise() && !alreadySigned {
+		err := s.callWithRetry(ctx, func() error {
+			return s.cfg.Upstream.DailyCheckin(a)
+		})
+		switch {
+		case err == nil:
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			s.markCheckinDone(st.UID)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+		case upstream.IsAlreadyCheckin(err):
+			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			s.markCheckinDone(st.UID)
+			log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+		default:
+			log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			failed = true
+			msg = fmt.Sprintf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		}
+	}
+	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与按自然日
+	// 聚合的全部批次（首页快照与「检查」共用同一口径）；瞬态错误重试 1 次。
+	var (
+		remain, creditsTotal, expiring, earliestRemaining int64
+		earliestAt                                        time.Time
+		buckets                                           []upstream.ExpiryBucket
+	)
+	err := s.callWithRetry(ctx, func() error {
+		var e error
+		remain, creditsTotal, expiring, earliestAt, earliestRemaining, buckets, e =
+			s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
+		return e
+	})
+	if err != nil {
+		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		failed = true
+		msg = fmt.Sprintf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+	} else {
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain, creditsTotal)
+		s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
+			Remain:            remain,
+			Total:             creditsTotal,
+			Expiring:          expiring,
+			EarliestAt:        earliestAt,
+			EarliestRemaining: earliestRemaining,
+			ExpiryBuckets:     poolExpiryBuckets(buckets),
+		})
+	}
+	if alreadySigned {
+		skipped = true
+	}
+	return skipped, failed, msg
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。

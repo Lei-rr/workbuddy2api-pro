@@ -36,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.3.0-pro"
+const appVersion = "2.3.1-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -107,7 +107,15 @@ func main() {
 	defer cancel()
 
 	// v2.3.0 #19 事件通知（Webhook；空/非法 URL = 关闭，Notifier 为 no-op 实例）。
-	notifier := notify.New(cfg.Notify.WebhookURL, cfg.NotifyTimeoutDur, cfg.Notify.Events)
+	// v2.3.1 #19：渠道配置（webhook/wecom/telegram/bark）统一由 notify.NewFromConfig 解析。
+	notifier := notify.NewFromConfig(notify.Config{
+		WebhookURL:     cfg.Notify.WebhookURL,
+		Timeout:        cfg.NotifyTimeoutDur,
+		Events:         cfg.Notify.Events,
+		Channel:        cfg.Notify.Channel,
+		TelegramChatID: cfg.Notify.TelegramChatID,
+		Title:          cfg.Notify.Title,
+	})
 	// 兜底关闭（幂等）：正常路径在 main 尾部显式带超时排空后再退出。
 	defer func() { _ = notifier.Close(context.Background()) }()
 
@@ -264,12 +272,18 @@ func main() {
 		// v2.0.1 #11 子项：补跑窗口（默认 120 分钟，0=关闭）。批次跨过后续时点
 		// 或进程重启后，把「今天尚未跑过且在窗口内」的任务族立即补跑一轮。
 		CatchUpMinutes: cfg.Schedule.CatchUpMinutes,
+		// v2.3.1 #11：签到 worker pool 账号级并发（默认 3，clamp 1..16；面板保存热生效）。
+		CheckinConcurrency: cfg.Schedule.CheckinConcurrency,
+		// v2.3.1 #11：定时/补跑批次进 Job 历史（trigger=schedule/catch_up），
+		// 面板 GET /panel/api/jobs 可见、cancel 可让批次提前停止；JobDone 走 webhook。
+		Jobs: jobReg,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
 		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
 	default:
-		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻；账号级并发 %d）",
+			cfg.Schedule.CheckinHours, cfg.Schedule.CheckinConcurrency)
 	}
 	switch {
 	case !cfg.Schedule.TravelEnabled:

@@ -154,6 +154,11 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// CheckinConcurrency 签到批次的账号级并发度（v2.3.1 #11）：默认 3，clamp 1..16。
+		// 1146 号池下单号签到约 2-3s，串行需 1 小时级；并发 3-5 可压到十几分钟，
+		// 过高会触发上游风控（WAF 429/403），保守默认 3。
+		CheckinConcurrency int `json:"checkin_concurrency"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -302,6 +307,13 @@ type Config struct {
 		Timeout string `json:"timeout"`
 		// Events 订阅事件名（空 = 默认集合 job_done/account_disabled/checkin_failed）。
 		Events []string `json:"events,omitempty"`
+		// Channel 渠道类型（v2.3.1 #19）：webhook（默认，通用 JSON）/ wecom（企业微信机器人）/
+		// telegram（Bot sendMessage，需 telegram_chat_id）/ bark（iOS Bark）。
+		Channel string `json:"channel"`
+		// TelegramChatID telegram 渠道目标 chat_id（@channel 或数字 id）。
+		TelegramChatID string `json:"telegram_chat_id"`
+		// Title 渠道消息标题（wecom/bark 用；默认 "WorkBuddy2API Pro"）。
+		Title string `json:"title"`
 	} `json:"notify"`
 
 	// 解析后
@@ -345,6 +357,8 @@ func Default() *Config {
 	c.Jobs.MaxConcurrency = 4
 	c.Jobs.Retain = 50
 	c.Notify.Timeout = "10s"
+	c.Notify.Channel = "webhook"
+	c.Notify.Title = "WorkBuddy2API Pro"
 	c.Notify.Events = []string{"job_done", "account_disabled", "checkin_failed"}
 	c.Panel.PollIntervalSec = 5
 	c.Panel.PackageDetailLimit = 5
@@ -378,6 +392,7 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.CheckinConcurrency = 3
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -554,6 +569,20 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_NOTIFY_TIMEOUT"); v != "" {
 		c.Notify.Timeout = v
 	}
+	if v := os.Getenv("WB2A_CHECKIN_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.CheckinConcurrency = n
+		}
+	}
+	if v := os.Getenv("WB2A_NOTIFY_CHANNEL"); v != "" {
+		c.Notify.Channel = v
+	}
+	if v := os.Getenv("WB2A_NOTIFY_TELEGRAM_CHAT_ID"); v != "" {
+		c.Notify.TelegramChatID = v
+	}
+	if v := os.Getenv("WB2A_NOTIFY_TITLE"); v != "" {
+		c.Notify.Title = v
+	}
 	if v := os.Getenv("WB2A_NOTIFY_EVENTS"); v != "" {
 		var events []string
 		for _, e := range strings.Split(v, ",") {
@@ -716,6 +745,28 @@ func (c *Config) normalize() error {
 	case c.NotifyTimeoutDur > 60*time.Second:
 		c.Notify.Timeout = "60s"
 		c.NotifyTimeoutDur = 60 * time.Second
+	}
+	if c.Schedule.CheckinConcurrency <= 0 {
+		c.Schedule.CheckinConcurrency = 3
+	}
+	if c.Schedule.CheckinConcurrency > 16 {
+		c.Schedule.CheckinConcurrency = 16
+	}
+	// v2.3.1 #19 渠道类型与 telegram 目标校验。
+	c.Notify.Channel = strings.ToLower(strings.TrimSpace(c.Notify.Channel))
+	if c.Notify.Channel == "" {
+		c.Notify.Channel = "webhook"
+	}
+	switch c.Notify.Channel {
+	case "webhook", "wecom", "telegram", "bark":
+	default:
+		return fmt.Errorf("notify.channel: 未知渠道 %q（可选 webhook/wecom/telegram/bark）", c.Notify.Channel)
+	}
+	if c.Notify.Channel == "telegram" && strings.TrimSpace(c.Notify.TelegramChatID) == "" {
+		return fmt.Errorf("notify.telegram_chat_id: telegram 渠道必须配置 chat_id")
+	}
+	if strings.TrimSpace(c.Notify.Title) == "" {
+		c.Notify.Title = "WorkBuddy2API Pro"
 	}
 	if len(c.Notify.Events) == 0 {
 		c.Notify.Events = []string{"job_done", "account_disabled", "checkin_failed"}

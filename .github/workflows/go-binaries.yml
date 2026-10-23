@@ -41,6 +41,8 @@ jobs:
       # 任一失败即红。gofmt 检查暂不加入：HEAD 基线有 15 个历史文件未 gofmt（非本版引入），
       # 等一次性 gofmt 清理提交后再开闸。
       - run: go vet ./...
+      # 前端工程化检查（v2.3.1 #18）：JS 语法、DOM id 双向契约、API 路径白名单、体积预算。
+      - run: node scripts/panel_frontend_check.mjs
       # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
       - run: go test ./...
 

@@ -151,6 +151,9 @@ func applyConfigRuntime(newCfg *Config, live *livecfg.Holder, p *pool.Pool, up *
 	// v2.0.1 #10/#11：余额刷新并发上限与补跑窗口均支持热生效（下一轮读新值）。
 	sch.SetBalanceRefreshConcurrency(newCfg.Schedule.BalanceRefreshConcurrency)
 	sch.SetCatchUpMinutes(newCfg.Schedule.CatchUpMinutes)
+	// v2.3.1 #11：签到 worker pool 账号级并发度热生效（下一轮签到读取新值；
+	// 在途 worker 不打断）。Jobs/Notify 装配期接线，不在热更新范围。
+	sch.SetCheckinConcurrency(newCfg.Schedule.CheckinConcurrency)
 	return restartRequiredFields(newCfg)
 }
 

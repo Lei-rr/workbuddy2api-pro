@@ -336,5 +336,9 @@
   #remarkVeil .rm-row .rm-who { flex: none; padding-top: 0; font-size: 12px; }
   #remarkVeil .rm-row .rm-fields { gap: 4px; }
   #remarkVeil .rm-row input { width: 100%; }
+
+  /* v2.3.1 标签筛选下拉：长标签（≤32 字）不允许撑破 320px 的筛选行；原生 select
+     会按最长 option 取宽，这里限宽后由浏览器截断显示（选中的值仍完整提交）。 */
+  #accTagFilter { max-width: 100%; min-width: 0; }
 }
 
