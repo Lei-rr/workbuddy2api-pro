@@ -315,3 +315,26 @@
   /* 标签类（限流冷却 · 1时02分 / 模型档位）窄列里换行，而不是 nowrap 撑着容器溢出 */
   .tag { max-width: 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 }
+
+/* ══ v2.3.0 #20 移动端收尾：Job 进度条 / 账号标签 / 备注标签编辑 ═══════════
+   320px 下的约束：进度条独占一行、标签可换行且长标签省略、备注弹窗字段竖排。 */
+@media (max-width: 760px) {
+  /* Job 进度条：类型 + 进度独占整行，取消按钮不挤压进度条 */
+  #jobBar { padding: 8px 11px 0; gap: 6px 8px; }
+  #jobBar .jkind { flex: 1 1 100%; font-size: 12px; }
+  #jobBar .jprog { flex: 1 1 calc(100% - 92px); min-width: 0; }
+  #jobBar .jprog .note { font-size: 11.5px; }
+  #jobBar #jobMeta { flex: 1 1 100%; font-size: 11px; }
+  #jobBar #btnJobCancel { flex: none; margin-left: auto; }
+
+  /* 账号行标签：最多 3 个 + 「+N」，换行不溢出；单个长标签省略 */
+  .acc-tags { max-width: 100%; margin-left: 0; }
+  .acc-tags .tag { max-width: 9em; }
+
+  /* 备注弹窗（640px 宽在手机上被 .dlg 限宽）：账号名与两个输入框竖排，输入框全宽 */
+  #remarkVeil .rm-row { flex-direction: column; align-items: stretch; gap: 4px; }
+  #remarkVeil .rm-row .rm-who { flex: none; padding-top: 0; font-size: 12px; }
+  #remarkVeil .rm-row .rm-fields { gap: 4px; }
+  #remarkVeil .rm-row input { width: 100%; }
+}
+

@@ -806,7 +806,7 @@ function renderAccounts(list, meta) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + accTagsHtml(s.uid) + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -1102,6 +1102,7 @@ async function loadAccountPage(quiet) {
     accPage = meta.page;
     accPageMeta = meta;
     renderAccounts(d.rows || [], meta);
+    maybeMigrateRemarks();   // 账号列表就位后才有 uid8→全 uid 的解析表，再尝试迁移旧备注
     return true;
   } catch (e) {
     if (seq !== accReqSeq) return true;
@@ -1113,10 +1114,12 @@ async function loadAccountPage(quiet) {
 /* refreshAccountsView 账号池视图的一轮刷新（5s 轮询与操作后刷新共用）：
    ① lite overview（统计条/导航/模型锁池）；
    ② 当前页 accounts（服务端筛选+分页，ETag 命中 304 时复用缓存）；
-   ③ 仅当「积分到期」tab 激活时才按 60s 窗口补完整 overview（低频）。
+   ③ 批量任务进度 jobs（v2.3.0 #10：小响应，复用同一 5s 节奏；失败不影响本视图）；
+   ④ 仅当「积分到期」tab 激活时才按 60s 窗口补完整 overview（低频）。
    列表 tab 下不拉全量——这是「账号池不再每 5s 拉 689KB」的落点。 */
 async function refreshAccountsView(quiet) {
   const [summaryOK, pageOK] = await Promise.all([loadSummary(quiet), loadAccountPage(quiet)]);
+  loadJobs(true);   // 进度条跟随轮询刷新；404/失败静默（不影响账号池刷新与退避）
   if (accTab === 'expiry' && view === 'accounts') {
     const ok = await ensureFullOverview(quiet);
     if (ok && overviewData) renderExpirySnapshot(overviewData);
@@ -1149,6 +1152,168 @@ function refreshAccountPoolAfterMutation(quiet) {
   refreshAccountPool(quiet);
   refreshFullOverviewInBackground();
 }
+
+
+/* ── 批量任务进度/取消（v2.3.0 #10：Job Runner）───────────────────────────
+   后端实际契约（backend-b task-18 最终版）：
+     GET  /panel/api/jobs?limit=20     → {ok,jobs:[Job]}（新在前；limit 缺省 20）
+         Job = {id,kind,trigger,state,total,done,fail,skip,started_at,finished_at,
+                error,log_tail}；started_at/finished_at 是 Go time.Time 的 RFC3339
+                字符串（不是 unix 秒）；state ∈ pending|running|done|failed|canceled|
+                interrupted（重启中断，按未知态兜底展示）。
+     GET  /panel/api/jobs/{id}         → {ok,job}（UI 未用，列表已够）
+     POST /panel/api/jobs/{kind}/run   → {ok,started,job_id}；同 kind 单飞 → 409 {error}
+         kind 仅 checkin/travel/activity/keepalive/balance（tasks_run 不可触发，只进历史）
+     POST /panel/api/jobs/{id}/cancel  → {ok,canceled:true|false}（false=已结束）
+    旧批量端点 checkin_all/... 返回 {ok,started,job_id}（旧字段保留）。
+   进度语义：done = 已处理账号（含 fail、不含 skip），total = 触发时池内账号数；
+   进度条按 (done+skip)/total 计算「已处理」，失败/跳过并列展示。取消只停后续账号
+   （在途请求自然结束），确认弹窗已写明。
+   批量按钮仍走旧端点，本段只负责：① 进度条轮询（复用账号池 5s 节奏，模块内并发
+   保护）；② 取消；③ toast「已开始（job 进度见顶部）」，409 时原样展示后端 error。
+   后端未提供 Job API（404/501）时置 jobsSupported=false 并不再空打，行为退回 v2.2。 */
+const JOBS_LIMIT = 20;
+const JOB_KIND_LABEL = {
+  checkin: '全部签到', travel: '旅行巡检', activity: '活跃上报',
+  keepalive: '全部保活', balance: '刷新余额', tasks_run: '单号做任务', catch_up: '补跑任务',
+};
+const JOB_STATE_LABEL = {
+  pending: '排队中', running: '执行中', done: '已完成', failed: '失败',
+  canceled: '已取消', interrupted: '已中断',
+};
+let jobsActive = null;      // 进度条当前展示的 running job
+let jobsSupported = true;   // 后端是否提供 Job API（404/501 后置 false）
+let jobsLoading = false;    // 一轮 jobs 请求在途（避免叠加）
+
+function normalizeJob(raw) {
+  const j = raw || {};
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  return {
+    id: String(j.id != null ? j.id : (j.job_id != null ? j.job_id : '')),
+    kind: String(j.kind != null ? j.kind : ''),
+    trigger: String(j.trigger != null ? j.trigger : ''),
+    state: String(j.state != null ? j.state : ''),
+    total: num(j.total),
+    done: num(j.done),
+    fail: num(j.fail != null ? j.fail : j.failed),
+    skip: num(j.skip != null ? j.skip : j.skipped),
+    started_at: j.started_at != null ? j.started_at : (j.started != null ? j.started : ''),
+    finished_at: j.finished_at != null ? j.finished_at : (j.finished != null ? j.finished : ''),
+    error: String(j.error != null ? j.error : ''),
+  };
+}
+function normalizeJobs(d) {
+  const list = (d && (d.jobs || d.entries || d.items)) || [];
+  return Array.isArray(list) ? list.map(normalizeJob) : [];
+}
+/* pickActiveJob 只展示 running：pending 还没真正跑、done/failed/canceled 是历史态。 */
+function pickActiveJob(jobs) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  for (const j of list) if (j && j.state === 'running') return j;
+  return null;
+}
+function jobKindText(kind) {
+  const code = String(kind || '');
+  return JOB_KIND_LABEL[code] || code || '任务';
+}
+function jobStateText(state) {
+  const code = String(state || '');
+  return JOB_STATE_LABEL[code] || code || '';
+}
+function jobTriggerText(trigger) {
+  const code = String(trigger || '');
+  return { manual: '手动', schedule: '定时', catch_up: '补跑', startup: '启动' }[code] || code || '';
+}
+/* renderJobBar 把 jobs 列表写成顶部进度条：有 running 显示类型/进度/失败/跳过/取消，
+/* renderJobBar 把 jobs 列表写成顶部进度条：有 running 显示类型/进度/失败/跳过/取消，
+   否则隐藏（不占布局）。进度口径：done 含失败但不含跳过，所以「已处理」= done+skip
+   （进度条宽度用它）；失败/跳过并列显示。started_at 是 RFC3339 字符串，按本地时间展示。 */
+function renderJobBar(jobs) {
+  jobsActive = pickActiveJob(jobs);
+  const bar = $('jobBar');
+  if (!bar) return;
+  if (!jobsActive) { bar.hidden = true; return; }
+  const j = jobsActive;
+  bar.hidden = false;
+  if ($('jobKind')) $('jobKind').textContent = jobKindText(j.kind) + '（' + jobStateText(j.state) + '）';
+  const processed = j.done + j.skip;
+  const pct = j.total > 0 ? Math.min(100, Math.round(processed / j.total * 100)) : 0;
+  if ($('jobBarFill')) $('jobBarFill').style.width = pct + '%';
+  const parts = [processed + ' / ' + j.total];
+  if (j.fail) parts.push('失败 ' + j.fail);
+  if (j.skip) parts.push('跳过 ' + j.skip);
+  if ($('jobProgText')) $('jobProgText').textContent = parts.join(' · ');
+  if ($('jobMeta')) {
+    const trig = jobTriggerText(j.trigger);
+    $('jobMeta').textContent = (trig ? trig + ' · ' : '') +
+      '开始 ' + fmtRunTime(j.started_at) + (j.error ? ' · ' + j.error : '');
+  }
+  if ($('btnJobCancel')) $('btnJobCancel').disabled = j.state !== 'running';
+}
+/* loadJobs 一轮 jobs 拉取（静默：失败不打断账号池刷新，也不计入轮询退避）。 */
+async function loadJobs(quiet) {
+  if (!jobsSupported || jobsLoading) return false;
+  jobsLoading = true;
+  try {
+    const d = await api('jobs?limit=' + JOBS_LIMIT);
+    renderJobBar(normalizeJobs(d));
+    return true;
+  } catch (e) {
+    const msg = String((e && e.message) || '');
+    if (/HTTP (404|501)/.test(msg)) {
+      // 后端尚未提供 Job API：隐藏进度条并停止空打（旧端点仍可用，行为退回 v2.2）。
+      jobsSupported = false;
+      renderJobBar([]);
+    } else if (!quiet) {
+      toast('读取任务进度失败：' + msg, 'err');
+    }
+    return false;
+  } finally {
+    jobsLoading = false;
+  }
+}
+/* cancelJob 取消当前 running job：confirm 说明「只停后续账号」，成功/失败都 toast。
+   后端返回 {ok,canceled:true|false}：false = 请求到达时任务已结束（无需取消）。 */
+async function cancelJob() {
+  const j = jobsActive;
+  if (!j || !j.id) return;
+  if (!confirm('取消「' + jobKindText(j.kind) + '」：只停后续账号，当前正在执行的账号会跑完。确认取消？')) return;
+  const btn = $('btnJobCancel');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('jobs/' + encodeURIComponent(j.id) + '/cancel', { method: 'POST' });
+    if (r && r.canceled === false) toast('任务已结束，无需取消', 'ok');
+    else toast('已请求取消：当前账号跑完后停止后续', 'ok');
+  } catch (e) {
+    toast('取消失败：' + e.message, 'err');
+  } finally {
+    loadJobs(true);
+  }
+}
+/* runBatchTask 批量端点统一调用：成功 toast 指向顶部进度条；409 等错误原样展示后端文案。 */
+async function runBatchTask(path, label, btn) {
+  const b = btn || null;
+  if (b) b.disabled = true;
+  try {
+    const r = await api(path, { method: 'POST' });
+    if (r && r.ok === false) {
+      toast(r.error || r.message || (label + '提交失败'), 'err');
+      return;
+    }
+    toast(label + '已开始（job 进度见顶部）', 'ok');
+    loadJobs(true);   // 立刻刷新进度条，不等下一轮轮询
+  } catch (e) {
+    // 409（同类任务正在执行）等错误：后端 error 文案直接展示。
+    toast(label + '失败：' + e.message, 'err');
+  } finally {
+    if (b) b.disabled = false;
+  }
+}
+if ($('btnJobCancel')) $('btnJobCancel').onclick = cancelJob;
+$('btnCheckinAll').onclick = () => runBatchTask('checkin_all', '全部签到', $('btnCheckinAll'));
+$('btnKeepaliveAll').onclick = () => runBatchTask('keepalive_all', '全部保活', $('btnKeepaliveAll'));
+$('btnTravelAll').onclick = () => runBatchTask('travel_all', '旅行巡检', $('btnTravelAll'));
+$('btnActivityAll').onclick = () => runBatchTask('activity_all', '活跃上报', $('btnActivityAll'));
 
 
 /* runAccountDotask 账号行「做任务」：单账号执行全部可自动任务。
@@ -1229,19 +1394,14 @@ $('accBody').addEventListener('click', async ev => {
     b.disabled = false;
     // 移除账号会改变账号集合：除当前页外还要后台补拉完整 overview（积分历史
     // 下拉/积分条基准/到期快照都依赖全量 accounts，v2.1.0 QA P2）。
-    if (a === 'remove') refreshAccountPoolAfterMutation(true);
-    else refreshAccountPool(true);
+    if (a === 'remove') {
+      // 服务端删号时已同步 forget meta（v2.3.0 #12）；本机缓存同步清掉，避免残留展示。
+      try { if (metaAll && metaAll[u] !== undefined) delete metaAll[u]; } catch (e) {}
+      refreshAccountPoolAfterMutation(true);
+    } else refreshAccountPool(true);
   }
 });
 
-$('btnCheckinAll').onclick = async () => {
-  try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnKeepaliveAll').onclick = async () => {
-  try { await api('keepalive_all', { method: 'POST' }); toast('全部保活已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
 // 重新扫描 auths/ 目录：外部脚本批量导入/删除凭证后免重启对齐（只增删账号，
 // 已存在账号的积分/冷却状态保留）。后端对「扫到 0 个文件」有拒绝保护。
 if ($('btnRescan')) $('btnRescan').onclick = async () => {
@@ -1250,14 +1410,6 @@ if ($('btnRescan')) $('btnRescan').onclick = async () => {
     toast('扫描 ' + r.scanned + ' 个文件：新增 ' + r.added + '，剔除 ' + r.removed, 'ok');
     refreshAccountPoolAfterMutation(true);   // 账号集合变了：当前页 + 全量快照都刷新
   } catch (e) { toast(e.message, 'err'); }
-};
-$('btnTravelAll').onclick = async () => {
-  try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnActivityAll').onclick = async () => {
-  try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
@@ -2454,7 +2606,9 @@ $('btnRefresh').onclick = async () => {
     // 抛出，catch 直接展示后端 error 文案。
     const r = await api('balance_all', { method: 'POST' });
     if (r && r.ok === false) { toast(r.error || r.message || '刷新提交失败', 'err'); return; }
-    toast('已开始刷新余额（后台执行，完成后自动刷新）', 'ok');
+    // v2.3.0 #10：balance_all 也是 Job Runner 任务，进度/取消见账号池顶部进度条。
+    toast('已开始刷新余额（后台执行，job 进度见顶部）', 'ok');
+    loadJobs(true);
     setTimeout(() => refreshAccountPool(true), 2500);
   } catch (e) { toast('刷新失败：' + e.message, 'err'); }
   finally { b.disabled = false; b.textContent = label; }
@@ -2601,6 +2755,9 @@ function start() {
   // 完整 overview 只在页面加载时后台补一次（积分合计/到期快照/备注弹窗需要全量
   // accounts）；之后只有「积分到期」tab 会按 60s 新鲜窗口再拉，不再每 5s 全量。
   ensureFullOverview(true);
+  // v2.3.0 #12：账号备注/标签服务端权威数据。失败静默回落 localStorage；
+  // 加载成功后尝试一次性把本机旧备注迁移到服务端（服务端已有数据时不覆盖）。
+  loadMeta(true).then(() => maybeMigrateRemarks());
   checkAuthGate();
 }
 async function checkAuthGate() {
@@ -4681,10 +4838,20 @@ if ($('pkBody')) $('pkBody').addEventListener('click', ev => {
   }
 });
 
-/* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
-   键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
-   三个表格因此都能直接 join。展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身
-   仍由服务端下发，不写回后端；备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
+/* ══ 账号备注 / 标签（v2.3.0 #12：服务端权威 + localStorage 降级）══════════════
+   后端契约（backend-c）：
+     GET  /panel/api/meta                        → {ok, meta:{uid:{note,tags,updated_at}}}
+     GET  /panel/api/accounts/{uid}/meta         → {ok, uid, note, tags, updated_at}
+     PUT  /panel/api/accounts/{uid}/meta {note,tags}
+     DELETE /panel/api/accounts/{uid}/meta
+   服务端 data/account-meta.json 是权威数据（note ≤500 字、tags ≤10 个且每个 ≤32 字）；
+   本机 localStorage(LS_REMARKS) 只作降级缓存：读失败/写失败时界面仍可用、改动不丢。
+   备注键仍按 uid 前 8 位存本机（与 renderUsageDim / 积分扣除表 join 口径一致）；
+   服务端键是完整 uid（与 auths/、state.json 同源）。 */
+let metaAll = {};           // 完整 uid → {note,tags,updated_at}（服务端权威快照）
+let metaLoaded = false;     // /meta 是否成功加载过
+let metaMigrationTried = false;   // 本机旧备注→服务端的一次性迁移是否已尝试
+
 function remarksAll() {
   if (remarksCache) return remarksCache;
   try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
@@ -4692,8 +4859,52 @@ function remarksAll() {
   return remarksCache;
 }
 function remarkKey(uid) { return String(uid == null ? '' : uid).slice(0, 8); }
+function storeRemarks(map) {
+  remarksCache = map;
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+}
+
+/* parseTags 标签输入 → 数组：逗号（半角/全角）或空白分隔，去空、去重，
+   最多 10 个、每个截到 32 字。与后端 accountmeta.go 的校验口径一致。 */
+function parseTags(v) {
+  const raw = Array.isArray(v) ? v : String(v == null ? '' : v).split(/[,，\s]+/);
+  const out = [];
+  for (const item of raw) {
+    const t = String(item == null ? '' : item).trim().slice(0, 32);
+    if (t && out.indexOf(t) < 0) out.push(t);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+/* normalizeMeta 把 /meta 响应归一化成 uid→{note,tags,updated_at}；
+   字段缺失/类型不对都容忍（后端未就绪时返回空对象，界面回落 localStorage）。 */
+function normalizeMeta(d) {
+  const src = (d && (d.meta || d.accounts)) || {};
+  const out = {};
+  if (!src || typeof src !== 'object') return out;
+  for (const uid of Object.keys(src)) {
+    if (!uid) continue;
+    const m = src[uid] || {};
+    out[String(uid)] = {
+      note: String(m.note == null ? '' : m.note),
+      tags: parseTags(m.tags),
+      updated_at: Number(m.updated_at) || 0,
+    };
+  }
+  return out;
+}
+function metaFor(uid) { return metaAll[String(uid == null ? '' : uid)] || null; }
+function metaNoteOf(uid) { const m = metaFor(uid); return m ? m.note : ''; }
+function metaTagsOf(uid) { const m = metaFor(uid); return m ? m.tags : []; }
+
+/* remarkOf 备注展示：服务端权威优先，未命中回落 localStorage（降级/迁移前）。 */
 function remarkOf(uid) {
-  const k = remarkKey(uid);
+  const s = String(uid == null ? '' : uid);
+  if (!s) return '';
+  const m = metaFor(s);
+  if (m && m.note) return m.note;
+  const k = remarkKey(s);
   return k ? String(remarksAll()[k] || '') : '';
 }
 /* nameHtml 必须是已转义的 HTML；有备注时返回「备注 + 原标识（浅色虚体）」 */
@@ -4701,52 +4912,205 @@ function remarkName(uid, nameHtml) {
   const r = remarkOf(uid);
   return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
 }
-function storeRemarks(map) {
-  remarksCache = map;
-  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+/* accTagsHtml 账号行标签：最多展示 3 个 + 「+N」（title 里给全量），无标签返回空串。 */
+function accTagsHtml(uid) {
+  const tags = metaTagsOf(uid);
+  if (!tags.length) return '';
+  const shown = tags.slice(0, 3);
+  const extra = tags.length - shown.length;
+  const parts = shown.map(t => '<span class="tag mute" title="' + esc(t) + '">' + esc(t) + '</span>');
+  if (extra > 0) parts.push('<span class="tag mute" title="' + esc(tags.slice(3).join('、')) + '">+' + extra + '</span>');
+  return '<span class="acc-tags">' + parts.join('') + '</span>';
 }
 
-/* 编辑器的行来自账号全集（poolAccountList：完整 overview 快照优先，退当前页），
-   另外补上「已有备注但当前列表里没有」的键，避免账号被移除后备注看起来凭空消失。 */
-function remarkFormRows() {
-  const rows = poolAccountList()
-    .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
-    .filter(r => r.uid);
-  for (const k of Object.keys(remarksAll())) {
-    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
+/* mergeServerNotesToLocal 把服务端备注同步进本机缓存（降级用）：
+   只覆盖非空备注，不删除本地已有键——本地可能是尚未迁移的旧数据。 */
+function mergeServerNotesToLocal() {
+  const merged = Object.assign({}, remarksAll());
+  let changed = false;
+  for (const uid of Object.keys(metaAll)) {
+    const k = remarkKey(uid);
+    const note = metaAll[uid].note;
+    if (k && note && merged[k] !== note) { merged[k] = note; changed = true; }
   }
-  return rows;
+  if (changed) storeRemarks(merged);
 }
+
+async function loadMeta(quiet) {
+  try {
+    const d = await api('meta');
+    metaAll = normalizeMeta(d);
+    metaLoaded = true;
+    mergeServerNotesToLocal();
+    maybeMigrateRemarks();
+    return true;
+  } catch (e) {
+    // 接口未就绪/网络失败：界面继续用 localStorage（remarkOf 已回落），不阻塞面板。
+    if (!quiet) toast('读取账号备注失败，已回落本机缓存：' + e.message, 'err');
+    return false;
+  }
+}
+
+/* maybeMigrateRemarks 一次性迁移：服务端 meta 为空 且 本机存在旧备注时，
+   用当前账号全集把 uid8 解析成完整 uid 后逐个 PUT 导入；成功后清理已迁移的本地键，
+   全失败则静默保留本地（下次打开再试，或用户手动保存时自然写入服务端）。
+   服务端已有任意 meta 时不自动导入，避免覆盖服务端数据。 */
+function maybeMigrateRemarks() {
+  if (metaMigrationTried || !metaLoaded) return;
+  const local = remarksAll();
+  const keys = Object.keys(local).filter(k => local[k]);
+  if (!keys.length || Object.keys(metaAll).length > 0) { metaMigrationTried = true; return; }
+  const pool = poolAccountList();
+  if (!pool.length) return;   // 账号列表还没加载：等 loadAccountPage 成功后再试
+  metaMigrationTried = true;
+  const uidOf = k => {
+    const hit = pool.find(s => s && remarkKey(s.uid) === k);
+    return hit ? String(hit.uid) : '';
+  };
+  const pairs = [];
+  for (const k of keys) {
+    const uid = uidOf(k);
+    if (uid) pairs.push({ k: k, uid: uid, note: local[k] });
+  }
+  if (!pairs.length) return;   // 全部解析不到完整 uid：保留本地（不回写错键）
+  Promise.allSettled(pairs.map(p => api('accounts/' + encodeURIComponent(p.uid) + '/meta', {
+    method: 'PUT',
+    body: JSON.stringify({ note: String(p.note).slice(0, 500), tags: [] }),
+  }))).then(results => {
+    const migrated = [];
+    results.forEach((r, i) => {
+      if (r.status !== 'fulfilled') return;
+      const p = pairs[i];
+      metaAll[p.uid] = { note: String(p.note).slice(0, 500), tags: [], updated_at: Math.floor(Date.now() / 1000) };
+      migrated.push(p.k);
+    });
+    if (!migrated.length) return;   // 全失败：保留本地，静默
+    const remain = {};
+    for (const k of Object.keys(local)) {
+      if (migrated.indexOf(k) < 0) remain[k] = local[k];
+    }
+    storeRemarks(remain);
+    toast('已迁移本机备注到服务端（' + migrated.length + ' 条）', 'ok');
+    renderAfterMetaChange();
+  });
+}
+
+/* renderAfterMetaChange 备注/标签变化后重渲染当前视图（无后端请求）。 */
+function renderAfterMetaChange() {
+  if (view === 'accounts') renderAccounts(accAll, accPageMeta);
+  else if (view === 'usage' && usageData) renderUsage(usageData);
+}
+
+/* 编辑器的行来自：账号全集（poolAccountList）+ 服务端 meta 里有记录的 uid
+   （被筛掉/不在当前页也能编辑）+ 本机旧备注（uid8，未解析到完整 uid 时标 legacy）。 */
+function remarkFormRows() {
+  const map = new Map();
+  const fullUids = new Set();
+  for (const s of poolAccountList()) {
+    if (!s || !s.uid) continue;
+    const uid = String(s.uid);
+    fullUids.add(uid);
+    map.set(uid, { uid: uid, who: s.nickname || uid.slice(0, 8), legacy: false });
+  }
+  for (const uid of Object.keys(metaAll)) {
+    if (!map.has(uid)) map.set(uid, { uid: uid, who: uid, legacy: false });
+  }
+  for (const k of Object.keys(remarksAll())) {
+    if (!remarksAll()[k]) continue;
+    let uid = '';
+    for (const full of fullUids) { if (remarkKey(full) === k) { uid = full; break; } }
+    if (uid) {
+      if (!map.has(uid)) map.set(uid, { uid: uid, who: uid.slice(0, 8), legacy: false });
+    } else if (!map.has(k)) {
+      map.set(k, { uid: k, who: k, legacy: true });
+    }
+  }
+  return Array.from(map.values());
+}
+
 function renderRemarkBody() {
   const box = $('remarkBody');
   if (!box) return;
   const rows = remarkFormRows();
   box.innerHTML = rows.length
-    ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
-        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
+    ? rows.map(r => {
+      const note = r.legacy ? String(remarksAll()[r.uid] || '') : (metaNoteOf(r.uid) || remarkOf(r.uid));
+      const tags = r.legacy ? [] : metaTagsOf(r.uid);
+      return '<div class="rm-row" data-uid="' + esc(r.uid) + '"' + (r.legacy ? ' data-legacy="1"' : '') + '>' +
+        '<span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
+        '<div class="rm-fields">' +
+        '<input type="text" class="rm-note" data-uid="' + esc(r.uid) + '" value="' + esc(note) +
+        '" placeholder="备注（留空即清除，≤500 字）" maxlength="500">' +
+        '<input type="text" class="rm-tags" data-uid="' + esc(r.uid) + '" value="' + esc(tags.join(', ')) +
+        '" placeholder="标签：逗号/空格分隔（≤10 个，每个 ≤32 字）" maxlength="400">' +
+        '</div></div>';
+    }).join('')
     : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
 }
-function openRemarks() {
-  renderRemarkBody();
+async function openRemarks() {
   if ($('remarkVeil')) $('remarkVeil').classList.add('on');
+  renderRemarkBody();                 // 先用已加载的 meta/本地缓存渲染，避免空白
+  if (!metaLoaded) {
+    await loadMeta(true);             // 打开时优先拉服务端最新数据；失败保留本地渲染
+    renderRemarkBody();
+  }
 }
 function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
-function saveRemarkForm() {
-  const map = {};
-  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) map[inp.getAttribute('data-uid')] = v;
+/* saveRemarkForm 保存：逐账号 PUT（清空则 DELETE），本地缓存先写（失败不丢改动）；
+   部分失败提示数量并保留本地，可再次保存重试。 */
+async function saveRemarkForm() {
+  const box = $('remarkBody');
+  if (!box) return;
+  const rows = Array.from(box.querySelectorAll('.rm-row'));
+  if (!rows.length) { closeRemarks(); return; }
+  const nextLocal = {};
+  const changes = [];
+  for (const row of rows) {
+    const uid = String(row.getAttribute('data-uid') || '');
+    if (!uid) continue;
+    const legacy = row.getAttribute('data-legacy') === '1';
+    const noteInp = row.querySelector('.rm-note');
+    const tagsInp = row.querySelector('.rm-tags');
+    const note = String((noteInp && noteInp.value) || '').trim().slice(0, 500);
+    const tags = parseTags(tagsInp ? tagsInp.value : '');
+    if (note) nextLocal[remarkKey(uid)] = note;
+    if (legacy) continue;   // 旧本机键解析不到完整 uid：只更新本地，不把 uid8 写到服务端
+    const prev = metaFor(uid);
+    const prevNote = prev ? prev.note : '';
+    const prevTags = prev ? prev.tags : [];
+    if (prevNote === note && prevTags.join('\u0001') === tags.join('\u0001')) continue;
+    changes.push({ uid: uid, note: note, tags: tags, hasPrev: !!prev });
+  }
+  storeRemarks(nextLocal);   // 本地兜底：服务端写失败也不丢改动
+  if (!changes.length) { closeRemarks(); toast('没有需要保存的改动'); return; }
+  const btn = $('btnRemarkSave');
+  if (btn) btn.disabled = true;
+  const results = await Promise.allSettled(changes.map(ch => {
+    const path = 'accounts/' + encodeURIComponent(ch.uid) + '/meta';
+    if (!ch.note && !ch.tags.length && ch.hasPrev) return api(path, { method: 'DELETE' });
+    return api(path, { method: 'PUT', body: JSON.stringify({ note: ch.note, tags: ch.tags }) });
+  }));
+  let ok = 0, failed = 0;
+  changes.forEach((ch, i) => {
+    if (results[i].status !== 'fulfilled') { failed++; return; }
+    ok++;
+    if (!ch.note && !ch.tags.length) delete metaAll[ch.uid];
+    else metaAll[ch.uid] = { note: ch.note, tags: ch.tags, updated_at: Math.floor(Date.now() / 1000) };
   });
-  storeRemarks(map);
+  if (btn) btn.disabled = false;
   closeRemarks();
-  // 备注只影响本机展示：用现有 rows 重渲染当前视图即可，无需后端参与（也不发请求）。
-  if (view === 'accounts') renderAccounts(accAll, accPageMeta);
-  else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast('备注已保存（仅本机浏览器）');
+  if (failed) toast('已保存 ' + ok + ' 条，失败 ' + failed + ' 条（本机缓存已保留，可重试）', 'err');
+  else toast('备注/标签已保存到服务端（' + ok + ' 条）', 'ok');
+  renderAfterMetaChange();
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
-if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => {
+  // 只清编辑框与本地缓存；点「保存」后空值会触发服务端 DELETE。
+  document.querySelectorAll('#remarkBody .rm-note, #remarkBody .rm-tags').forEach(inp => { inp.value = ''; });
+  storeRemarks({});
+  toast('已清空编辑框（点「保存」同步删除服务端备注/标签）');
+};
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* ══ 首页「积分到期提醒」折叠（选择记在本机，默认展开）═════════════════════

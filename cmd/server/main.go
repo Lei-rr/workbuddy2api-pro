@@ -21,7 +21,9 @@ import (
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 	"github.com/lei-rr/workbuddy2api-pro/internal/credithist"
+	"github.com/lei-rr/workbuddy2api-pro/internal/jobs"
 	"github.com/lei-rr/workbuddy2api-pro/internal/livecfg"
+	"github.com/lei-rr/workbuddy2api-pro/internal/notify"
 	"github.com/lei-rr/workbuddy2api-pro/internal/panel"
 	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
 	"github.com/lei-rr/workbuddy2api-pro/internal/redisstore"
@@ -34,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.2.0-pro"
+const appVersion = "2.3.0-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -97,6 +99,30 @@ func main() {
 	for _, warning := range startupSelfCheck(cfg.AuthDir, cfg.StateFile) {
 		log.Printf("WARN: %s", warning)
 	}
+
+	// v2.3.0 #10/#19：后台根 ctx 提前创建——Job Registry 与通知器在 panel/调度器
+	// 装配前就要拿到它；优雅停机在同一处 cancel（运行中 Job → canceled、通知器
+	// 仍可排空已入队事件，见 main 尾部收尾顺序）。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// v2.3.0 #19 事件通知（Webhook；空/非法 URL = 关闭，Notifier 为 no-op 实例）。
+	notifier := notify.New(cfg.Notify.WebhookURL, cfg.NotifyTimeoutDur, cfg.Notify.Events)
+	// 兜底关闭（幂等）：正常路径在 main 尾部显式带超时排空后再退出。
+	defer func() { _ = notifier.Close(context.Background()) }()
+
+	// v2.3.0 #10 全池任务 Job Runner：jobs.json 与 state 同目录；并发闸门/保留条数
+	// 来自 config.jobs。BaseContext=主 ctx（SIGTERM → 运行中 Job 取消为 canceled），
+	// OnFinish 把终态 Job 转成 job_done 通知（Notifier 关闭时 no-op）。
+	jobReg := jobs.New(jobs.Config{
+		Path:           stateSibling(cfg.StateFile, "jobs.json"),
+		Retain:         cfg.Jobs.Retain,
+		MaxConcurrency: cfg.Jobs.MaxConcurrency,
+		BaseContext:    ctx,
+		OnFinish:       func(j *jobs.Job) { notifier.JobDone(jobDonePayload(j)) },
+	})
+	log.Printf("[jobs] 全池任务 Job Runner 已启用: %s（并发上限 %d，保留 %d 条）",
+		stateSibling(cfg.StateFile, "jobs.json"), jobReg.MaxConcurrency(), cfg.Jobs.Retain)
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -371,6 +397,10 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// v2.3.0 #10 Job Runner：批量端点起 Job（job_id/进度/取消/jobs.json 持久化）。
+		Jobs: jobReg,
+		// v2.3.0 #19 通知器：accountDisable 成功时 Emit account_disabled（关闭时 no-op）。
+		Notify: notifier,
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -406,15 +436,14 @@ func main() {
 	})
 
 	// v2.2 #14 优雅停机：显式信号通道（不用 signal.NotifyContext——需要两级语义：
-	// 第一次信号走优雅停机，停机期间再按一次立即强制退出）。
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+	// 第一次信号走优雅停机，停机期间再按一次立即强制退出）。ctx/cancel 已在 main
+	// 前部创建（Job Registry/通知器共享），这里只挂后台任务与 HTTP 服务。
 	// 后台任务登记：停机时先 cancel 让它们不再取新任务，再等待收敛
 	//（收敛上限由 server.shutdown_timeout 的同一时间预算兜底）。
 	// 注：sch.StartBalanceRefresh/StartTaskSweep 在 scheduler 包内部另起 goroutine，
-	// 随 ctx 取消退出但不纳入本 WaitGroup（scheduler 不在本任务改动范围）；
+	// 随 ctx 取消退出但不纳入本 WaitGroup（scheduler 包不在本任务改动范围）；
 	// 其手头若有正在跑的上游请求，最坏被进程退出截断，最终 state 仍会在停机时落盘。
+	// Job Registry 的运行中 Job 由 main 尾部 jobReg.Close()+Wait 单独等待收敛。
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
 	go func() { defer bgWG.Done(); sch.Run(ctx) }()
@@ -494,6 +523,23 @@ func main() {
 		})
 	}
 
+	// v2.3.0 #10 Job Registry 收尾：gracefulShutdown 已 cancel 根 ctx（运行中 Job
+	// 收到取消），这里显式 Close 拒绝新 Job 并有上限等待 goroutine 收敛——避免
+	// 「进程退出时 jobs.json 正被半写」与「Job 状态卡在 running」。
+	jobReg.Close()
+	jobWaitCtx, jobWaitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	jobConverged := jobReg.Wait(jobWaitCtx)
+	jobWaitCancel()
+	if !jobConverged {
+		log.Printf("WARN: jobs: 运行中 Job 未在 5s 内全部收敛（继续退出；jobs.json 保留最后快照）")
+	}
+	// v2.3.0 #19 通知器收尾：排空已入队事件（有上限；webhook 故障不得拖住退出）。
+	notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := notifier.Close(notifyCtx); err != nil {
+		log.Printf("WARN: notify: 关闭时未排空全部事件: %v", err)
+	}
+	notifyCancel()
+
 	// 最终资源收尾：观测账本（usage/reqlog）→ 会话 GC → 池状态/Redis 异步写。
 	// 与 main 顶部 defer 的兜底重复调用是安全的（各处 Stop/Close 均幂等）。
 	rec.Stop()
@@ -507,6 +553,35 @@ func main() {
 	log.Printf("graceful shutdown complete in %dms（在途请求超时=%v，后台任务已收敛=%v）",
 		time.Since(shutdownStart).Milliseconds(), shutdownRes.TimedOut, shutdownRes.BackgroundDone)
 	log.Printf("bye")
+}
+
+// jobDonePayload 把 Job 终态转成 notify job_done 事件的 data：
+// 字段与 GET /panel/api/jobs 对齐（接收端可区分 kind/state/计数），时间用 unix 秒；
+// 不含任何凭证，Error 仅执行级摘要（上游/任务体返回的公开错误文本）。
+func jobDonePayload(j *jobs.Job) map[string]any {
+	if j == nil {
+		return map[string]any{}
+	}
+	data := map[string]any{
+		"id":      j.ID,
+		"kind":    string(j.Kind),
+		"trigger": string(j.Trigger),
+		"state":   string(j.State),
+		"total":   j.Total,
+		"done":    j.Done,
+		"fail":    j.Fail,
+		"skip":    j.Skip,
+	}
+	if !j.StartedAt.IsZero() {
+		data["started_at"] = j.StartedAt.Unix()
+	}
+	if !j.FinishedAt.IsZero() {
+		data["finished_at"] = j.FinishedAt.Unix()
+	}
+	if j.Error != "" {
+		data["error"] = j.Error
+	}
+	return data
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。

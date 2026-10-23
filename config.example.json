@@ -22,6 +22,15 @@
     "request_archive_max_mb": 100,
     "request_client_info": true
   },
+  "jobs": {
+    "max_concurrency": 4,
+    "retain": 50
+  },
+  "notify": {
+    "webhook_url": "",
+    "timeout": "10s",
+    "events": ["job_done", "account_disabled", "checkin_failed"]
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

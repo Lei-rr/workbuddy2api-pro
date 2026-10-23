@@ -285,6 +285,25 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Jobs 全池批量任务 Job Runner（v2.3 #10）。
+	Jobs struct {
+		// MaxConcurrency 批量任务同时在途的账号数上限（默认 4，clamp 1..32）。
+		// 与余额刷新各自的并发闸门相互独立：本值约束 Job Runner 派发的账号级任务。
+		MaxConcurrency int `json:"max_concurrency"`
+		// Retain data/jobs.json 保留的最近任务条数（默认 50，clamp 5..500）。
+		Retain int `json:"retain"`
+	} `json:"jobs"`
+
+	// Notify 事件通知渠道（v2.3 #19）：任务批次结束 / 账号被禁用 / 签到失败等。
+	Notify struct {
+		// WebhookURL 接收事件的 HTTP(S) 地址；空 = 关闭通知。
+		WebhookURL string `json:"webhook_url"`
+		// Timeout 单次 Webhook 请求超时（Go duration，默认 "10s"，clamp 1..60s）。
+		Timeout string `json:"timeout"`
+		// Events 订阅事件名（空 = 默认集合 job_done/account_disabled/checkin_failed）。
+		Events []string `json:"events,omitempty"`
+	} `json:"notify"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -305,6 +324,9 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// ShutdownTimeoutDur 解析后的优雅停机时限（v2.2 #14）；默认 30s，clamp 5..120s。
 	ShutdownTimeoutDur time.Duration `json:"-"`
+
+	// NotifyTimeoutDur 解析后的 Webhook 超时（v2.3 #19）；默认 10s，clamp 1..60s。
+	NotifyTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -319,6 +341,11 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.ShutdownTimeout = "30s"
+	// v2.3 #10/#19：Job Runner 与通知渠道默认值。
+	c.Jobs.MaxConcurrency = 4
+	c.Jobs.Retain = 50
+	c.Notify.Timeout = "10s"
+	c.Notify.Events = []string{"job_done", "account_disabled", "checkin_failed"}
 	c.Panel.PollIntervalSec = 5
 	c.Panel.PackageDetailLimit = 5
 	// Security.AllowAnonymous 缺省 false（零值即默认）：非回环监听 + 空密钥会启动失败。
@@ -510,6 +537,32 @@ func applyEnv(c *Config) {
 			c.Schedule.BalanceRefreshStartupForce = b
 		}
 	}
+	// v2.3 #10/#19 批量任务 Job Runner 与通知渠道。
+	if v := os.Getenv("WB2A_JOBS_MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Jobs.MaxConcurrency = n
+		}
+	}
+	if v := os.Getenv("WB2A_JOBS_RETAIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Jobs.Retain = n
+		}
+	}
+	if v := os.Getenv("WB2A_NOTIFY_WEBHOOK"); v != "" {
+		c.Notify.WebhookURL = v
+	}
+	if v := os.Getenv("WB2A_NOTIFY_TIMEOUT"); v != "" {
+		c.Notify.Timeout = v
+	}
+	if v := os.Getenv("WB2A_NOTIFY_EVENTS"); v != "" {
+		var events []string
+		for _, e := range strings.Split(v, ",") {
+			if e = strings.TrimSpace(e); e != "" {
+				events = append(events, e)
+			}
+		}
+		c.Notify.Events = events
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -630,6 +683,57 @@ func (c *Config) normalize() error {
 	case c.ShutdownTimeoutDur > 120*time.Second:
 		c.Server.ShutdownTimeout = "120s"
 		c.ShutdownTimeoutDur = 120 * time.Second
+	}
+	// v2.3 #10 Job Runner：并发与保留条数 clamp（0/负值回落默认，避免误配成 0 并发死锁）。
+	if c.Jobs.MaxConcurrency <= 0 {
+		c.Jobs.MaxConcurrency = 4
+	}
+	if c.Jobs.MaxConcurrency > 32 {
+		c.Jobs.MaxConcurrency = 32
+	}
+	if c.Jobs.Retain <= 0 {
+		c.Jobs.Retain = 50
+	}
+	if c.Jobs.Retain < 5 {
+		c.Jobs.Retain = 5
+	}
+	if c.Jobs.Retain > 500 {
+		c.Jobs.Retain = 500
+	}
+	// v2.3 #19 通知渠道：空 WebhookURL = 关闭；timeout 默认 10s，clamp 1..60s。
+	if c.Notify.Timeout == "" {
+		c.Notify.Timeout = "10s"
+	}
+	if c.NotifyTimeoutDur, err = time.ParseDuration(c.Notify.Timeout); err != nil {
+		return fmt.Errorf("notify.timeout: %w", err)
+	}
+	switch {
+	case c.NotifyTimeoutDur <= 0:
+		return fmt.Errorf("notify.timeout: 必须为正时长（收到 %q）", c.Notify.Timeout)
+	case c.NotifyTimeoutDur < time.Second:
+		c.Notify.Timeout = "1s"
+		c.NotifyTimeoutDur = time.Second
+	case c.NotifyTimeoutDur > 60*time.Second:
+		c.Notify.Timeout = "60s"
+		c.NotifyTimeoutDur = 60 * time.Second
+	}
+	if len(c.Notify.Events) == 0 {
+		c.Notify.Events = []string{"job_done", "account_disabled", "checkin_failed"}
+	} else {
+		seen := make(map[string]bool, len(c.Notify.Events))
+		out := make([]string, 0, len(c.Notify.Events))
+		for _, e := range c.Notify.Events {
+			e = strings.ToLower(strings.TrimSpace(e))
+			if e == "" || seen[e] {
+				continue
+			}
+			seen[e] = true
+			out = append(out, e)
+		}
+		if len(out) == 0 {
+			out = []string{"job_done", "account_disabled", "checkin_failed"}
+		}
+		c.Notify.Events = out
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

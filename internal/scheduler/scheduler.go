@@ -123,6 +123,23 @@ func (k TaskKind) valid() bool {
 	return false
 }
 
+// ProgressFunc 全池任务进度回调（v2.3.0 #10 Job Runner 用）：
+//   - done  = 已处理账号数（含 failed/skipped，供进度条单调前进）；
+//   - total = 候选账号总数（触发时刻池内账号数）；
+//   - fail  = 其中失败数；skip = 其中跳过数（disabled / 无凭证 / 域门控等）；
+//   - msg   = 非空时由 Job Runner 追加到 Job.LogTail（失败/关键节点用）。
+//
+// 回调可并发调用（余额刷新按有界并发逐号上报）；nil 表示不关心进度（旧 Run*Now
+// 路径与定时批次），调用方统一经 reportProgress 做 nil 安全上报。
+type ProgressFunc func(done, total, fail, skip int, msg string)
+
+// reportProgress nil 安全的进度上报。
+func reportProgress(progress ProgressFunc, done, total, fail, skip int, msg string) {
+	if progress != nil {
+		progress(done, total, fail, skip, msg)
+	}
+}
+
 // Scheduler 调度器。
 type Scheduler struct {
 	cfg Config
@@ -668,13 +685,13 @@ func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
 	}
 	switch k {
 	case taskCheckin:
-		s.runCheckin(ctx)
+		s.runCheckin(ctx, nil)
 	case taskTravel:
-		s.runTravel(ctx)
+		s.runTravel(ctx, nil)
 	case taskActivity:
-		s.runActivity(ctx)
+		s.runActivity(ctx, nil)
 	case taskKeepalive:
-		s.RunKeepaliveNow()
+		s.runKeepalive(ctx, nil)
 	case taskBlackcat:
 		s.RunBlackcatNow()
 	case taskGrowth:
@@ -689,7 +706,7 @@ func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
 		// 队列已启动（内部单飞）：标今天已跑，补跑窗口不再重复触发。
 		s.noteTaskDone(taskGrowth, s.now())
 	case taskBalance:
-		s.RunBalanceRefreshNow()
+		_ = s.RunBalanceRefreshCtx(ctx, nil)
 	}
 	return true
 }
@@ -814,33 +831,56 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 // 本函数是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走 runCheckin。
 func (s *Scheduler) RunCheckinNow() {
-	s.runCheckin(context.Background())
+	_ = s.RunCheckinCtx(context.Background(), nil)
+}
+
+// RunCheckinCtx 是 RunCheckinNow 的 ctx + 进度变体（v2.3.0 #10 Job Runner 用）：
+// ctx 取消时账号循环尽早返回（剩余账号不再发请求、不计数）；progress 逐号上报
+// 累计计数（nil = 不关心）。账号级失败只计入 fail，不把「部分失败」升级成整轮
+// error（返回恒 nil，保持「任务跑完即成功」的既有语义）。
+func (s *Scheduler) RunCheckinCtx(ctx context.Context, progress ProgressFunc) error {
+	s.runCheckin(ctx, progress)
+	return nil
 }
 
 // runCheckin 签到遍历（ctx 感知）：ctx 取消后不再发起新的上游请求、不记「今天
 // 已跑」——剩余账号留给下一轮（优雅停机不把半轮当整轮）。
-func (s *Scheduler) runCheckin(ctx context.Context) {
+//
+// 进度口径（v2.3.0 #10）：done = 已处理账号数（含失败/跳过，进度条单调前进），
+// fail = 签到或余额查询失败的账号数，skip = 域门控/无凭证/禁用跳过数。
+func (s *Scheduler) runCheckin(ctx context.Context, progress ProgressFunc) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	stList := s.cfg.Pool.List()
+	total := len(stList)
+	done, fail, skip := 0, 0, 0
+	for _, st := range stList {
 		// v2.0.1 #11：时间敏感循环内的可取消等待/检查（本循环无 sleep，但整轮
 		// 1146 号可能跑近一小时，停机信号要在账号之间及时生效）。
 		if ctx.Err() != nil {
 			return
 		}
 		if st.Disabled && !includeDisabled {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
 		if a.IsGlobal() {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
+		acctFailed := false
+		msg := ""
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
@@ -853,6 +893,8 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 				} else {
 					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+					acctFailed = true
+					msg = fmt.Sprintf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 				}
 				// 其余业务错误也继续走余额查询
 			} else {
@@ -864,20 +906,27 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与
 		// 按自然日聚合的全部批次（首页快照与「检查」共用同一口径）。
-		remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
+		remain, creditsTotal, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			continue
+			acctFailed = true
+			msg = fmt.Sprintf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		} else {
+			s.cfg.Pool.ReenableIfCredits(st.UID, remain, creditsTotal)
+			s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
+				Remain:            remain,
+				Total:             creditsTotal,
+				Expiring:          expiring,
+				EarliestAt:        earliestAt,
+				EarliestRemaining: earliestRemaining,
+				ExpiryBuckets:     poolExpiryBuckets(buckets),
+			})
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
-			Remain:            remain,
-			Total:             total,
-			Expiring:          expiring,
-			EarliestAt:        earliestAt,
-			EarliestRemaining: earliestRemaining,
-			ExpiryBuckets:     poolExpiryBuckets(buckets),
-		})
+		if acctFailed {
+			fail++
+		}
+		done++
+		reportProgress(progress, done, total, fail, skip, msg)
 	}
 	s.RunStreakBonusNow()
 	if ctx.Err() == nil {
@@ -895,19 +944,36 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	_ = s.RunActivityCtx(context.Background(), nil)
+}
+
+// RunActivityCtx 是 RunActivityNow 的 ctx + 进度变体（v2.3.0 #10 Job Runner 用）。
+func (s *Scheduler) RunActivityCtx(ctx context.Context, progress ProgressFunc) error {
+	s.runActivity(ctx, progress)
+	return nil
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+// 进度口径：done=已处理账号数，fail=上报失败数，skip=禁用/无 token/企业门控跳过数。
+func (s *Scheduler) runActivity(ctx context.Context, progress ProgressFunc) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	stList := s.cfg.Pool.List()
+	total := len(stList)
+	done, fail, skip := 0, 0, 0
+	for _, st := range stList {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled && !includeDisabled {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
@@ -917,6 +983,8 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 企业切换会话（token_source=enterprise_switch）同跳：report 返回 200 却被
 		// 上游静默丢弃（连登不涨），同样是零收益（见 auth.IsEnterpriseSession）。
 		if a.IsEnterpriseSession() {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -933,9 +1001,15 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			fail++
+			done++
+			reportProgress(progress, done, total, fail, skip,
+				fmt.Sprintf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err))
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		done++
+		reportProgress(progress, done, total, fail, skip, "")
 	}
 	if ctx.Err() == nil {
 		s.noteTaskDone(taskActivity, s.now())
@@ -971,13 +1045,35 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	_ = s.RunKeepaliveCtx(context.Background(), nil)
+}
+
+// RunKeepaliveCtx 是 RunKeepaliveNow 的 ctx + 进度变体（v2.3.0 #10 Job Runner 用）。
+func (s *Scheduler) RunKeepaliveCtx(ctx context.Context, progress ProgressFunc) error {
+	s.runKeepalive(ctx, progress)
+	return nil
+}
+
+// runKeepalive token 保活遍历（ctx 感知 + 进度）。
+// 进度口径：done=已处理账号数，fail=刷新失败数，skip=禁用/无 refresh_token 跳过数。
+func (s *Scheduler) runKeepalive(ctx context.Context, progress ProgressFunc) {
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	stList := s.cfg.Pool.List()
+	total := len(stList)
+	done, fail, skip := 0, 0, 0
+	for _, st := range stList {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled && !includeDisabled {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			skip++
+			reportProgress(progress, done, total, fail, skip, "")
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -988,14 +1084,22 @@ func (s *Scheduler) RunKeepaliveNow() {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
+			fail++
+			done++
+			reportProgress(progress, done, total, fail, skip,
+				fmt.Sprintf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err))
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
+		done++
+		reportProgress(progress, done, total, fail, skip, "")
 	}
-	s.noteTaskDone(taskKeepalive, s.now())
+	if ctx.Err() == nil {
+		s.noteTaskDone(taskKeepalive, s.now())
+	}
 }
 
 // poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，
@@ -1023,45 +1127,80 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // 风暴最危险的路径）。后台周期刷新/启动首刷/面板手动刷新共用本函数与同一把
 // 单飞 gate（见 refreshBalanceGated），不会叠加两轮全池余额查询。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	_ = s.RunBalanceRefreshCtx(context.Background(), nil)
+}
+
+// RunBalanceRefreshCtx 是 RunBalanceRefreshNow 的 ctx + 进度变体（v2.3.0 #10
+// Job Runner 用）：ctx 取消后不再派发新账号（在途并发请求自然结束）；progress
+// 按账号完成顺序上报累计计数（回调需并发安全，Job Runner 内部加锁）。
+// 进度口径：done=已处理账号数，fail=余额查询失败数，skip=禁用/无凭证跳过数。
+func (s *Scheduler) RunBalanceRefreshCtx(ctx context.Context, progress ProgressFunc) error {
 	conc := s.BalanceRefreshConcurrency()
 	// sem 即并发闸门：满载时遍历端阻塞，因此同时在途的 goroutine 数恒 <= conc，
 	// 与账号总数无关（账号 1 万也只会有 conc 个 goroutine 存活于本函数）。
 	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
+	var done, fail, skip atomic.Int64
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	stList := s.cfg.Pool.List()
+	total := len(stList)
+	report := func(msg string) {
+		reportProgress(progress, int(done.Load()), total, int(fail.Load()), int(skip.Load()), msg)
+	}
+loop:
+	for _, st := range stList {
+		if ctx.Err() != nil {
+			break
+		}
 		if st.Disabled && !includeDisabled {
+			skip.Add(1)
+			report("")
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
+			skip.Add(1)
+			report("")
 			continue
 		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop // 停机/取消：不再派发新账号，等在途收尾
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
+			remain, creditsTotal, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				fail.Add(1)
+				done.Add(1)
+				report(fmt.Sprintf("balance %s: %v", logfmt.Label(uid, a.Nickname), err))
 				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			s.cfg.Pool.ReenableIfCredits(uid, remain, creditsTotal)
 			s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
 				Remain:            remain,
-				Total:             total,
+				Total:             creditsTotal,
 				Expiring:          expiring,
 				EarliestAt:        earliestAt,
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
+			done.Add(1)
+			report("")
 		}(a, st.UID)
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return nil // 取消由 Job Runner 统一按 canceled 落状态；账号级失败只进 fail 计数
+	}
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
 	s.noteTaskDone(taskBalance, s.now())
+	return nil
 }
 
 // refreshBalanceGated 在单飞 gate 保护下跑一轮全量余额刷新（后台周期/启动首刷

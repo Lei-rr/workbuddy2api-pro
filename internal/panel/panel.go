@@ -31,7 +31,9 @@ import (
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 	"github.com/lei-rr/workbuddy2api-pro/internal/credithist"
 	"github.com/lei-rr/workbuddy2api-pro/internal/httpauth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/jobs"
 	"github.com/lei-rr/workbuddy2api-pro/internal/livecfg"
+	"github.com/lei-rr/workbuddy2api-pro/internal/notify"
 	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
 	"github.com/lei-rr/workbuddy2api-pro/internal/reqlog"
 	"github.com/lei-rr/workbuddy2api-pro/internal/scheduler"
@@ -93,6 +95,15 @@ type Config struct {
 	// 与 usage/request-logs 同一口径）。为空时回落 ConfigPath 推导（见 panelDataDir）。
 	// main.go 装配一行：StateFile: cfg.StateFile（由 Lead 合入；不改本包之外的代码）。
 	StateFile string
+
+	// Jobs 全池任务 Job Runner（v2.3.0 #10）。nil = 未装配：批量端点退回 v2.2 的
+	// 异步实现（无 job_id），Job API 返回 501（嵌入式/老测试兼容）。
+	// main.go 用 cfg.Jobs 创建（jobs.New），数据落 <state 同目录>/jobs.json。
+	Jobs *jobs.Registry
+	// Notify 事件通知器（v2.3.0 #19；nil/关闭状态时所有方法 no-op）。面板在
+	// accountDisable 成功后 Emit account_disabled；Job 完成通知由 main 的
+	// jobs.Config.OnFinish 接线（本包不感知 registry 回调）。
+	Notify *notify.Notifier
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -217,6 +228,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/metrics", p.withAuth(p.metrics))
 	p.mux.HandleFunc("GET /panel/api/audit", p.withAuth(p.auditHandler))
 	p.mux.HandleFunc("GET /panel/api/task_runs", p.withAuth(p.taskRunsHandler))
+	// v2.3.0 #10 Job Runner：任务进度/历史查询（只读；Job 持久化在 data/jobs.json）。
+	p.mux.HandleFunc("GET /panel/api/jobs", p.withAuth(p.jobsList))
+	p.mux.HandleFunc("GET /panel/api/jobs/{id}", p.withAuth(p.jobsGet))
+	// v2.3.0 #12 账号备注/标签（handler 由 backend-c 的 accountmeta.go 提供）：
+	// 列表与单号读取为只读，写操作在下方写分区。数据落 <data>/account-meta.json。
+	p.mux.HandleFunc("GET /panel/api/meta", p.withAuth(p.accountMetaList))
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaGet))
 
 	// ---- 写操作 ----
 	// v2.2.0 #5：统一经 withAudit 包一层落操作审计（成功/失败都记，detail 取响应
@@ -248,9 +266,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.withAudit(auditActionTaskClaim, p.accountTaskClaim)))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.withAudit(auditActionTaskAuto, p.accountTaskAuto)))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.withAudit(auditActionTaskAutoAll, p.accountTaskAutoAll)))
-	// 单账号「做任务」= 审计（人的操作）+ 任务历史（执行结果，v2.2.0 #9）。
+	// 单账号「做任务」= 审计（人的操作）+ 任务历史（执行结果，v2.2.0 #9）+ Job 历史
+	//（v2.3.0 #10：kind=tasks_run 的已完成记录写入 data/jobs.json，供 /jobs 查询）。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/run", p.withAuth(
-		p.withAudit(auditActionTasksRun, p.withTaskRunCapture(taskKindTasksRun, taskTriggerManual, p.accountTasksRun))))
+		p.withAudit(auditActionTasksRun,
+			p.withJobHistory(jobs.KindTasksRun, jobs.TriggerManual,
+				p.withTaskRunCapture(taskKindTasksRun, taskTriggerManual, p.accountTasksRun)))))
 	// 扫描只读、不产生副作用：不审计（生产上由任务中心按钮触发，只读上游）。
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.withAudit(auditActionTasksRunQueue, p.tasksRunQueue)))
@@ -261,6 +282,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.withAudit(auditActionActivityAll, p.activityAll)))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.withAudit(auditActionKeepaliveAll, p.keepaliveAll)))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.withAudit(auditActionBalanceAll, p.balanceAll)))
+	// v2.3.0 #10 Job Runner：触发（/jobs/{kind}/run，返回 job_id）与取消。
+	// 触发走与旧端点相同的同 kind 单飞 gate：409 语义不变。
+	p.mux.HandleFunc("POST /panel/api/jobs/{kind}/run", p.withAuth(p.jobsRun))
+	p.mux.HandleFunc("POST /panel/api/jobs/{id}/cancel", p.withAuth(p.jobsCancel))
+	// v2.3.0 #12 账号备注/标签写操作（PUT 覆盖保存；DELETE 幂等删除）。
+	p.mux.HandleFunc("PUT /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaPut))
+	p.mux.HandleFunc("DELETE /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaDelete))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.withAudit(auditActionUsageSave, p.usageSave)))
@@ -1124,6 +1152,10 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
+	// v2.3.0 #19：账号被禁用 → Emit account_disabled（Notifier 关闭时 no-op；uid 脱敏）。
+	if p.cfg.Notify != nil {
+		p.cfg.Notify.AccountDisabled(shortUID(uid), "manual disable (panel)")
+	}
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1322,6 +1354,9 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// v2.3.0 #12：账号已出池 → 同步清理其备注/标签（accountmeta.go）。
+	// 放在 Remove 之后、两个成功响应分支之前，保证「删号但备注残留」不会发生。
+	p.accountMetaForget(uid)
 	fileMsg := ""
 	if a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
@@ -1358,89 +1393,88 @@ func writeBatchConflict(w http.ResponseWriter, msg string) {
 
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
 //
-// v2.2.0 #9：单飞 gate/异步/409 语义不变，统一改走 triggerBatchTask——任务结束
-// 后写一条任务执行历史（kind=checkin，trigger=manual；调度器内部逐号统计 panel
-// 侧拿不到，历史里只记触发时账号总数与起止时间）。
+// v2.3.0 #10：统一经 Job Runner 起 Job——先占 scheduler 同 kind 单飞 gate（409
+// 语义不变），再注册 Job（返回 job_id，可经 GET /jobs/{id} 看进度/取消）。
+// 旧响应字段 ok/started 保留；Registry 未装配时退回 v2.2 异步实现（无 job_id）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
-	sch := p.cfg.Scheduler
-	if sch == nil {
+	spec, ok := p.jobSpecFor(jobs.KindCheckin)
+	if !ok {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.triggerBatchTask(sch, scheduler.TaskCheckin, taskKindCheckin, sch.RunCheckinNow) {
-		writeBatchConflict(w, "全量签到正在执行中，请等本轮结束后再试")
+	jobID, started := p.triggerJob(spec)
+	if !started {
+		writeBatchConflict(w, spec.conflict)
 		return
 	}
-	log.Printf("panel: 手动全量签到已触发（含连登管家；后台执行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	log.Printf("panel: 手动全量签到已触发（含连登管家；job=%s）", jobID)
+	writeJSON(w, http.StatusOK, batchStartedBody(jobID))
 }
 
-// travelAll 手动触发全量猫猫旅行巡检（异步执行；任务历史 kind=travel）。
+// travelAll 手动触发全量猫猫旅行巡检（v2.3.0 #10 Job Runner，响应附 job_id）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
-	sch := p.cfg.Scheduler
-	if sch == nil {
+	spec, ok := p.jobSpecFor(jobs.KindTravel)
+	if !ok {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.triggerBatchTask(sch, scheduler.TaskTravel, taskKindTravel, sch.RunTravelNow) {
-		writeBatchConflict(w, "全量旅行巡检正在执行中，请等本轮结束后再试")
+	jobID, started := p.triggerJob(spec)
+	if !started {
+		writeBatchConflict(w, spec.conflict)
 		return
 	}
-	log.Printf("panel: 手动全量旅行巡检已触发（后台执行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	log.Printf("panel: 手动全量旅行巡检已触发（job=%s）", jobID)
+	writeJSON(w, http.StatusOK, batchStartedBody(jobID))
 }
 
-// activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置；任务历史 kind=activity）。
+// activityAll 手动触发全量活跃上报（v2.3.0 #10 Job Runner，响应附 job_id）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
-	sch := p.cfg.Scheduler
-	if sch == nil {
+	spec, ok := p.jobSpecFor(jobs.KindActivity)
+	if !ok {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.triggerBatchTask(sch, scheduler.TaskActivity, taskKindActivity, sch.RunActivityNow) {
-		writeBatchConflict(w, "全量活跃上报正在执行中，请等本轮结束后再试")
+	jobID, started := p.triggerJob(spec)
+	if !started {
+		writeBatchConflict(w, spec.conflict)
 		return
 	}
-	log.Printf("panel: 手动全量活跃上报已触发（后台执行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	log.Printf("panel: 手动全量活跃上报已触发（job=%s）", jobID)
+	writeJSON(w, http.StatusOK, batchStartedBody(jobID))
 }
 
-// keepaliveAll 手动触发全量 token 保活（异步执行；任务历史 kind=keepalive）。
+// keepaliveAll 手动触发全量 token 保活（v2.3.0 #10 Job Runner，响应附 job_id）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
-	sch := p.cfg.Scheduler
-	if sch == nil {
+	spec, ok := p.jobSpecFor(jobs.KindKeepalive)
+	if !ok {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.triggerBatchTask(sch, scheduler.TaskKeepalive, taskKindKeepalive, sch.RunKeepaliveNow) {
-		writeBatchConflict(w, "全量 token 保活正在执行中，请等本轮结束后再试")
+	jobID, started := p.triggerJob(spec)
+	if !started {
+		writeBatchConflict(w, spec.conflict)
 		return
 	}
-	log.Printf("panel: 手动全量保活已触发（后台执行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	log.Printf("panel: 手动全量保活已触发（job=%s）", jobID)
+	writeJSON(w, http.StatusOK, batchStartedBody(jobID))
 }
 
-// balanceAll 手动全量刷新余额：异步执行（v2.0.1 #10）。
-// 先占单飞 gate 再立即返回 {ok:true,started:true}；后台按
-// schedule.balance_refresh_concurrency 有界并发查上游、写回池内 credits（含解冻
-// 语义）并同步昵称——不再让 HTTP 请求挂到全池刷完（1146 号池会触发反代 504）。
-// 重复点击/后台周期刷新撞车 → 409。前端补拉 overview 获取结果。
-// v2.2.0 #9：任务历史 kind=balance（含昵称同步这一步的总时长）。
+// balanceAll 手动全量刷新余额（v2.3.0 #10 Job Runner，响应附 job_id）。
+// 后台按 schedule.balance_refresh_concurrency 有界并发查上游、写回池内 credits
+// （含解冻语义）并同步昵称；重复点击/周期刷新撞车 → 409。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
-	sch := p.cfg.Scheduler
-	if sch == nil {
+	spec, ok := p.jobSpecFor(jobs.KindBalance)
+	if !ok {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !p.triggerBatchTask(sch, scheduler.TaskBalance, taskKindBalance, func() {
-		sch.RunBalanceRefreshNow()
-		p.syncNicknames()
-	}) {
-		writeBatchConflict(w, "全量余额刷新正在执行中，请等本轮结束后再试")
+	jobID, started := p.triggerJob(spec)
+	if !started {
+		writeBatchConflict(w, spec.conflict)
 		return
 	}
-	log.Printf("panel: 手动全量余额刷新已触发（后台执行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	log.Printf("panel: 手动全量余额刷新已触发（job=%s）", jobID)
+	writeJSON(w, http.StatusOK, batchStartedBody(jobID))
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。

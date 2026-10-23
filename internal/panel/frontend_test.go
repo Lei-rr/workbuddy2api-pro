@@ -1283,15 +1283,20 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
-const start = src.indexOf('function remarkKey(');
-const end = src.indexOf('function storeRemarks(');
+const kStart = src.indexOf('function remarkKey(');
+const kEnd = src.indexOf('function storeRemarks(');
+// v2.3.0 #12：备注展示改为「服务端 meta 优先、localStorage 降级」——
+// remarkOf 依赖 metaFor，这里注入恒 null 的服务端查询，验证本地降级路径不变。
+const rStart = src.indexOf('function remarkOf(');
+const rEnd = src.indexOf('function accTagsHtml(');
 if (escStart < 0 || escEnd < 0) throw new Error('esc helpers not found');
-if (start < 0 || end < 0) throw new Error('remark helpers not found');
+if (kStart < 0 || kEnd < 0 || rStart < 0 || rEnd < 0) throw new Error('remark helpers not found');
 const ctx = { String, RegExp, Number };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(escStart, escEnd) + src.slice(start, end) +
+  src.slice(escStart, escEnd) + src.slice(kStart, kEnd) + src.slice(rStart, rEnd) +
   '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
+  '\nfunction metaFor() { return null; }' +
   '\nfunction remarksAll() { return REM; }' +
   '\nthis.remarkKey=remarkKey; this.remarkName=remarkName;',
   ctx
@@ -2253,6 +2258,8 @@ const ctx = {
   // start() 还会后台补一次完整 overview（ensureFullOverview）。
   refreshAccountsView: async () => { loadCalls++; return loadResult; },
   ensureFullOverview: async () => true,
+  loadMeta: async () => true,          // v2.3.0 #12：start() 会后台加载服务端备注
+  maybeMigrateRemarks: () => {},
   loadLogs: async () => { logCalls++; return true; },
   reattachQueueView: () => { reattachCalls++; },
   openKey: () => { openKeyCalls++; },
@@ -2507,6 +2514,7 @@ const ctx = {
   toast: (m, c) => toasts.push([m, c || '']),
   // v2.1 #1：定时补拉走 refreshAccountPool（summary + 当前页），不再全量 overview。
   refreshAccountPool: () => { overviewCalls++; },
+  loadJobs: () => {},   // v2.3.0 #10：余额刷新后立即刷顶部 Job 进度条
   loadLogs: () => { logCalls++; },
   view: 'accounts',
   setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
@@ -2533,7 +2541,7 @@ vm.runInContext(src.slice(start, stop), ctx);
   process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });`
 	want := `{"ok":{"calls":[["balance_all","POST"]],"during":{"text":"已提交…","disabled":true},` +
-		`"toast":[["已开始刷新余额（后台执行，完成后自动刷新）","ok"]],"timers":[2500],` +
+		`"toast":[["已开始刷新余额（后台执行，job 进度见顶部）","ok"]],"timers":[2500],` +
 		`"label":"刷新","disabled":false,"overviewAfterTimer":1},` +
 		`"conflict":{"calls":[["balance_all","POST"]],` +
 		`"toast":[["刷新失败：正在执行余额刷新任务，请稍后重试","err"]],"timers":0,` +
@@ -3549,6 +3557,487 @@ func TestPanelAuditTaskRunsWiring(t *testing.T) {
 	} {
 		if !strings.Contains(h, want) {
 			t.Errorf("index.html 缺少 %q", want)
+		}
+	}
+}
+
+// TestAppJSJobsProgressAndCancel v2.3.0 #10 的 Job 进度条/取消/批量按钮交互（node 切片）。
+//
+// 覆盖：jobs 归一化（字段别名/缺失）、只展示 running（pending/done 不显示）、
+// 进度百分比/失败/跳过/触发来源文案、取消确认（拒绝不发请求、确认发 POST、失败 toast）、
+// 后端未提供 jobs 接口（404）时停止空打（兜底旧行为）、批量按钮成功 toast 指向顶部进度条、
+// 409 原样展示后端 error 文案。
+func TestAppJSJobsProgressAndCancel(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const JOBS_LIMIT = 20;');
+const end = src.indexOf("\nif ($('btnJobCancel')) $('btnJobCancel').onclick = cancelJob;");
+if (start < 0 || end < 0 || end < start) throw new Error('jobs section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false, className: '',
+  style: {}, value: '', dataset: {}, children: [], classList: { add() {}, remove() {}, toggle() {} } });
+const toasts = [];
+const apiCalls = [];
+let apiImpl = async () => ({});
+let confirmAnswer = false;
+const ctx = {
+  fmtRunTime: v => (v ? 'T:' + v : '—'),
+  $: id => (sinks[id] || mk(id)),
+  api: async (p, o) => { apiCalls.push([p, o && o.method]); return apiImpl(p, o); },
+  toast: (m, c) => toasts.push([m, c || '']),
+  confirm: () => confirmAnswer,
+  Date, Number, String, Object, Array, Math, JSON,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.__job = {' +
+  ' normalizeJob, normalizeJobs, pickActiveJob, jobKindText, jobStateText, jobTriggerText,' +
+  ' renderJobBar, loadJobs, cancelJob, runBatchTask,' +
+  ' state: () => ({ active: jobsActive, supported: jobsSupported, loading: jobsLoading }),' +
+  ' reset: () => { jobsActive = null; jobsSupported = true; jobsLoading = false; },' +
+  '};', ctx);
+const J = ctx.__job;
+(async () => {
+  const out = {};
+  const jobs = [
+    { id: 'j0', kind: 'travel', trigger: 'schedule', state: 'done', total: 3, done: 3, fail: 0, skip: 0 },
+    // 后端实际契约：started_at 是 RFC3339 字符串；done 含失败不含跳过 → 已处理 = done+skip。
+    { id: 'j1', kind: 'checkin', trigger: 'manual', state: 'running', total: 10, done: 3, fail: 1, skip: 2,
+      started_at: '2026-10-24T04:16:40.123+08:00' },
+    { id: 'j2', kind: 'balance', trigger: 'manual', state: 'pending', total: 5, done: 0 },
+  ];
+  const norm = J.normalizeJobs({ jobs: jobs });
+  out.norm = { count: norm.length, id: norm[1].id, kind: norm[1].kind, done: norm[1].done,
+               fail: norm[1].fail, skip: norm[1].skip, trigger: norm[1].trigger,
+               startedIsString: typeof norm[1].started_at === 'string' };
+  out.pick = J.pickActiveJob(norm).id;
+  out.pickNone = J.pickActiveJob([{ id: 'x', state: 'done' }, { id: 'y', state: 'pending' }]) === null;
+  // 未知/中断状态按兜底标签展示（interrupted = 进程重启时上次未完成的 Job）
+  out.labels = [J.jobKindText('checkin'), J.jobStateText('running'),
+                J.jobStateText('interrupted'), J.jobTriggerText('manual')];
+  J.renderJobBar(norm);
+  out.render = { hidden: sinks.jobBar.hidden, kind: sinks.jobKind.textContent,
+                 prog: sinks.jobProgText.textContent, meta: sinks.jobMeta.textContent,
+                 width: sinks.jobBarFill.style.width, cancelDisabled: sinks.btnJobCancel.disabled };
+  J.renderJobBar([{ id: 'x', state: 'done', kind: 'checkin' }]);
+  out.hideWhenNoRunning = sinks.jobBar.hidden;
+  J.reset();
+  apiImpl = async () => ({ ok: true, jobs: jobs });
+  await J.loadJobs(true);
+  out.load = { path: apiCalls[apiCalls.length - 1][0], active: J.state().active && J.state().active.id };
+  // 后端未就绪（404）：隐藏进度条并停止空打
+  J.reset(); apiCalls.length = 0;
+  apiImpl = async () => { throw new Error('HTTP 404'); };
+  await J.loadJobs(true);
+  const afterFirst404 = apiCalls.length;
+  await J.loadJobs(true);
+  out.unsupported = { supported: J.state().supported, first404Calls: afterFirst404,
+                      retriedCalls: apiCalls.length, hidden: sinks.jobBar.hidden };
+  J.reset();
+  apiImpl = async () => ({ ok: true, jobs: [jobs[1]] });
+  await J.loadJobs(true);
+  J.renderJobBar([jobs[1]]);   // 取消场景逐项重置为「有 running job」状态（防异步 loadJobs 清空）
+  confirmAnswer = false; apiCalls.length = 0; toasts.length = 0;
+  await J.cancelJob();
+  out.cancelNo = { calls: apiCalls.length, toasts: toasts.length };
+  confirmAnswer = true; apiImpl = async () => ({ ok: true });
+  J.renderJobBar([jobs[1]]);
+  apiCalls.length = 0; toasts.length = 0;
+  await J.cancelJob();
+  out.cancelYes = { calls: apiCalls.slice(), toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1] };
+  apiImpl = async () => { throw new Error('HTTP 409'); };
+  J.renderJobBar([jobs[1]]);
+  apiCalls.length = 0; toasts.length = 0;
+  await J.cancelJob();
+  out.cancelFail = { toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1] };
+  // canceled:false = 请求到达时任务已结束（后端契约：canceled 布尔）
+  apiImpl = async () => ({ ok: true, canceled: false });
+  J.renderJobBar([jobs[1]]);
+  toasts.length = 0;
+  await J.cancelJob();
+  out.cancelAlready = { toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1] };
+  apiCalls.length = 0; toasts.length = 0;
+  apiImpl = async () => ({ ok: true, started: true, job_id: 'j9' });
+  const btn = { disabled: false };
+  await J.runBatchTask('checkin_all', '全部签到', btn);
+  out.batchOk = { call: apiCalls[0] && apiCalls[0][0], method: apiCalls[0] && apiCalls[0][1],
+                  toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1], btn: btn.disabled };
+  apiCalls.length = 0; toasts.length = 0;
+  apiImpl = async () => { throw new Error('签到任务正在执行中，请稍后再试'); };
+  await J.runBatchTask('checkin_all', '全部签到', btn);
+  out.batch409 = { toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1] };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"norm":{"count":3,"id":"j1","kind":"checkin","done":3,"fail":1,"skip":2,"trigger":"manual",` +
+		`"startedIsString":true},` +
+		`"pick":"j1","pickNone":true,"labels":["全部签到","执行中","已中断","手动"],` +
+		`"render":{"hidden":false,"kind":"全部签到（执行中）","prog":"5 / 10 · 失败 1 · 跳过 2",` +
+		`"meta":"手动 · 开始 T:2026-10-24T04:16:40.123+08:00","width":"50%","cancelDisabled":false},` +
+		`"hideWhenNoRunning":true,` +
+		`"load":{"path":"jobs?limit=20","active":"j1"},` +
+		`"unsupported":{"supported":false,"first404Calls":1,"retriedCalls":1,"hidden":true},` +
+		`"cancelNo":{"calls":0,"toasts":0},` +
+		`"cancelYes":{"calls":[["jobs/j1/cancel","POST"],["jobs?limit=20",null]],` +
+		`"toast":"已请求取消：当前账号跑完后停止后续","cls":"ok"},` +
+		`"cancelFail":{"toast":"取消失败：HTTP 409","cls":"err"},` +
+		`"cancelAlready":{"toast":"任务已结束，无需取消","cls":"ok"},` +
+		`"batchOk":{"call":"checkin_all","method":"POST",` +
+		`"toast":"全部签到已开始（job 进度见顶部）","cls":"ok","btn":false},` +
+		`"batch409":{"toast":"全部签到失败：签到任务正在执行中，请稍后再试","cls":"err"}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("Job 进度/取消=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSMetaTagsAndMigration v2.3.0 #12 的标签解析/展示优先级/服务端加载/一次性迁移。
+//
+// 覆盖：tags 分隔（逗号/全角逗号/空格）、去重、≤10 个、每个 ≤32 字；备注展示
+// 「服务端优先、localStorage 降级（uid8）」；账号行标签最多 3 个 + 「+N」；
+// GET /meta 成功/失败（失败回落本地）；服务端 meta 为空且本地有旧备注时按完整 uid
+// 批量 PUT 迁移一次并清理已迁移本地键；服务端已有 meta 不自动导入；账号列表未就位
+// 时等待（不置迁移标记、不误写）。
+func TestAppJSMetaTagsAndMigration(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('let metaAll = {};');
+const end = src.indexOf("\nif ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;");
+if (start < 0 || end < 0 || end < start) throw new Error('meta section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false, className: '',
+  style: {}, value: '', dataset: {}, children: [], classList: { add() {}, remove() {}, toggle() {} } });
+const toasts = [];
+const apiCalls = [];
+let apiImpl = async () => ({ ok: true, meta: {} });
+let pool = [];
+const state = { view: 'accounts', renders: 0 };
+const ctx = {
+  LS_REMARKS: 'wb2api.remarks.v1',
+  esc: s => String(s == null ? '' : s),
+  $: id => (sinks[id] || mk(id)),
+  localStorage: {
+    store: {},
+    getItem(k) { return this.store[k] == null ? null : this.store[k]; },
+    setItem(k, v) { this.store[k] = String(v); },
+  },
+  poolAccountList: () => pool,
+  api: async (p, o) => { apiCalls.push([p, o && o.method, o && o.body]); return apiImpl(p, o); },
+  toast: (m, c) => toasts.push([m, c || '']),
+  get view() { return state.view; },
+  renderAccounts: () => { state.renders++; },
+  renderUsage: () => {},
+  usageData: null, accAll: [], accPageMeta: null,
+  Date, Number, String, Object, Array, Math, JSON, Promise,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.__meta = {' +
+  ' parseTags, normalizeMeta, loadMeta, maybeMigrateRemarks, remarkOf, remarkName, accTagsHtml,' +
+  ' remarkFormRows, renderRemarkBody, saveRemarkForm, openRemarks, remarksAll, storeRemarks, metaFor,' +
+  ' state: () => ({ all: metaAll, loaded: metaLoaded, tried: metaMigrationTried }),' +
+  ' reset: () => { metaAll = {}; metaLoaded = false; metaMigrationTried = false; },' +
+  ' setMeta: m => { metaAll = m; }, setLoaded: v => { metaLoaded = v; },' +
+  '};', ctx);
+const M = ctx.__meta;
+const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+(async () => {
+  const out = {};
+  out.parse = {
+    basic: M.parseTags('a, b，c  a'),
+    empty: M.parseTags(''),
+    arr: M.parseTags(['x', 'x', ' y ']),
+    cap: M.parseTags(Array.from({ length: 15 }, (_, i) => 't' + i)).length,
+    long: M.parseTags('x'.repeat(40))[0].length,
+  };
+  const norm = M.normalizeMeta({ meta: { u1: { note: 'n1', tags: ['a', ' b '], updated_at: 5 }, u2: {} } });
+  out.normalize = { uids: Object.keys(norm).sort(), note: norm.u1.note, tags: norm.u1.tags,
+                    at: norm.u1.updated_at, empty: norm.u2.note };
+  M.storeRemarks({ abcd1234: '本机备注' });
+  out.display = { local: M.remarkOf('abcd1234XYZ'), name: M.remarkName('abcd1234XYZ', '昵称') };
+  M.setMeta({ abcd1234XYZ: { note: '服务端备注', tags: [], updated_at: 1 } });
+  out.displayServer = { note: M.remarkOf('abcd1234XYZ'), name: M.remarkName('abcd1234XYZ', '昵称') };
+  M.setMeta({ u1: { note: 's', tags: ['t1', 't2'], updated_at: 1 },
+              u2: { note: '', tags: ['a', 'b', 'c', 'd', 'e'], updated_at: 2 } });
+  const t2 = M.accTagsHtml('u1');
+  const t5 = M.accTagsHtml('u2');
+  out.tags = { none: M.accTagsHtml('nope'),
+               twoCount: (t2.match(/class="tag mute"/g) || []).length,
+               fiveCount: (t5.match(/class="tag mute"/g) || []).length,
+               hasPlus: t5.indexOf('+2') >= 0, two: t2 };
+  M.reset(); pool = [{ uid: 'u1', nickname: 'A' }];
+  apiImpl = async () => ({ ok: true, meta: { u1: { note: '服务端A', tags: ['vip'], updated_at: 9 } } });
+  apiCalls.length = 0;
+  out.loadOk = { ret: await M.loadMeta(true), path: apiCalls[0] && apiCalls[0][0],
+                 note: M.remarkOf('u1'), localNote: ctx.localStorage.store['wb2api.remarks.v1'] };
+  M.reset();
+  apiImpl = async () => { throw new Error('HTTP 404'); };
+  out.loadFail = { ret: await M.loadMeta(true), localFallback: M.remarkOf('abcd1234XYZ') };
+  // 迁移：服务端空 + 本地旧备注（uid8）→ 解析完整 uid 后 PUT 一次，清已迁移本地键
+  M.reset(); M.setLoaded(true); pool = [{ uid: 'abcd1234XYZ', nickname: 'A' }];
+  M.storeRemarks({ abcd1234: '旧备注', orphankey: '孤立' });
+  apiCalls.length = 0; toasts.length = 0;
+  apiImpl = async () => ({ ok: true });
+  M.maybeMigrateRemarks();
+  await flush();
+  out.migrate = { calls: apiCalls.map(c => [c[0], c[1]]),
+                  body: apiCalls[0] && JSON.parse(apiCalls[0][2]),
+                  metaNote: M.metaFor('abcd1234XYZ') && M.metaFor('abcd1234XYZ').note,
+                  local: M.remarksAll(), toast: toasts[0] && toasts[0][0] };
+  // 服务端已有 meta：不自动导入（避免覆盖），本地保留
+  M.reset(); M.setLoaded(true); pool = [{ uid: 'abcd1234XYZ', nickname: 'A' }];
+  M.setMeta({ u9: { note: 'x', tags: [], updated_at: 1 } });
+  M.storeRemarks({ abcd1234: '旧备注' });
+  apiCalls.length = 0;
+  M.maybeMigrateRemarks();
+  await flush();
+  out.migrateSkip = { calls: apiCalls.length, local: M.remarksAll() };
+  // 账号列表未就位：不尝试、不置 tried（loadAccountPage 成功后会再调）
+  M.reset(); M.setLoaded(true); pool = [];
+  apiCalls.length = 0;
+  M.maybeMigrateRemarks();
+  out.migrateWait = { calls: apiCalls.length, tried: M.state().tried };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"parse":{"basic":["a","b","c"],"empty":[],"arr":["x","y"],"cap":10,"long":32},` +
+		`"normalize":{"uids":["u1","u2"],"note":"n1","tags":["a","b"],"at":5,"empty":""},` +
+		`"display":{"local":"本机备注","name":"本机备注<span class=\"rm-ghost\">昵称</span>"},` +
+		`"displayServer":{"note":"服务端备注","name":"服务端备注<span class=\"rm-ghost\">昵称</span>"},` +
+		`"tags":{"none":"","twoCount":2,"fiveCount":4,"hasPlus":true,` +
+		`"two":"<span class=\"acc-tags\"><span class=\"tag mute\" title=\"t1\">t1</span>` +
+		`<span class=\"tag mute\" title=\"t2\">t2</span></span>"},` +
+		`"loadOk":{"ret":true,"path":"meta","note":"服务端A",` +
+		`"localNote":"{\"abcd1234\":\"本机备注\",\"u1\":\"服务端A\"}"},` +
+		`"loadFail":{"ret":false,"localFallback":"本机备注"},` +
+		`"migrate":{"calls":[["accounts/abcd1234XYZ/meta","PUT"]],"body":{"note":"旧备注","tags":[]},` +
+		`"metaNote":"旧备注","local":{"orphankey":"孤立"},` +
+		`"toast":"已迁移本机备注到服务端（1 条）"},` +
+		`"migrateSkip":{"calls":0,"local":{"abcd1234":"旧备注"}},` +
+		`"migrateWait":{"calls":0,"tried":false}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("备注标签/迁移=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSMetaSaveAndRender v2.3.0 #12 的服务端保存/删除/降级与备注弹窗渲染。
+//
+// 覆盖：改动 → PUT（note+tags）、清空且服务端有记录 → DELETE、未改动跳过、
+// 无完整 uid 的旧本机键只写本地不误写服务端；写失败 toast 数量+本地保留+meta 不变；
+// 弹窗渲染服务端备注/tags 输入值 + 本机孤儿旧键（data-legacy）；打开时未加载过 meta
+// 会先 GET /meta 再渲染。
+func TestAppJSMetaSaveAndRender(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('let metaAll = {};');
+const end = src.indexOf("\nif ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;");
+if (start < 0 || end < 0 || end < start) throw new Error('meta section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false, className: '',
+  style: {}, value: '', dataset: {}, children: [], classList: { on: 0, add() { this.on++; }, remove() { this.on--; }, toggle() {} } });
+const toasts = [];
+const apiCalls = [];
+let apiImpl = async () => ({ ok: true });
+let pool = [];
+const state = { view: 'accounts', renders: 0, usageRenders: 0 };
+const ctx = {
+  LS_REMARKS: 'wb2api.remarks.v1',
+  esc: s => String(s == null ? '' : s),
+  $: id => (sinks[id] || mk(id)),
+  localStorage: {
+    store: {},
+    getItem(k) { return this.store[k] == null ? null : this.store[k]; },
+    setItem(k, v) { this.store[k] = String(v); },
+  },
+  poolAccountList: () => pool,
+  api: async (p, o) => { apiCalls.push([p, o && o.method, o && o.body]); return apiImpl(p, o); },
+  toast: (m, c) => toasts.push([m, c || '']),
+  get view() { return state.view; },
+  renderAccounts: () => { state.renders++; },
+  renderUsage: () => { state.usageRenders++; },
+  usageData: null, accAll: [], accPageMeta: null,
+  Date, Number, String, Object, Array, Math, JSON, Promise,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.__meta = {' +
+  ' parseTags, normalizeMeta, loadMeta, maybeMigrateRemarks, remarkOf, remarkName, accTagsHtml,' +
+  ' remarkFormRows, renderRemarkBody, saveRemarkForm, openRemarks, remarksAll, storeRemarks, metaFor,' +
+  ' state: () => ({ all: metaAll, loaded: metaLoaded, tried: metaMigrationTried }),' +
+  ' reset: () => { metaAll = {}; metaLoaded = false; metaMigrationTried = false; },' +
+  ' setMeta: m => { metaAll = m; }, setLoaded: v => { metaLoaded = v; },' +
+  '};', ctx);
+const M = ctx.__meta;
+const row = (uid, note, tags, legacy) => ({
+  getAttribute: k => (k === 'data-uid' ? uid : (k === 'data-legacy' ? (legacy ? '1' : null) : null)),
+  querySelector: sel => (sel === '.rm-note' ? { value: note } : (sel === '.rm-tags' ? { value: tags } : null)),
+});
+(async () => {
+  const out = {};
+  M.reset(); M.setLoaded(true);
+  M.setMeta({ u1: { note: 'old', tags: ['x'], updated_at: 1 }, u2: { note: '', tags: [], updated_at: 2 },
+              u4: { note: 'old4', tags: [], updated_at: 3 } });
+  pool = [{ uid: 'u1', nickname: 'A' }, { uid: 'u2', nickname: 'B' }, { uid: 'u4', nickname: 'D' }];
+  M.storeRemarks({ legacy12: '旧本机' });
+  const rows = [
+    row('u1', ' new1 ', 'a, b', false),
+    row('u2', '', '', false),
+    row('u4', '', '', false),
+    row('u3', '新账号备注', 'vip', false),
+    row('legacy12', '本机改', '', true),
+  ];
+  sinks.remarkBody = { innerHTML: '', querySelectorAll: () => rows };
+  apiImpl = async () => ({ ok: true });
+  apiCalls.length = 0; toasts.length = 0; state.renders = 0;
+  await M.saveRemarkForm();
+  out.save = {
+    calls: apiCalls.map(c => [c[0], c[1], c[2] ? JSON.parse(c[2]) : null]),
+    u1: { note: M.metaFor('u1').note, tags: M.metaFor('u1').tags },
+    u3: { note: M.metaFor('u3').note, tags: M.metaFor('u3').tags },
+    u4: M.metaFor('u4'),
+    local: M.remarksAll(), toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1],
+    btn: sinks.btnRemarkSave.disabled, renders: state.renders,
+  };
+  M.reset(); M.setLoaded(true); M.setMeta({ u1: { note: 'old', tags: [], updated_at: 1 } });
+  pool = [{ uid: 'u1', nickname: 'A' }];
+  M.storeRemarks({});
+  sinks.remarkBody = { innerHTML: '', querySelectorAll: () => [row('u1', 'changed', '', false)] };
+  apiImpl = async () => { throw new Error('HTTP 500'); };
+  apiCalls.length = 0; toasts.length = 0;
+  await M.saveRemarkForm();
+  out.saveFail = { calls: apiCalls.length, u1: M.metaFor('u1').note, local: M.remarksAll(),
+                   toast: toasts[0] && toasts[0][0], cls: toasts[0] && toasts[0][1] };
+  M.reset(); M.setLoaded(true); M.setMeta({ u1: { note: 'same', tags: ['t'], updated_at: 1 } });
+  sinks.remarkBody = { innerHTML: '', querySelectorAll: () => [row('u1', 'same', 't', false)] };
+  apiCalls.length = 0; toasts.length = 0;
+  await M.saveRemarkForm();
+  out.saveNoop = { calls: apiCalls.length, toast: toasts[0] && toasts[0][0] };
+  // 弹窗渲染：服务端备注/标签 + 本机孤儿旧键（legacy）
+  M.reset(); M.setLoaded(true);
+  M.setMeta({ u1: { note: '服务端备注', tags: ['t1', 't2'], updated_at: 1 } });
+  pool = [{ uid: 'u1', nickname: '甲' }];
+  M.storeRemarks({ orphan01: '本机孤立' });
+  sinks.remarkBody = { innerHTML: '' };
+  M.renderRemarkBody();
+  const html = sinks.remarkBody.innerHTML;
+  out.renderRows = {
+    rows: (html.match(/class="rm-row"/g) || []).length,
+    hasNote: html.indexOf('服务端备注') >= 0,
+    hasTags: html.indexOf('value="t1, t2"') >= 0,
+    hasLegacy: html.indexOf('data-legacy="1"') >= 0,
+    hasLegacyNote: html.indexOf('本机孤立') >= 0,
+  };
+  out.formRows = M.remarkFormRows().map(r => ({ uid: r.uid, legacy: r.legacy }));
+  // openRemarks：未加载 meta 时先拉服务端再渲染
+  M.reset(); pool = [{ uid: 'u1', nickname: '甲' }];
+  apiImpl = async () => ({ ok: true, meta: { u1: { note: '打开时拉取', tags: [], updated_at: 1 } } });
+  apiCalls.length = 0;
+  sinks.remarkVeil = mk('remarkVeil');
+  sinks.remarkBody = { innerHTML: '' };
+  await M.openRemarks();
+  out.open = { path: apiCalls[0] && apiCalls[0][0],
+               hasNote: sinks.remarkBody.innerHTML.indexOf('打开时拉取') >= 0,
+               veilOn: sinks.remarkVeil.classList.on };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"save":{"calls":[["accounts/u1/meta","PUT",{"note":"new1","tags":["a","b"]}],` +
+		`["accounts/u4/meta","DELETE",null],["accounts/u3/meta","PUT",{"note":"新账号备注","tags":["vip"]}]],` +
+		`"u1":{"note":"new1","tags":["a","b"]},"u3":{"note":"新账号备注","tags":["vip"]},"u4":null,` +
+		`"local":{"u1":"new1","u3":"新账号备注","legacy12":"本机改"},` +
+		`"toast":"备注/标签已保存到服务端（3 条）","cls":"ok","btn":false,"renders":1},` +
+		`"saveFail":{"calls":1,"u1":"old","local":{"u1":"changed"},` +
+		`"toast":"已保存 0 条，失败 1 条（本机缓存已保留，可重试）","cls":"err"},` +
+		`"saveNoop":{"calls":0,"toast":"没有需要保存的改动"},` +
+		`"renderRows":{"rows":2,"hasNote":true,"hasTags":true,"hasLegacy":true,"hasLegacyNote":true},` +
+		`"formRows":[{"uid":"u1","legacy":false},{"uid":"orphan01","legacy":true}],` +
+		`"open":{"path":"meta","hasNote":true,"veilOn":1}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("备注保存/渲染=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelJobMetaWiring v2.3.0 #10/#12/#20 的前端接线（源码级）：
+// Job 进度条/取消/批量按钮、备注标签服务端读写与迁移、移动端样式、旧「仅本机」实现移除。
+func TestPanelJobMetaWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		// #10 Job API 契约（路径/limit/取消）
+		"const JOBS_LIMIT = 20;",
+		"api('jobs?limit=' + JOBS_LIMIT)",
+		"api('jobs/' + encodeURIComponent(j.id) + '/cancel'",
+		"function renderJobBar(",
+		"async function loadJobs(",
+		"async function cancelJob(",
+		"async function runBatchTask(",
+		"已开始（job 进度见顶部）",
+		"loadJobs(true);   // 进度条跟随轮询刷新",
+		// 后端契约：state 含 interrupted；进度 = done+skip（done 含失败不含跳过）
+		"interrupted: '已中断'",
+		"const processed = j.done + j.skip;",
+		"canceled === false",
+		// 批量按钮统一走 runBatchTask（4 个全池按钮）
+		"$('btnCheckinAll').onclick = () => runBatchTask('checkin_all', '全部签到'",
+		"$('btnTravelAll').onclick = () => runBatchTask('travel_all', '旅行巡检'",
+		"$('btnActivityAll').onclick = () => runBatchTask('activity_all', '活跃上报'",
+		"$('btnKeepaliveAll').onclick = () => runBatchTask('keepalive_all', '全部保活'",
+		// #12 meta 服务端读写 + 迁移 + 标签
+		"api('meta')",
+		"accounts/' + encodeURIComponent(ch.uid) + '/meta'",
+		"function maybeMigrateRemarks(",
+		"function parseTags(",
+		"function accTagsHtml(",
+		"accTagsHtml(s.uid)",
+		"LS_REMARKS = 'wb2api.remarks.v1'",
+		"已迁移本机备注到服务端",
+		"备注/标签已保存到服务端",
+		// 账号集合变更时清本地 meta 缓存（服务端 forget 的镜像）
+		"delete metaAll[u]",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 缺少 %q", want)
+		}
+	}
+	// 旧「只写本机」实现必须移除（避免备注看起来保存了其实没上服务端）。
+	for _, forbidden := range []string{
+		"备注已保存（仅本机浏览器）",
+		"function saveRemarkForm() {\n  const map = {};",
+	} {
+		if strings.Contains(j, forbidden) {
+			t.Errorf("app.js 仍残留旧的纯本机备注实现 %q", forbidden)
+		}
+	}
+	if n := strings.Count(j, "runBatchTask("); n < 5 {
+		t.Errorf("runBatchTask 引用 %d 处（定义 + 4 个批量按钮至少 5 处）", n)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{
+		`id="jobBar"`, `id="jobKind"`, `id="jobBarFill"`, `id="jobProgText"`,
+		`id="jobMeta"`, `id="btnJobCancel"`,
+		"账号备注 / 标签", "服务端", "data/account-meta.json",
+		"标签用逗号或空格分隔",
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺少 %q", want)
+		}
+	}
+	css, err := os.ReadFile("mobile.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(css)
+	for _, want := range []string{
+		"v2.3.0", "#jobBar", ".acc-tags", "#remarkVeil .rm-row", "@media (max-width: 760px)",
+	} {
+		if !strings.Contains(c, want) {
+			t.Errorf("mobile.css 缺少 %q", want)
 		}
 	}
 }

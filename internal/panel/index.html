@@ -599,15 +599,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
 
-  /* ── 账号备注（本机 localStorage，不写服务器）─────────────────────────
+  /* ── 账号备注/标签（v2.3.0 #12：服务端权威 + localStorage 降级）────────
      有备注时备注当主标识，原昵称 / uid8 以 .rm-ghost 浅色跟随。账号池、用量明细、
-     积分扣除三张表共用同一套渲染，保证同一账号在两个视图里显示一致。 */
+     积分扣除三张表共用同一套渲染，保证同一账号在两个视图里显示一致。
+     标签（tags）服务端持久化，账号行最多显示 3 个 + 「+N」省略。 */
   .rm-ghost { color: var(--ink-3); font-weight: 400; margin-left: .35em; }
   .rm-list { display: flex; flex-direction: column; gap: 9px; }
-  .rm-row { display: flex; align-items: center; gap: 10px; }
+  .rm-row { display: flex; align-items: flex-start; gap: 10px; }
   .rm-row .rm-who { flex: 0 0 168px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    color: var(--ink-2); font-size: 12.5px; }
-  .rm-row input { flex: 1; }
+    color: var(--ink-2); font-size: 12.5px; padding-top: 8px; }
+  .rm-row .rm-fields { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .rm-row input { flex: 1; min-width: 0; }
+  .rm-row input.rm-tags { font-size: 12px; }
+  .acc-tags { display: inline-flex; flex-wrap: wrap; gap: 3px; margin-left: 4px; vertical-align: middle; }
+  .acc-tags .tag { font-size: 10px; padding: 0 5px; max-width: 120px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── 批量任务进度条（v2.3.0 #10 Job Runner）───────────────────────────
+     账号池顶部；有 running job 才显示。进度条复用任务中心的 .qprog 样式。 */
+  .jobbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px 0; flex-wrap: wrap; }
+  .jobbar .jkind { font-size: 12px; font-weight: 600; color: var(--ink-1); white-space: nowrap; }
+  .jobbar .jprog { flex: 1 1 220px; min-width: 140px; padding: 0; gap: 8px; }
+  .jobbar .qbar { min-width: 80px; }
+  .jobbar .note { white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 </style>
 <!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
@@ -721,6 +735,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
           <button class="xs" id="btnRescan" title="按 auths/ 目录重新对齐账号池：外部导入/删除凭证后免重启生效（积分与冷却状态保留）">重新扫描</button>
         </header>
+        <!-- 批量任务进度（v2.3.0 #10 Job Runner）：有 running job 才显示；取消只停后续账号 -->
+        <div class="jobbar" id="jobBar" hidden>
+          <span class="jkind" id="jobKind">—</span>
+          <div class="qprog jprog">
+            <div class="qbar"><i id="jobBarFill"></i></div>
+            <span class="note" id="jobProgText">—</span>
+          </div>
+          <span class="note" id="jobMeta"></span>
+          <span class="grow"></span>
+          <button class="xs danger" id="btnJobCancel">取消任务</button>
+        </div>
         <div class="fbar" id="accFilter">
           <input id="accQ" type="search" placeholder="搜索 uid / 昵称" aria-label="搜索账号">
           <select id="accState" aria-label="按状态筛选">
@@ -1563,12 +1588,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<!-- 账号备注：只写本机 localStorage，不写回服务器；账号池与用量两个视图同步显示 -->
+<!-- 账号备注/标签（v2.3.0 #12）：服务端 data/account-meta.json 权威，localStorage 仅作降级缓存 -->
 <div class="veil" id="remarkVeil">
-  <div class="dlg" style="width:560px">
+  <div class="dlg" style="width:640px">
     <header>
-      <h3>账号备注</h3>
-      <div class="hint">备注只存在本机浏览器（localStorage: wb2api.remarks.v1），不写回后端；账号池与用量页会同时显示「备注 + 原昵称」。留空即清除该账号备注。</div>
+      <h3>账号备注 / 标签</h3>
+      <div class="hint">备注与标签保存在服务端（data/account-meta.json），换浏览器/设备同步；本机 localStorage 仅作降级缓存。标签用逗号或空格分隔（最多 10 个、每个 ≤32 字）；备注留空并清空标签即删除该账号记录。</div>
     </header>
     <div class="body">
       <div class="rm-list" id="remarkBody"></div>
