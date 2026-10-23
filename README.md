@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.2.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.3.0-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -29,6 +29,7 @@
 > 5. **v2.0.1 P0 优化**：面板 gzip / 静态缓存 / 轮询治理、面板密钥与网关密钥分离、鉴权失败限速、余额刷新有界并发与启动首刷保护、批量任务单飞（409）、调度补跑窗口；
 > 6. **v2.1.0 面板数据面重构**：账号池改为**服务端分页/筛选/排序**（`GET /panel/api/accounts`，light 投影 + ETag/304），轮询拆为 `overview?lite=1` + 当前页（客服端不再每 5s 拉全量）；到期 tab 懒加载完整 overview；
 > 7. **v2.2.0 工程与可靠性批次**：优雅停机（SIGTERM 收尾 + state flush）、state.json 滚动备份/损坏回退/启动自检、Go 1.24、CI vet + 容器日志轮转/stop_grace_period、配置保存 .bak + 一键回滚、`/panel/api/readyz` + `/metrics`（Prometheus）、操作审计（JSONL）、任务执行历史（JSONL）。
+> 8. **v2.3.0 运维效能批次**：全池批量任务 **Job Runner**（异步/进度/取消/持久化/单飞）、**Webhook 事件通知**（job_done/account_disabled/checkin_failed）、**账号备注/标签服务端化**（data/account-meta.json，替代 localStorage）、面板 Job 进度条与备注迁移。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -389,6 +390,11 @@ curl -s http://localhost:7863/v1/search/messages \
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `server.shutdown_timeout` | `30s` | **优雅停机**（v2.2.0）等待在途请求/后台任务收敛的上限（clamp 5–120s；0/负/非法启动报错）；超时后继续收尾并退出；改动需重启 |
+| `jobs.max_concurrency` | `4` | Job Runner 并发闸门：同时执行的批量任务 Job 数上限（clamp 1–32，热生效）；账号级并行度仍由各任务自身控制 |
+| `jobs.retain` | `50` | `data/jobs.json` 保留的最近任务条数（clamp 5–500） |
+| `notify.webhook_url` | 空 | **事件通知 Webhook**（v2.3.0）：空=关闭；非空时异步 POST `{"event","ts","data"}` |
+| `notify.timeout` | `10s` | Webhook 单次请求超时（Go duration，clamp 1–60s） |
+| `notify.events` | 默认三件套 | 订阅事件：`job_done` / `account_disabled` / `checkin_failed`；空=默认集合 |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `panel.api_key` | 空 | **面板专用密钥**（v2.0.1）：空 = 回落 `api_key`（面板与网关共用）；设置后仅面板使用此 key，`/v1/*` 仍只认 `api_key`。改动需重启 |
 | `panel.poll_interval_sec` | `5` | 面板轮询间隔（秒，2–60，热生效）；前端按约 ±20% 抖动，页面隐藏时暂停 |
@@ -457,7 +463,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_JOBS_MAX_CONCURRENCY` · `WB2A_JOBS_RETAIN` · `WB2A_NOTIFY_WEBHOOK` · `WB2A_NOTIFY_TIMEOUT`(duration) · `WB2A_NOTIFY_EVENTS`(逗号分隔) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
 
 ## 核心行为语义
 
@@ -805,8 +811,12 @@ http://127.0.0.1:7863/panel/
 |---|---|
 | 只读 | `GET overview`（默认全量；`?lite=1` 无 accounts、约 1–2 KB）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 可观测（v2.2.0） | `GET readyz`（就绪探测：config/auth_dir/state_dir 可写 + pool_loaded，失败 503）· `GET metrics`（Prometheus text v0.0.4：池计数/在途/积分合计/模型锁/面板请求计数）· `GET audit?limit=200`（面板操作审计 JSONL，新的在前）· `GET task_runs?limit=100`（任务执行历史 JSONL） |
+| 任务调度（v2.3.0） | `GET jobs?limit=20`（Job 列表，新→旧）· `GET jobs/{id}` · `POST jobs/{kind}/run`（kind=checkin/travel/activity/keepalive/balance；同类在跑 409）· `POST jobs/{id}/cancel`（只停后续账号）；旧批量端点保留 `ok/started` 并新增 `job_id` |
+| 备注/标签（v2.3.0） | `GET meta`（全部账号备注/标签）· `GET accounts/{uid}/meta` · `PUT accounts/{uid}/meta`（body `{note,tags}`；note≤500 字符、tags≤10×32 字符）· `DELETE accounts/{uid}/meta` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
+
+> **Job Runner（v2.3.0）**：批量任务（全部签到/旅行/活跃/保活/余额刷新）改为异步 Job：立即返回 `job_id`，面板顶部进度条轮询 `GET jobs` 展示 done/total·失败·跳过并可取消；同 kind 单飞（重复触发 409）；Job 状态持久化到 `data/jobs.json`（重启后上次 running 变 interrupted）。
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
 | 写入 | `POST config`（校验 → 备份 `config.json.bak` → 落盘 → 热应用，返回需重启字段清单）· **`POST config/rollback`（v2.2.0：用 .bak 恢复并热应用；无备份/非法备份 400）** · `POST usage/save`（立即把内存用量落盘） |
 
@@ -1074,6 +1084,22 @@ readinessProbe:
 ### 改错了配置怎么回滚（v2.2.0）？
 
 每次保存配置前会自动把上一版备份为 `config.json.bak`（保留最近 1 份）。调用 `POST /panel/api/config/rollback`（Bearer 鉴权）即可恢复并热应用，响应含 `restart_required`；无备份或备份非法返回 400 且不改动当前配置。
+
+### 如何配置 Webhook 事件通知（v2.3.0）？
+
+在 `config.json` 设置（或环境变量 `WB2A_NOTIFY_WEBHOOK`）：
+
+```json
+{
+  "notify": {
+    "webhook_url": "https://example.com/hooks/workbuddy",
+    "timeout": "10s",
+    "events": ["job_done", "account_disabled", "checkin_failed"]
+  }
+}
+```
+
+事件以 `POST application/json` 发送，payload 固定 `{"event":"job_done","ts":<unix秒>,"data":{...}}`；异步发送（不阻塞面板/任务），失败重试 1 次后仅 WARN；队列满丢弃并计数。data 超 64KB 时降级为摘要，日志中 Webhook URL 脱敏、不发送任何凭证。
 
 ### 账号被 Disable 后如何恢复？
 

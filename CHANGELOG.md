@@ -8,6 +8,46 @@
 
 ---
 
+## v2.3.0-pro（2026-10-24）
+
+运维效能批次（UPGRADE_PROPOSALS #10 / #12 / #19，Wave 2A）。
+
+### #10 全池批量任务 Job Runner（异步 / 进度 / 取消 / 持久化）
+
+- 新增 `internal/jobs`：Job 状态机（pending/running/done/failed/canceled/interrupted）、**同 kind 单飞**、**Job 级并发闸门**（`jobs.max_concurrency`，默认 4）、取消、`data/jobs.json` 原子持久化（`jobs.retain` 默认 50，重启时上次 running → interrupted）
+- 新增 API：`GET /panel/api/jobs`、`GET /panel/api/jobs/{id}`、`POST /panel/api/jobs/{kind}/run`、`POST /panel/api/jobs/{id}/cancel`
+- 旧批量端点（checkin_all/travel_all/activity_all/keepalive_all/balance_all）改为**异步 Job**：保留 `ok/started` 并新增 `job_id`，同类在跑 409 语义不变
+- scheduler 新增 `Run{Checkin,Travel,Activity,Keepalive,BalanceRefresh}Ctx(ctx, ProgressFunc)`：逐号进度上报、ctx 取消早停；旧 `Run*Now()` 行为不变；#11 补跑窗口/单飞 gate 语义保留
+- 面板账号池顶部新增 **Job 进度条**：类型/进度/失败/跳过/取消（只停后续账号），无 running 时隐藏；取消/进度轮询与旧 API 兜底
+- 单号 `tasks/run` 额外写一条 kind=tasks_run 的 Job 历史（同步响应契约不变）
+
+### #19 Webhook 事件通知（最小闭环）
+
+- 新增 `internal/notify`：异步单 worker 发送 `{"event","ts","data"}`（JSON POST），失败重试 1 次、队列满丢弃计数、Close 排空、URL 日志脱敏、64KB 摘要降级
+- 事件：`job_done`（Job 终态）、`account_disabled`（面板人工禁用）、`checkin_failed`（单号签到失败）；空 `notify.webhook_url` = 关闭且所有调用 no-op
+- 新增配置 `notify.webhook_url` / `notify.timeout`（默认 10s）/ `notify.events`（默认三件套），env `WB2A_NOTIFY_*`；停机时 notifier.Close(5s) 排空
+
+### #12 账号备注/标签服务端化（部分）
+
+- 新增 `data/account-meta.json`（0600 原子写、损坏隔离 .corrupt-*、懒加载）存储 `{note,tags,updated_at}`
+- 新增 API：`GET /panel/api/meta`、`GET|PUT|DELETE /panel/api/accounts/{uid}/meta`；校验 note≤500 字符、tags≤10 个×32 字符、uid 白名单；账号删除时自动清理
+- 面板备注弹窗改为服务端读写（localStorage 降级缓存保留）：保存按 diff 逐账号 PUT/DELETE、部分失败保留本地并提示；账号行显示 tags（最多 3 个 + N）
+- **一次性迁移**：服务端 meta 为空且本机有旧备注 → 自动导入服务端（成功后清本地键、toast 提示）；服务端已有数据不覆盖
+- 新增配置 `jobs.*`、`notify.*`（见 README 字段速查）
+
+### 兼容性
+
+- 旧批量端点响应字段只增不改（新增 job_id）；`/panel/api/tasks/run`、`/task_runs`、`/status` 等行为不变
+- 备注迁移只发生在服务端 meta 为空的首次升级；迁移失败自动保留本机缓存（可重试）
+- 定时/补跑批次暂不写入 jobs.json（手动批量 + 单号任务历史已覆盖）；账号级 worker pool 与 #11 调度器完整优化在 v2.3.1
+
+### 测试与验证
+
+- 新增测试：jobs 12 + scheduler 6 + panel jobapi/accountmeta 20 + notify 17 + cmd/server 1；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
+- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v23.md`）
+
+---
+
 ## v2.2.0-pro（2026-10-24）
 
 工程与可靠性批次（UPGRADE_PROPOSALS #5 / #8 / #9 / #13 子项 / #14 / #15 / #16 / #17 + v2.1 P2 修复）。
