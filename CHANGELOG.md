@@ -79,6 +79,7 @@
 - QA 独立验证 `verify-pro.ps1`：26 项全 PASS（本地起服务：`/healthz` 身份与 X-Service、面板标题、overview version=2.0.0-pro、无 token 401、补偿路由 404、tasks/run 未知 uid 404、安全响应头、日志无 panic）
 - 保留并锁定账号池三个二级 tab（账号池 / 模型锁池 / 积分到期）：`tabs_test.go` 钉住结构与顺序，QA 冒烟 C11 + 真实浏览器点击双重验证
 - QA 复核后修补：窄屏移动端「做任务」按钮文案裁切（`ACT_SHORT` 增加 3 字映射 + 映射优先于长度阈值）、进行中按钮被 5s 轮询重渲染后误恢复可点击（`dotaskBusy` 集合）、README 请求体上限文档自相矛盾（8 MiB vs 不限 / WB2A_MAX_BODY_MB 已于上游移除）
+- 修复后复验（HEAD `2c5e012`）：`verify-pro.ps1` **26/26 PASS**；独立前端 harness **22/22 PASS、0 warning**（含「轮询后执行态保持」）；真实浏览器 DOM/CSP **9/9 PASS**；真实 320px 移动端 **10/10 PASS**（含按钮不裁切、执行中 disabled + 短标签、三 tab 真实点击）；GitHub Actions `docker-ghcr` / `go-binaries` 均 success，GHCR 镜像可匿名拉取（tags: latest / main / sha-*）
 - 旧 fork 的 `LOCAL_CHANGES.md` 内容并入 [MAINTAINERS.md](MAINTAINERS.md) 并删除该文件
 
 ---
