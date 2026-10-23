@@ -15,6 +15,7 @@ let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
+let reqPage = 1, reqPageSize = 100;           // 客户端分页（0 = 全部）
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
@@ -415,6 +416,54 @@ let accFilters = { q: '', state: '', ver: '' };
 let accPageSize = 100;                        // 0 = 全部
 let accPage = 1;
 
+/* ── 分页纯函数（账号池 / 日志 / 请求记录 / 积分历史 / 模型锁池 / 任务队列共用）──
+   pageSlice 只做「钳页码 + 切片」，不读写任何模块状态；updatePagerUI 把结果写回
+   一组分页控件。抽成纯函数是为了 node harness 能直接切片测试边界（空列表、页码
+   越界、pageSize=0 表示全部）——这些分支在浏览器里很难手工复现。 */
+function pageSlice(list, pageSize, page) {
+  const rows = list || [];
+  const size = Number(pageSize) > 0 ? Math.floor(Number(pageSize)) : 0;   // 0 = 全部
+  const total = rows.length;
+  const pages = size > 0 ? Math.max(1, Math.ceil(total / size)) : 1;
+  let p = Math.floor(Number(page)) || 1;
+  if (p < 1) p = 1;
+  if (p > pages) p = pages;
+  const start = size > 0 ? (p - 1) * size : 0;
+  return { rows: size > 0 ? rows.slice(start, start + size) : rows.slice(), page: p, pages: pages, total: total, size: size };
+}
+
+/* updatePagerUI 把 pageSlice 结果写回一组控件：ids = {count, info, prev, next} 是元素 id。
+   label 只在传入时更新计数文案（各列表口径不同，如「命中 3 / 100 条」）。 */
+function updatePagerUI(ids, pr, label) {
+  ids = ids || {};
+  const count = ids.count ? $(ids.count) : null;
+  if (count && label != null) count.textContent = label;
+  const info = ids.info ? $(ids.info) : null;
+  if (info) info.textContent = pr.page + ' / ' + pr.pages;
+  const prev = ids.prev ? $(ids.prev) : null;
+  if (prev) prev.disabled = pr.page <= 1;
+  const next = ids.next ? $(ids.next) : null;
+  if (next) next.disabled = pr.page >= pr.pages;
+}
+
+/* hitCountLabel 列表命中计数文案：未筛选时只报总数，筛选后带出命中数。
+   total 为 0 时返回空串（各列表空态有自己的文案，计数不要再叠一句「0 条」）。 */
+function hitCountLabel(shown, total, unit) {
+  unit = unit || '条';
+  if (!total) return '';
+  return shown === total ? total + ' ' + unit : '命中 ' + shown + ' / ' + total + ' ' + unit;
+}
+
+/* accDoTaskBtn 账号行「做任务」按钮：对单账号执行全部可自动任务（后端
+   POST /accounts/{uid}/tasks/run，同步接口，约 1-2 分钟）。企业版没有个人成长
+   体系（后端 200 + ok:false 拒绝），与「签到」「任务」按钮同口径不渲染。
+   抽成纯函数便于 node harness 直接钉住「企业版不出按钮」的渲染条件。 */
+function accDoTaskBtn(s) {
+  if (!s || s.enterprise) return '';
+  return '<button class="xs ghost" data-a="dotask" data-u="' + esc(s.uid) +
+    '" title="对该账号一键执行全部可自动任务（含真实对话，约 1-2 分钟）">做任务</button>';
+}
+
 // 账号是否处于冷却（限流 / 熔断 / 连败降权），与行内状态判定一致。
 function accIsCool(s) {
   const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
@@ -458,14 +507,14 @@ function renderAccounts(list) {
   }
   const filtered = accAll.filter(accMatch);
   if (!filtered.length) {
+    accPage = 1;
     tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合筛选条件的账号</div></td></tr>';
     updateAccPager(0, 1);
     return;
   }
-  const pages = accPageSize > 0 ? Math.max(1, Math.ceil(filtered.length / accPageSize)) : 1;
-  if (accPage > pages) accPage = pages;
-  if (accPage < 1) accPage = 1;
-  const pageRows = accPageSize > 0 ? filtered.slice((accPage - 1) * accPageSize, accPage * accPageSize) : filtered;
+  const pr = pageSlice(filtered, accPageSize, accPage);
+  accPage = pr.page;
+  const pageRows = pr.rows;
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   // 基准取全量（accAll）而非当前页，翻页与筛选时条长稳定不跳。
   const maxCred = Math.max(1, ...accAll.map(s => s.credits || 0));
@@ -541,6 +590,7 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="pk" data-u="' + esc(s.uid) + '" title="查看单号积分构成（仅查这 1 个账号）">积分</button>' +
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        accDoTaskBtn(s) +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -548,7 +598,7 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
-  updateAccPager(filtered.length, pages);
+  updateAccPager(filtered.length, pr.pages);
 }
 
 if ($('accTabs')) document.querySelectorAll('#accTabs .subtab').forEach(b => b.onclick = () => switchAccTab(b.dataset.tab));
@@ -584,46 +634,100 @@ if ($('accPageSize')) $('accPageSize').addEventListener('change', () => {
 });
 if ($('accPrev')) $('accPrev').onclick = () => { if (accPage > 1) { accPage--; renderAccounts(accAll); } };
 if ($('accNext')) $('accNext').onclick = () => {
-  const filtered = accAll.filter(accMatch).length;
-  const pages = accPageSize > 0 ? Math.max(1, Math.ceil(filtered / accPageSize)) : 1;
+  const pages = pageSlice(accAll.filter(accMatch), accPageSize, accPage).pages;
   if (accPage < pages) { accPage++; renderAccounts(accAll); }
 };
 
+/* ── 模型锁池：搜索 + 状态/地区筛选 + 客户端分页 ─────────────────────────
+   数据来自 /overview 的 model_locks（5s 轮询重渲染）；筛选条件与页码是模块
+   状态，轮询刷新时保持，翻页/筛选只重渲染当前页。 */
+let mlAll = [];
+let mlFilters = { q: '', state: '', realm: '' };
+let mlPage = 1;
+let mlPageSize = 100;                         // 0 = 全部
+
+// mlMatch 模型锁行筛选：q 对模型名做大小写不敏感包含匹配，state / realm 精确匹配。
+function mlMatch(r, f) {
+  f = f || mlFilters;
+  if (f.q && String((r && r.model) || '').toLowerCase().indexOf(f.q.toLowerCase()) < 0) return false;
+  if (f.state && String((r && r.state) || '') !== f.state) return false;
+  if (f.realm && String((r && r.realm) || '') !== f.realm) return false;
+  return true;
+}
+
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
 // 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+// 入口只更新数据源；筛选/分页变化时由 renderModelLocksView 用同一份 mlAll 重渲染。
 function renderModelLocks(rows) {
+  mlAll = rows || [];
+  renderModelLocksView();
+}
+
+function renderModelLocksView() {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
-  if (!rows || !rows.length) {
+  const filtered = mlAll.filter(r => mlMatch(r));
+  const pr = pageSlice(filtered, mlPageSize, mlPage);
+  mlPage = pr.page;
+  updatePagerUI({ count: 'mlCount', info: 'mlPageInfo', prev: 'mlPrev', next: 'mlNext' }, pr,
+    hitCountLabel(filtered.length, mlAll.length, '个模型'));
+  if (!mlAll.length) {
     tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
     if (note) note.textContent = '';
     return;
   }
-  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
-  const left = iso => {
-    const ms = parseAPITime(iso);
-    return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
-  };
-  tb.innerHTML = rows.map(r => {
-    const st = STATE[r.state] || ['mute', r.state || '—'];
-    const realm = r.realm === 'global' ? '国际版' : '国内版';
-    return '<tr>' +
-      '<td>' + esc(r.model) + '</td>' +
-      '<td><span class="realm-tag">' + realm + '</span></td>' +
-      '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
-      '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
-      '<td class="num">' + (r.locked || 0) + '</td>' +
-      '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
-      '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
-      '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
-      '</tr>';
-  }).join('');
+  if (!filtered.length) {
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">没有符合筛选条件的模型</div></td></tr>';
+  } else {
+    const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+    const left = iso => {
+      const ms = parseAPITime(iso);
+      return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
+    };
+    tb.innerHTML = pr.rows.map(r => {
+      const st = STATE[r.state] || ['mute', r.state || '—'];
+      const realm = r.realm === 'global' ? '国际版' : '国内版';
+      return '<tr>' +
+        '<td>' + esc(r.model) + '</td>' +
+        '<td><span class="realm-tag">' + realm + '</span></td>' +
+        '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
+        '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
+        '<td class="num">' + (r.locked || 0) + '</td>' +
+        '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
+        '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
+        '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
   if (note) {
-    const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
-    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+    // note 描述整池（不受筛选影响）：筛选只影响当前页看到哪些行。
+    const bad = mlAll.filter(r => r.state === 'locked' || r.state === 'starved').length;
+    note.textContent = bad ? bad + ' 个模型整池不可用' : mlAll.length + ' 个模型部分限流';
   }
 }
+
+let mlQTimer = null;
+if ($('mlQ')) $('mlQ').addEventListener('input', () => {
+  clearTimeout(mlQTimer);
+  mlQTimer = setTimeout(() => { mlFilters.q = $('mlQ').value.trim(); mlPage = 1; renderModelLocksView(); }, 150);
+});
+if ($('mlState')) $('mlState').addEventListener('change', () => {
+  mlFilters.state = $('mlState').value; mlPage = 1; renderModelLocksView();
+});
+if ($('mlRealm')) $('mlRealm').addEventListener('change', () => {
+  mlFilters.realm = $('mlRealm').value; mlPage = 1; renderModelLocksView();
+});
+if ($('mlPageSize')) $('mlPageSize').addEventListener('change', () => {
+  mlPageSize = parseInt($('mlPageSize').value, 10) || 0;
+  mlPage = 1;
+  renderModelLocksView();
+});
+if ($('mlPrev')) $('mlPrev').onclick = () => { if (mlPage > 1) { mlPage--; renderModelLocksView(); } };
+if ($('mlNext')) $('mlNext').onclick = () => {
+  const pages = pageSlice(mlAll.filter(r => mlMatch(r)), mlPageSize, mlPage).pages;
+  if (mlPage < pages) { mlPage++; renderModelLocksView(); }
+};
 
 async function loadOverview(quiet) {
   try {
@@ -658,10 +762,45 @@ async function loadOverview(quiet) {
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
+/* runAccountDotask 账号行「做任务」：单账号执行全部可自动任务。
+   与「任务」弹窗（看进度、单项执行）并行保留：这个按钮是「没空逐项点」时的
+   一把梭，走同步接口 POST /accounts/{uid}/tasks/run，含真实对话，约 1-2 分钟。
+   后端契约：{ok,uid,results[{task_code,status,message}],summary{total,done,skipped,error,claimed}}；
+   企业版/无凭证走 200 + ok:false + message（不发起上游请求），4xx/5xx 由 api() 抛出。 */
+async function runAccountDotask(btn, uid) {
+  if (!btn || !confirm('将对该账号依次执行全部可自动任务（含真实对话），预计 1-2 分钟。\n执行期间请勿关闭页面。确认继续？')) return;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '做任务中…';
+  try {
+    const r = await api('accounts/' + encodeURIComponent(uid) + '/tasks/run', { method: 'POST' });
+    // ok:false = 门控拒绝（企业版 / 无凭证 / 未知账号等），message 是后端给的可读原因。
+    if (r && r.ok === false) { toast(r.message || r.error || '做任务失败', 'err'); return; }
+    const results = (r && r.results) || [];
+    const s = (r && r.summary) || {};
+    const count = k => (s[k] != null ? Number(s[k]) : results.filter(x => x && x.status === k).length);
+    const done = count('done'), skipped = count('skipped'), error = count('error');
+    if (!results.length && !(Number(s.total) > 0)) {
+      toast('没有可执行的任务（可能已全部完成）', 'ok');
+      return;
+    }
+    toast('做任务完成：成功 ' + done + ' 项，跳过 ' + skipped + ' 项' + (error ? '，失败 ' + error + ' 项' : ''),
+      error ? 'err' : 'ok');
+  } catch (e) {
+    toast('做任务失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+    loadOverview(true);   // 任务可能写了积分/进度，刷新首页统计
+  }
+}
+
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
+  // 「做任务」耗时分钟级：单独走一个分支，确认前不动按钮状态（取消就什么都不发生）。
+  if (a === 'dotask') { await runAccountDotask(b, u); return; }
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
@@ -984,14 +1123,72 @@ $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
+/* 日志页筛选 + 客户端分页：频道 chips 与「最近 500 行」的取数协议不变（仍由
+   /panel/api/logs 返回全量、前端过滤），只是渲染前多一道关键词过滤 + 切片——
+   500 行日志一次铺开在手机端又长又卡。筛选条件与页码是模块状态，5s 轮询重渲染
+   时保持；翻页只重画当前页。 */
 let logCh = 'all';
+let logAll = [];                              // 最近一次拉取的全量日志（筛选/翻页的数据源）
+let logFilters = { q: '' };
+let logPage = 1;
+let logPageSize = 100;                        // 0 = 全部
+
+// logMatch 日志行关键词匹配：只对 text 做大小写不敏感包含匹配；空关键词全通过。
+function logMatch(e, q) {
+  if (!q) return true;
+  return String((e && e.text) || '').toLowerCase().indexOf(String(q).toLowerCase()) >= 0;
+}
+
+// filterLogs 频道 + 关键词过滤（纯函数；只筛已拉取的条目，不发新请求）。
+function filterLogs(entries, ch, q) {
+  return (entries || []).filter(e => e && (ch === 'all' || e.ch === ch) && logMatch(e, q));
+}
+
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
   logCh = b.dataset.ch;
+  logPage = 1;                       // 换频道 = 换结果集，回到第一页
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
   loadLogs();
 });
+
+function renderLogBox(scrollToEnd) {
+  const box = $('logBox');
+  if (!box) return;
+  const filtered = filterLogs(logAll, logCh, logFilters.q);
+  const pr = pageSlice(filtered, logPageSize, logPage);
+  logPage = pr.page;
+  updatePagerUI({ count: 'logCount', info: 'logPageInfo', prev: 'logPrev', next: 'logNext' }, pr,
+    hitCountLabel(filtered.length, logAll.length, '行'));
+  box.innerHTML = pr.rows.length
+    ? pr.rows.map(e => {
+      const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
+      const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+      const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
+      return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+    }).join('')
+    : '<span style="color:var(--ink-3)">' + (logAll.length ? '没有匹配的日志' : '暂无日志') + '</span>';
+  // 自动滚动只发生在「轮询刷新 + 原本就在底部」时；筛选/翻页不追底，否则一打字就跳走。
+  if (scrollToEnd) box.scrollTop = box.scrollHeight;
+}
+
+let logQTimer = null;
+if ($('logQ')) $('logQ').addEventListener('input', () => {
+  clearTimeout(logQTimer);
+  logQTimer = setTimeout(() => { logFilters.q = $('logQ').value.trim(); logPage = 1; renderLogBox(false); }, 150);
+});
+if ($('logPageSize')) $('logPageSize').addEventListener('change', () => {
+  logPageSize = parseInt($('logPageSize').value, 10) || 0;
+  logPage = 1;
+  renderLogBox(false);
+});
+if ($('logPrev')) $('logPrev').onclick = () => { if (logPage > 1) { logPage--; renderLogBox(false); } };
+if ($('logNext')) $('logNext').onclick = () => {
+  const pages = pageSlice(filterLogs(logAll, logCh, logFilters.q), logPageSize, logPage).pages;
+  if (logPage < pages) { logPage++; renderLogBox(false); }
+};
+
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
@@ -1000,12 +1197,14 @@ async function loadLogs() {
   // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
+  // 积分历史账号下拉的候选来自账号池；这里同步一次（只在账号集合变化时重建 DOM）。
+  syncCreditAccounts();
   try {
     const [d, metrics, requestRows, credit] = await Promise.all([
       api('logs'),
       api('request_metrics').catch(() => ({})),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
-      api('credit_history?limit=' + creditLimitValue()).catch(() => null),
+      api(creditHistoryQuery()).catch(() => null),
     ]);
     // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
     // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
@@ -1013,21 +1212,13 @@ async function loadLogs() {
     const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
     const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
     renderRequestMetrics(metrics, recent);
-    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
-    box.innerHTML = entries.length
-      ? entries.map(e => {
-        const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
-      }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
-    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
+    logAll = d.entries || [];
+    renderLogBox(logPin && atEnd);
     const counts = {};
-    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
+    for (const e of logAll) counts[e.ch] = (counts[e.ch] || 0) + 1;
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + filterLogs(logAll, logCh, '').length + ' 行';
     renderCreditHistory(credit);
   } catch (e) { /* 概览已提示 */ }
 }
@@ -1091,35 +1282,101 @@ function creditHistoryNote(entries) {
   for (const e of entries) net += Number(e && e.delta || 0);
   return entries.length + ' 条 · 净 ' + (net > 0 ? '+' : net < 0 ? '−' : '') + creditNum(Math.abs(net));
 }
+
+/* 积分历史筛选 + 分页：账号下拉走服务端 credit_history?uid=（后端有 uid 时先全量读
+   账本再过滤，比前端筛已截断的 limit 条更完整），分页在前端对已取回条目切片。
+   creditFilter/creditPage/creditPageSize 是模块状态，5s 轮询重渲染时保持。 */
+let creditFilter = { uid: '' };
+let creditPage = 1;
+let creditPageSize = 100;                      // 0 = 全部
+let creditData = null;                         // 最近一次响应（翻页/改页大小不再发请求）
+
+// creditMatch 积分历史行账号匹配：uid 精确匹配（空筛选全通过）。纯函数便于测试。
+function creditMatch(e, uid) {
+  if (!uid) return true;
+  return String((e && e.uid) || '') === String(uid);
+}
+
 function renderCreditHistory(d) {
   const body = $('creditBody'), note = $('creditNote');
   if (!body) return;
+  if (d) creditData = d;
   if (!d) {
     if (note) note.textContent = '积分历史不可用';
     body.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">积分历史不可用</td></tr>';
+    if (typeof updatePagerUI === 'function') {
+      updatePagerUI({ info: 'creditPageInfo', prev: 'creditPrev', next: 'creditNext' }, { page: 1, pages: 1 }, '');
+    }
     return;
   }
-  const entries = d.entries || [];
-  if (note) note.textContent = creditHistoryNote(entries);
-  body.innerHTML = entries.length
-    ? entries.map(e => '<tr>' +
+  const raw = d.entries || [];
+  // 切片环境（node harness 的对抗测试直接调本函数）可能没有模块级分页状态 /
+  // pageSlice：此时退化为「全部渲染」，与加筛选前的行为一致，不得抛异常。
+  const uid = (typeof creditFilter === 'object' && creditFilter) ? creditFilter.uid : '';
+  const filtered = raw.filter(e => creditMatch(e, uid));
+  const size = typeof creditPageSize === 'number' ? creditPageSize : 0;
+  const canPage = typeof pageSlice === 'function';
+  const pr = canPage
+    ? pageSlice(filtered, size, typeof creditPage === 'number' ? creditPage : 1)
+    : { rows: filtered.slice(), page: 1, pages: 1, total: filtered.length };
+  if (canPage) {
+    if (typeof creditPage === 'number') creditPage = pr.page;
+    if (typeof updatePagerUI === 'function') {
+      const label = typeof hitCountLabel === 'function'
+        ? hitCountLabel(filtered.length, raw.length, '条') : null;
+      updatePagerUI({ count: 'creditCount', info: 'creditPageInfo', prev: 'creditPrev', next: 'creditNext' }, pr, label);
+    }
+  }
+  // 计数/净额跟随当前账号筛选（不是当前页）：翻页时 header 文案不该跳。
+  if (note) note.textContent = creditHistoryNote(filtered);
+  body.innerHTML = pr.rows.length
+    ? pr.rows.map(e => '<tr>' +
       '<td>' + esc(creditTimeText(e)) + '</td>' +
       '<td>' + esc(creditAccountText(e)) + '</td>' +
       '<td class="num">' + esc(creditDeltaText(e && e.delta)) + '</td>' +
       '<td class="num">' + esc(creditBalanceText(e)) + '</td>' +
       '<td>' + esc(creditDescText(e)) + '</td>' +
       '</tr>').join('')
-    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分变动记录</td></tr>';
+    : '<tr><td colspan="5" style="color:var(--ink-3)">' +
+      (raw.length ? '没有匹配的积分变动记录' : '暂无积分变动记录') + '</td></tr>';
 }
 function creditLimitValue() {
   const el = $('creditLimit');
   const n = el ? Number(el.value) : 100;
   return n === 300 || n === 1000 ? n : 100;
 }
+
+// creditHistoryQuery 积分历史请求路径：带上当前账号筛选（服务端过滤，账本完整）。
+function creditHistoryQuery() {
+  let q = 'credit_history?limit=' + creditLimitValue();
+  if (creditFilter && creditFilter.uid) q += '&uid=' + encodeURIComponent(creditFilter.uid);
+  return q;
+}
 async function loadCreditHistory() {
+  syncCreditAccounts();
   let d = null;
-  try { d = await api('credit_history?limit=' + creditLimitValue()); } catch (e) { d = null; }
+  try { d = await api(creditHistoryQuery()); } catch (e) { d = null; }
   renderCreditHistory(d);
+}
+
+/* syncCreditAccounts 积分历史账号下拉：候选来自账号池（accAll，/overview 已返回）。
+   只在账号集合变化时重建 options——日志页 5s 轮询会反复调到这里，每次换
+   innerHTML 会把用户正在展开的下拉框关掉。选中的账号被移除后回落「全部账号」。 */
+function syncCreditAccounts() {
+  const sel = $('creditAccount');
+  if (!sel) return;
+  const sig = accAll.map(s => s.uid + ':' + (s.nickname || '')).join('|');
+  if (sel.dataset && sel.dataset.sig === sig) return;
+  if (sel.dataset) sel.dataset.sig = sig;
+  const opts = ['<option value="">全部账号</option>'];
+  for (const s of accAll) {
+    opts.push('<option value="' + esc(s.uid) + '">' + esc(s.nickname || String(s.uid).slice(0, 8)) + '</option>');
+  }
+  sel.innerHTML = opts.join('');
+  const uid = creditFilter && creditFilter.uid ? creditFilter.uid : '';
+  sel.value = uid;
+  const v = typeof sel.value === 'string' ? sel.value : '';
+  if (v !== uid) { creditFilter.uid = v; creditPage = 1; }
 }
 
 /* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
@@ -1135,6 +1392,11 @@ function reqMatch(e, f) {
     }
   }
   return true;
+}
+
+// filterReqEntries 请求记录筛选（纯函数；renderRequestTable 与计数共用，便于测试）。
+function filterReqEntries(entries, f) {
+  return (entries || []).filter(e => reqMatch(e, f));
 }
 
 function reqOutcomeTag(e) {
@@ -1158,13 +1420,17 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
-/* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
-   UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
+/* renderRequestTable 渲染请求记录表——只渲染当前页。来源列是这一版的重点：IP 用
+   等宽字体方便扫，UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。
+   筛选（q / outcome）作用在已拉取的条目上（最多 1000 条），计数与翻页都基于这个
+   结果集；筛选变化由调用方重置到第 1 页。 */
 function renderRequestTable() {
-  const list = reqEntries.filter(e => reqMatch(e));
+  const matched = filterReqEntries(reqEntries, reqFilter);
+  const pr = pageSlice(matched, reqPageSize, reqPage);
+  reqPage = pr.page;
   const tb = $('reqBody');
   if (!tb) return;
-  tb.innerHTML = list.map(e => {
+  tb.innerHTML = pr.rows.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
@@ -1184,14 +1450,14 @@ function renderRequestTable() {
   }).join('') || '<tr><td colspan="10" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
-  const filtered = list.length !== reqEntries.length;
+  const filtered = matched.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
   // 而不是让人以为筛选坏了。
   const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
-  $('reqCount').textContent = !reqEntries.length ? ''
-    : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
-      (hasSource ? '' : ' · 来源未记录');
+  $('reqCount').textContent = hitCountLabel(matched.length, reqEntries.length, '条') +
+    (hasSource || !reqEntries.length ? '' : ' · 来源未记录');
   $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+  updatePagerUI({ info: 'reqPageInfo', prev: 'reqPrev', next: 'reqNext' }, pr);
 }
 
 /* 请求记录筛选控件。搜索框防抖 150ms：最多 1000 行重渲染，不必每键一次。
@@ -1200,19 +1466,47 @@ function renderRequestTable() {
 let reqQTimer = null;
 if ($('reqQ')) $('reqQ').oninput = () => {
   clearTimeout(reqQTimer);
-  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); renderRequestTable(); }, 150);
+  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); reqPage = 1; renderRequestTable(); }, 150);
 };
 if ($('reqOutcome')) $('reqOutcome').onchange = () => {
   reqFilter.outcome = $('reqOutcome').value;
+  reqPage = 1;
   renderRequestTable();
 };
-if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
-if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+if ($('reqPageSize')) $('reqPageSize').addEventListener('change', () => {
+  reqPageSize = parseInt($('reqPageSize').value, 10) || 0;
+  reqPage = 1;
+  renderRequestTable();
+});
+if ($('reqPrev')) $('reqPrev').onclick = () => { if (reqPage > 1) { reqPage--; renderRequestTable(); } };
+if ($('reqNext')) $('reqNext').onclick = () => {
+  const pages = pageSlice(filterReqEntries(reqEntries, reqFilter), reqPageSize, reqPage).pages;
+  if (reqPage < pages) { reqPage++; renderRequestTable(); }
+};
+if ($('reqLimit')) $('reqLimit').onchange = () => { reqPage = 1; loadLogs(); };
+if ($('btnReqReload')) $('btnReqReload').onclick = () => { reqPage = 1; loadLogs(); };
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
-// 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
-if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
+// 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。换区间 → 回第 1 页。
+if ($('reqRange')) trangeBind('reqRange', () => { reqPage = 1; loadLogs(); }, '0');
 if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
 if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
+// 积分历史：账号筛选 / 每页条数 / 翻页。账号筛选走服务端 uid 过滤（loadCreditHistory
+// 重新取数）；分页只重渲染已取回的数据，不再发请求。
+if ($('creditAccount')) $('creditAccount').addEventListener('change', () => {
+  creditFilter.uid = $('creditAccount').value;
+  creditPage = 1;
+  loadCreditHistory();
+});
+if ($('creditPageSize')) $('creditPageSize').addEventListener('change', () => {
+  creditPageSize = parseInt($('creditPageSize').value, 10) || 0;
+  creditPage = 1;
+  renderCreditHistory(creditData);
+});
+if ($('creditPrev')) $('creditPrev').onclick = () => { if (creditPage > 1) { creditPage--; renderCreditHistory(creditData); } };
+if ($('creditNext')) $('creditNext').onclick = () => {
+  const pages = pageSlice(creditData && creditData.entries || [], creditPageSize, creditPage).pages;
+  if (creditPage < pages) { creditPage++; renderCreditHistory(creditData); }
+};
 
 function requestLogText(e) {
   const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
@@ -1513,188 +1807,14 @@ $('btnRefresh').onclick = async () => {
   if (view === 'logs') loadLogs();
 };
 
-/* ── 官方补偿（issue #189）─────────────────────────────────────────
-   「查状态 → 待领才领」。
-
-   取数与呈现刻意分开：
-     - 取数只有手动触发（进页面一次 + 「检查」/「领取」后）。补偿状态没有
-       overview 快照可吃，必须逐号打上游，挂进 5s 轮询就是每 5 秒轰炸上游。
-     - 呈现走 compCache 的本地重渲染（refreshVisible 每轮调一次），只为让
-       倒计时走动 —— 不发任何请求。
-   之前这里有个「5 分钟新鲜窗口」分支，但它唯一的非强制调用点是 start()，
-   而那里 compCache 必为 null，所以该分支永远不会命中：注释宣称「防轰炸」，
-   实际是「根本不刷新」。现已删除，别再加回来。
-
-   声明位置在本段（轮询区之前）是必需的：start() 会调用 loadCompensation()，
-   若这些 let 写在 start() 之后，顶层求值会在 TDZ 上炸——
-   TestAppJSTopLevelSmoke 正是为这类问题设的闸门。 */
-let compCache = null;
-let compInFlight = null;   // 在途请求的 promise（非布尔标志：布尔标志配 force 刷新会静默空转）
-
-// compPending 挑出「可领未领」的账号。
-// 纯函数：判据独立于渲染，node 侧单测单独钉住。
-// 判据与后端 upstream.CompensationStatus.Pending() 对齐——两端各留一份实现是
-// 有意为之（前端要在渲染前先算总数），但**必须同步**，改一处就要改另一处。
-function compPending(rows) {
-  return (rows || []).filter(r => r && !r.skip && !r.error && r.status &&
-    r.status.active && !r.status.claimed && (r.status.credit_num || 0) > 0);
-}
-
-// compErrored 挑出「查询失败」的账号。
-// 单独拎出来，是因为它们**必须显形**：上游 5xx / token 过期时所有账号都会落到
-// 这里，若和「没有补偿」一起被过滤掉，卡片就会整块消失，用户看到的是「什么都没有」
-// ——而真相是「一个都没查成」。这正是本 PR 要消灭的静默失败。
-function compErrored(rows) {
-  return (rows || []).filter(r => r && r.error);
-}
-
-// compTotalPending 待领总额。
-function compTotalPending(rows) {
-  return compPending(rows).reduce((s, r) => s + (r.status.credit_num || 0), 0);
-}
-
-// compDeadlineText 领取截止倒计时文案。
-// 上游 end_time 形如 "2026-10-22 23:59:59" 且**不带时区**，按浏览器本地时区解析
-// （与后端积分到期的处理同口径）。urgent=true 表示距截止 <=48h，前端据此染色告警。
-function compDeadlineText(endTime, now) {
-  const raw = String(endTime == null ? '' : endTime).trim();
-  if (!raw) return { text: '无截止信息', urgent: false };
-  const t = new Date(raw.replace(' ', 'T')).getTime();
-  if (!isFinite(t)) return { text: raw, urgent: false };
-  const ms = t - (now || Date.now());
-  if (ms <= 0) return { text: '已截止', urgent: true };
-  const d = Math.floor(ms / 86400000);
-  const h = Math.floor(ms % 86400000 / 3600000);
-  const text = d > 0 ? (d + ' 天 ' + h + ' 小时') : (Math.max(1, h) + ' 小时');
-  return { text: '剩 ' + text, urgent: ms <= 2 * 86400000 };
-}
-
-function renderCompensation(d) {
-  const rows = (d && d.accounts) || [];
-  const box = $('compBox');
-  if (!box) return;
-  const active = rows.filter(r => r && !r.error && r.status && r.status.active);
-  const failed = compErrored(rows);
-  // 「有失败就必须显形」——哪怕一条有效数据都没有。
-  if (!active.length && !failed.length) { box.hidden = true; return; }
-  box.hidden = false;
-
-  const now = Date.now();
-  const okRows = active.map(r => {
-    const s = r.status || {};
-    const done = !!s.claimed;
-    const dl = compDeadlineText(s.end_time, now);
-    const name = esc(r.nickname || String(r.uid).slice(0, 8));
-    return '<div class="comp-row"><span>' + name + '</span>' +
-      (done
-        ? '<span class="tag ok">已领取</span>'
-        : '<span class="tag warn">待领取</span>' +
-          '<span class="tag' + (dl.urgent ? ' bad' : ' mute') + '">' + esc(dl.text) + '</span>') +
-      '<span class="tag mute">' + esc(fmtTok(s.credit_num || 0)) + ' 积分</span>' +
-      (done ? '' : '<button class="xs" data-comp-uid="' + esc(r.uid) + '">领取</button>') +
-      '</div>';
-  }).join('');
-  // err 文本来自上游响应体，是外部可控字符串，必须 esc。
-  const errRows = failed.map(r =>
-    '<div class="comp-row"><span>' + esc(r.nickname || String(r.uid).slice(0, 8)) + '</span>' +
-    '<span class="tag bad">查询失败</span>' +
-    '<span class="tag mute">' + esc(String(r.error).slice(0, 120)) + '</span></div>'
-  ).join('');
-
-  $('compList').innerHTML = okRows + errRows;
-
-  const n = compPending(rows).length;
-  let note = n ? (n + ' 个账号待领 · 共 ' + fmtTok(compTotalPending(rows)) + ' 积分') : '当前无待领补偿';
-  // 混合态下也要把失败数说出来，否则 note 仍读作「没事」。
-  if (failed.length) note += ' · ' + failed.length + ' 个账号查询失败';
-  $('compNote').textContent = note;
-}
-
-// renderCachedCompensation 从缓存重渲染（不发请求），让倒计时走动。
-// 由 refreshVisible 每轮调用；无缓存（还没查过）时什么都不做。
-function renderCachedCompensation() {
-  if (compCache) renderCompensation(compCache);
-}
-
-async function loadCompensation() {
-  // 已有在途请求就等它跑完，而不是静默返回——领取后紧接着的刷新必须能看到新状态，
-  // 否则用户点了「领取」但列表纹丝不动。
-  if (compInFlight) { await compInFlight; return; }
-  compInFlight = (async () => {
-    try {
-      const d = await api('compensation');
-      compCache = d;
-      renderCompensation(d);
-    } catch (e) {
-      const box = $('compBox');
-      if (box) box.hidden = false;
-      if ($('compList')) $('compList').innerHTML =
-        '<div class="empty">查询失败：' + esc(e.message) + '</div>';
-      if ($('compNote')) $('compNote').textContent = '';
-    }
-  })();
-  try {
-    await compInFlight;
-  } finally {
-    compInFlight = null;   // 必须 finally：否则一次异常就让此后所有刷新永久失效
-  }
-}
-
-// 领取按钮走事件委托：列表每次重渲染都整块换 innerHTML，绑在具体节点上必丢。
-if ($('compList')) $('compList').addEventListener('click', async e => {
-  const b = e.target.closest('[data-comp-uid]');
-  if (!b) return;
-  b.disabled = true;
-  try {
-    const r = await api('accounts/' + encodeURIComponent(b.dataset.compUid) + '/compensation', { method: 'POST' });
-    const res = r.result || {};
-    if (res.claimed) toast('已领取 ' + fmtTok(res.credit || 0) + ' 积分', 'ok');
-    else if (res.error) toast('查询失败，未能确认是否有补偿', 'err');
-    else if (res.skip) toast(res.skip_msg || '无需领取', '');
-    else toast('领取失败：未知结果', 'err');
-    await loadCompensation();
-    loadOverview(true);
-  } catch (err) {
-    toast('领取失败：' + err.message, 'err');
-  }
-});
-
-if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
-
-if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
-  const b = $('btnCompClaimAll');
-  b.disabled = true;
-  try {
-    const r = await api('compensation_all', { method: 'POST' });
-    const s = r.summary || {};
-    // 顺序要紧：先看有没有账号没拿到结论，再看有没有领到。
-    // 只按 claimed 判定的话，「全部查询失败」会被说成「当前没有待领补偿」，
-    // 把故障说成了「没活动」——比不说更糟。
-    if (s.errored) {
-      toast(s.errored + ' 个账号查询失败，未能确认是否有补偿', 'err');
-    } else if (s.claimed) {
-      toast('已领取 ' + s.claimed + ' 个账号，共 ' + fmtTok(s.credit || 0) + ' 积分', 'ok');
-    } else {
-      toast('当前没有待领补偿', '');
-    }
-    await loadCompensation();
-    loadOverview(true);
-  } catch (e) {
-    toast('领取失败：' + e.message, 'err');
-  } finally {
-    b.disabled = false;
-  }
-};
-
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
-  if (view === 'accounts') { loadOverview(true); renderCachedCompensation(); }
+  if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
   loadOverview(true);
-  loadCompensation();                       // 补偿状态：首次进页面查一次（之后靠新鲜窗口）
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
@@ -2130,6 +2250,79 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+
+/* ── 任务中心队列：筛选（状态 / 账号关键词）+ 客户端分页 ─────────────────
+   1146 个账号的扫描结果可能有数千行，一次全量拼 DOM 会卡住主线程：这里按行
+   分页，每页只渲染当前页。筛选/页码是模块状态，3s 队列轮询重渲染时保持；
+   新数据源（重新扫描 / 启动队列）由调用方把 queuePage 复位到第 1 页。 */
+let queueAll = [];              // 最近一次渲染的分组数据源
+let queueFilters = { q: '', state: '' };
+let queuePage = 1;
+let queuePageSize = 100;        // 0 = 全部
+let queueProgress = null;       // 队列进度（轮询时传入，筛选/翻页重渲染时复用）
+let queueEmptyTitle = '', queueEmptyDesc = '';
+
+// queueFlatten 分组 → 扁平行（行上带账号上下文，才能跨组按行筛选/分页）。
+function queueFlatten(groups) {
+  const out = [];
+  for (const g of groups || []) {
+    for (const row of (g && g.rows) || []) out.push({ uid: g.uid, nick: g.nick, row: row });
+  }
+  return out;
+}
+
+// queueMatchRow 单行筛选：state 精确匹配；q 对账号昵称 / uid / 任务代码 / 标题做
+// 大小写不敏感包含匹配（空格分词 AND，与请求记录筛选用同一口径）。
+function queueMatchRow(item, f) {
+  f = f || queueFilters;
+  if (f.state && String((item.row && item.row.status) || '') !== f.state) return false;
+  if (f.q) {
+    const title = (item.row && item.row.kind === 'school')
+      ? '开学季闭环' : (GROWTH_TITLES[item.row && item.row.code] || '');
+    const hay = [item.nick, item.uid, item.row && item.row.code, title].filter(Boolean).join(' ').toLowerCase();
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (hay.indexOf(kw) < 0) return false;
+    }
+  }
+  return true;
+}
+
+// filterQueueRows 分组 → 过滤后的扁平行（纯函数，node harness 可直接钉计数）。
+function filterQueueRows(groups, f) {
+  return queueFlatten(groups).filter(item => queueMatchRow(item, f));
+}
+
+// queueRegroup 扁平行 → 渲染用分组：保持原账号出现顺序；分页后同账号仍归一组，
+// 组头「N 项待办」跟随当前页行数（不是全量）。
+function queueRegroup(items) {
+  const groups = [], by = new Map();
+  for (const item of items || []) {
+    let g = by.get(item.uid);
+    if (!g) { g = { uid: item.uid, nick: item.nick, rows: [] }; by.set(item.uid, g); groups.push(g); }
+    g.rows.push(item.row);
+  }
+  return groups;
+}
+
+let queueQTimer = null;
+if ($('tcQ')) $('tcQ').addEventListener('input', () => {
+  clearTimeout(queueQTimer);
+  queueQTimer = setTimeout(() => { queueFilters.q = $('tcQ').value.trim(); queuePage = 1; renderQueueView(); }, 150);
+});
+if ($('tcState')) $('tcState').addEventListener('change', () => {
+  queueFilters.state = $('tcState').value; queuePage = 1; renderQueueView();
+});
+if ($('tcPageSize')) $('tcPageSize').addEventListener('change', () => {
+  queuePageSize = parseInt($('tcPageSize').value, 10) || 0;
+  queuePage = 1;
+  renderQueueView();
+});
+if ($('tcPrev')) $('tcPrev').onclick = () => { if (queuePage > 1) { queuePage--; renderQueueView(); } };
+if ($('tcNext')) $('tcNext').onclick = () => {
+  const pages = pageSlice(filterQueueRows(queueAll, queueFilters), queuePageSize, queuePage).pages;
+  if (queuePage < pages) { queuePage++; renderQueueView(); }
+};
+
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
@@ -2138,6 +2331,7 @@ $('btnScanAll').onclick = async () => {
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
+    queuePage = 1;   // 新扫描结果 = 新数据源，回到第 1 页
     renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
@@ -2151,6 +2345,7 @@ $('btnRunQueue').onclick = async () => {
     const r = await api('tasks/run_queue', { method: 'POST', body: JSON.stringify({ concurrency: conc }) });
     if (!r.started) { toast(r.message || '没有待办任务', 'ok'); return; }
     lastQueueSeq = r.seq || 0;
+    queuePage = 1;   // 新一轮队列 = 新数据源
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
@@ -2183,26 +2378,50 @@ function qrowHTML(it) {
     '<span class="msg">' + esc(it.message || '') + '</span>' +
     '</div>';
 }
+// renderQueue 队列渲染入口：只更新数据源/进度，实际渲染交给 renderQueueView
+// （筛选/翻页重渲染时不需要重新传数据，签名保持与既有调用方一致）。
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
+  queueAll = groups || [];
+  queueProgress = progress === undefined ? null : progress;
+  if (emptyTitle != null) queueEmptyTitle = emptyTitle;
+  if (emptyDesc != null) queueEmptyDesc = emptyDesc;
+  renderQueueView();
+}
+
+function renderQueueView() {
   const empty = $('tcEmpty'), list = $('qcList');
-  if (!groups.length) {
+  if (!empty || !list) return;
+  const allRows = queueFlatten(queueAll).length;
+  const filtered = filterQueueRows(queueAll, queueFilters);
+  const pr = pageSlice(filtered, queuePageSize, queuePage);
+  queuePage = pr.page;
+  updatePagerUI({ count: 'qcCount', info: 'tcPageInfo', prev: 'tcPrev', next: 'tcNext' }, pr,
+    hitCountLabel(filtered.length, allRows, '项'));
+  $('qcSummary').textContent = hitCountLabel(filtered.length, allRows, '项');
+  if (!queueAll.length) {
     empty.style.display = '';
-    if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
-    if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
+    if (queueEmptyTitle) empty.querySelector('.t').textContent = queueEmptyTitle;
+    if (queueEmptyDesc) empty.querySelector('.d').textContent = queueEmptyDesc;
     list.innerHTML = '';
-    $('qProg').hidden = true; $('qcSummary').textContent = '';
+    $('qProg').hidden = true;
+    return;
+  }
+  if (!filtered.length) {
+    empty.style.display = '';
+    empty.querySelector('.t').textContent = '没有符合筛选条件的待办';
+    empty.querySelector('.d').textContent = '试试清空关键词，或把状态筛回「全部状态」。';
+    list.innerHTML = '';
+    updateProgress(queueProgress);
     return;
   }
   empty.style.display = 'none';
-  empty.style.display = 'none';
-  let total = 0;
+  const groups = queueRegroup(pr.rows);
   list.innerHTML = groups.map(g => {
-    total += g.rows.length;
-    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
+    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || String(g.uid).slice(0, 12)) +
+      '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
-  $('qcSummary').textContent = total + ' 项';
-  updateProgress(progress);
+  updateProgress(queueProgress);
 }
 function updateProgress(q) {
   if (!q || !q.items) { $('qProg').hidden = true; return; }

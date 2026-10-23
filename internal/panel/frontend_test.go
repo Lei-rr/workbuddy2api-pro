@@ -1526,3 +1526,606 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// feNode 用 node 执行一段前端「切片」脚本：脚本以 app.js 为 process.argv[2]，工作目录
+// 为 internal/panel。无 node 环境时跳过（与既有前端测试同口径）。新增用例较多，把
+// 「写临时脚本 + 跑 node + 失败打印输出」收敛到一处，避免每处重复十行样板。
+func feNode(t *testing.T, script string) string {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; frontend slice test skipped")
+	}
+	fp := filepath.Join(t.TempDir(), "fe-slice.cjs")
+	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, fp, "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("frontend slice node test failed: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestAppJSCompensationRemoved 「官方补偿」前端必须彻底删除（用户明确不再需要）。
+//
+// 为什么用源码级断言：补偿卡片是「打开页面逐号打上游」的触发点（start() 里首查 +
+// refreshVisible 每轮重渲染），删掉的功能没有可执行入口，运行时测试抓不到「删得不干净」。
+// 留一处 compBox / loadCompensation 就等于给这条逐号上游链路留了复活点，故按 token
+// 逐文件钉死；配套的 Go 端测试文件也必须一并消失（否则它继续引用已删函数/接口）。
+func TestAppJSCompensationRemoved(t *testing.T) {
+	forbidden := []string{
+		"compCache", "compInFlight", "compPending", "compErrored", "compTotalPending",
+		"compDeadlineText", "renderCompensation", "renderCachedCompensation", "loadCompensation",
+		"btnCompRefresh", "btnCompClaimAll", "compBox", "comp-row", "compNote", "compList",
+		"官方补偿", "领取补偿", "compensation",
+	}
+	for _, name := range []string{"app.js", "index.html", "mobile.js", "mobile.css"} {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		for _, tok := range forbidden {
+			if strings.Contains(text, tok) {
+				t.Errorf("%s 仍残留官方补偿实现 %q（该功能已删除，勿恢复）", name, tok)
+			}
+		}
+	}
+	if _, err := os.Stat("compensation_frontend_test.go"); !os.IsNotExist(err) {
+		t.Errorf("compensation_frontend_test.go 应已删除（stat err=%v）", err)
+	}
+}
+
+// TestAppJSPageSliceBounds 分页切片纯函数的边界：空列表、页码越界/非数字、pageSize=0
+// （全部）、整除与非整除、小数入参。这些分支在浏览器里很难手工覆盖，而算错页码的表现
+// 是「翻到空页」或「最后一页丢行」——不报错，只能肉眼看，故在此逐项钉死。
+func TestAppJSPageSliceBounds(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function pageSlice');
+const end = src.indexOf('function accDoTaskBtn');
+if (start < 0 || end < 0 || end < start) throw new Error('pagination helpers not found');
+const ctx = { Number, Math, String };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.pageSlice = pageSlice; this.hitCountLabel = hitCountLabel;', ctx);
+const list = [];
+for (let i = 0; i < 10; i++) list.push({ n: i });
+const six = [];
+for (let i = 0; i < 6; i++) six.push({ n: i });
+const nums = pr => pr.rows.map(r => r.n);
+const pick = (pr, keys) => { const o = { rows: nums(pr) }; for (const k of keys) o[k] = pr[k]; return o; };
+process.stdout.write(JSON.stringify({
+  first: pick(ctx.pageSlice(list, 3, 1), ['page', 'pages', 'total', 'size']),
+  last: pick(ctx.pageSlice(list, 3, 4), ['page', 'pages', 'total', 'size']),
+  beyond: pick(ctx.pageSlice(list, 3, 9), ['page', 'pages']),
+  zero: pick(ctx.pageSlice(list, 3, 0), ['page']),
+  negative: pick(ctx.pageSlice(list, 3, -2), ['page']),
+  nonnum: pick(ctx.pageSlice(list, 3, 'x'), ['page']),
+  all: pick(ctx.pageSlice(list, 0, 5), ['page', 'pages', 'size']),
+  exact: pick(ctx.pageSlice(six, 3, 2), ['page', 'pages']),
+  empty: pick(ctx.pageSlice([], 3, 2), ['page', 'pages', 'total']),
+  nullList: pick(ctx.pageSlice(null, 3, 1), ['total']),
+  fracSize: pick(ctx.pageSlice(list, 2.9, 1), ['size']),
+  fracPage: pick(ctx.pageSlice(list, 3, 2.9), ['page']),
+  hits: {
+    a: ctx.hitCountLabel(3, 10),
+    b: ctx.hitCountLabel(10, 10),
+    c: ctx.hitCountLabel(0, 0),
+    d: ctx.hitCountLabel(2, 5, '行'),
+    e: ctx.hitCountLabel(0, 3),
+  },
+}));`
+	want := `{"first":{"rows":[0,1,2],"page":1,"pages":4,"total":10,"size":3},` +
+		`"last":{"rows":[9],"page":4,"pages":4,"total":10,"size":3},` +
+		`"beyond":{"rows":[9],"page":4,"pages":4},` +
+		`"zero":{"rows":[0,1,2],"page":1},` +
+		`"negative":{"rows":[0,1,2],"page":1},` +
+		`"nonnum":{"rows":[0,1,2],"page":1},` +
+		`"all":{"rows":[0,1,2,3,4,5,6,7,8,9],"page":1,"pages":1,"size":0},` +
+		`"exact":{"rows":[3,4,5],"page":2,"pages":2},` +
+		`"empty":{"rows":[],"page":1,"pages":1,"total":0},` +
+		`"nullList":{"rows":[],"total":0},` +
+		`"fracSize":{"rows":[0,1],"size":2},` +
+		`"fracPage":{"rows":[3,4,5],"page":2},` +
+		`"hits":{"a":"命中 3 / 10 条","b":"10 条","c":"","d":"命中 2 / 5 行","e":"命中 0 / 3 条"}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("pageSlice 边界=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSAccountFilterAndPager 账号池筛选（搜索/状态/版本）与计数、分页按钮禁用态。
+// 筛选后计数文案与页码信息是用户判断「筛没筛对」的唯一依据，写错不会报错只会误导。
+func TestAppJSAccountFilterAndPager(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function accIsCool');
+const end = src.indexOf('function renderAccounts');
+if (start < 0 || end < 0 || end < start) throw new Error('account filter helpers not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', disabled: false });
+const ctx = {
+  Date, Number, String, Array, Object, Math,
+  $: id => (sinks[id] || mk(id)),
+  accAll: [], accFilters: { q: '', state: '', ver: '' }, accPage: 1,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.accMatch = accMatch; this.updateAccPager = updateAccPager;', ctx);
+const rows = [
+  { uid: 'uid-ok', nickname: 'Alpha', realm: 'cn' },
+  { uid: 'uid-cool', nickname: 'Beta', realm: 'global', cool_remaining_sec: 120 },
+  { uid: 'uid-paused', nickname: 'Gamma', enterprise: true, paused: true },
+  { uid: 'uid-dis', nickname: 'Delta', disabled: true },
+  { uid: 'uid-ent', nickname: 'Eps', enterprise: true },
+];
+ctx.accAll = rows.slice();
+const pick = (q, state, ver) => {
+  ctx.accFilters = { q: q || '', state: state || '', ver: ver || '' };
+  return rows.filter(r => ctx.accMatch(r)).map(r => r.uid);
+};
+const out = {
+  all: pick('', '', ''),
+  qNick: pick('alpha'),
+  qUid: pick('UID-COOL'),
+  stateOk: pick('', 'ok'),
+  stateCool: pick('', 'cool'),
+  statePaused: pick('', 'paused'),
+  stateDisabled: pick('', 'disabled'),
+  verEnterprise: pick('', '', 'enterprise'),
+  verGlobal: pick('', '', 'global'),
+  verCn: pick('', '', 'cn'),
+  combo: pick('', 'ok', 'cn'),
+};
+ctx.accPage = 1;
+ctx.updateAccPager(2, 3);
+out.pager = [sinks.accCount.textContent, sinks.accPageInfo.textContent, sinks.accPrev.disabled, sinks.accNext.disabled];
+ctx.accPage = 3;
+ctx.updateAccPager(5, 3);
+out.pagerLast = [sinks.accCount.textContent, sinks.accPageInfo.textContent, sinks.accPrev.disabled, sinks.accNext.disabled];
+process.stdout.write(JSON.stringify(out));`
+	want := `{"all":["uid-ok","uid-cool","uid-paused","uid-dis","uid-ent"],` +
+		`"qNick":["uid-ok"],"qUid":["uid-cool"],` +
+		`"stateOk":["uid-ok","uid-ent"],"stateCool":["uid-cool"],` +
+		`"statePaused":["uid-paused"],"stateDisabled":["uid-dis"],` +
+		`"verEnterprise":["uid-paused","uid-ent"],"verGlobal":["uid-cool"],` +
+		`"verCn":["uid-ok","uid-dis"],"combo":["uid-ok"],` +
+		`"pager":["共 5 个 · 筛出 2","1 / 3",true,false],` +
+		`"pagerLast":["共 5 个","3 / 3",false,true]}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("账号池筛选/分页=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSLogFilter 运行日志关键词筛选：只对 text 做大小写不敏感包含匹配，频道过滤
+// 与关键词取交集；空关键词/脏数据不得抛异常。频道 chips 与 5s 轮询继续沿用原有协议。
+func TestAppJSLogFilter(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function logMatch');
+const end = src.indexOf('$(\'logChips\')');
+if (start < 0 || end < 0 || end < start) throw new Error('log filter helpers not found');
+const ctx = {};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.filterLogs = filterLogs;', ctx);
+const entries = [
+  { ch: 'task', text: '签到完成 uid=abc' },
+  { ch: 'task', text: '任务执行失败：HTTP 502' },
+  { ch: 'chat', text: 'chat ok 200' },
+  { ch: 'sys', text: '启动 warn 冷却' },
+];
+const n = (ch, q) => ctx.filterLogs(entries, ch, q).length;
+process.stdout.write(JSON.stringify({
+  all: n('all', ''),
+  task: n('task', ''),
+  taskFail: n('task', '失败'),
+  caseInsensitive: n('all', 'CHAT'),
+  textOnly: n('all', '签到'),
+  miss: n('all', '不存在'),
+  chAndKw: n('chat', '失败'),
+  emptyEntries: ctx.filterLogs(null, 'all', '').length,
+  dirty: ctx.filterLogs([null, { ch: 'task' }], 'all', '').length,
+}));`
+	want := `{"all":4,"task":2,"taskFail":1,"caseInsensitive":1,"textOnly":1,"miss":0,"chAndKw":0,"emptyEntries":0,"dirty":1}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("log filter=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSRequestFilterAndPage 请求记录：筛选结果计数 + 客户端分页（只渲染当前页，
+// 页码按命中数算而不是按拉取总数算——否则「命中 1 条」还会显示 10 页空页）。
+func TestAppJSRequestFilterAndPage(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const pageStart = src.indexOf('function pageSlice');
+const pageEnd = src.indexOf('function accDoTaskBtn');
+const start = src.indexOf('function reqMatch');
+const end = src.indexOf('function reqOutcomeTag');
+if ([pageStart, pageEnd, start, end].some(v => v < 0) || pageEnd < pageStart || end < start)
+  throw new Error('request filter/page helpers not found');
+const ctx = { Number, Math, String, Array, Object };
+vm.createContext(ctx);
+vm.runInContext(src.slice(pageStart, pageEnd) + src.slice(start, end) +
+  '\nthis.reqMatch = reqMatch; this.filterReqEntries = filterReqEntries; this.pageSlice = pageSlice;', ctx);
+const base = { status: 200, outcome: 'success' };
+const rows = [
+  Object.assign({}, base, { request_id: 'req-1', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.2', account: '甲' }),
+  { status: 502, outcome: 'http_error', request_id: 'req-2', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0', model: 'global:hy3', account: '乙' },
+  { status: 200, outcome: 'stream_error', request_id: 'req-3', client_ip: '203.0.113.9', user_agent: 'curl/8', model: 'cn:glm-5.2', account: '甲' },
+  { status: 200, outcome: 'interrupted', request_id: 'req-4', client_ip: '198.51.100.8', user_agent: 'python-requests/2.31.0', model: 'cn:hy3', account: '丙' },
+  Object.assign({}, base, { request_id: 'req-5', client_ip: '203.0.113.10', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.2', account: '乙' }),
+];
+const f = (q, outcome) => ({ q: q || '', outcome: outcome || '' });
+const ids = flt => rows.filter(e => ctx.reqMatch(e, flt)).map(e => e.request_id);
+const matched = ctx.filterReqEntries(rows, f('', ''));
+const pr = ctx.pageSlice(matched, 2, 3);
+const http = ctx.filterReqEntries(rows, f('', 'http_error'));
+process.stdout.write(JSON.stringify({
+  all: ids(f('', '')),
+  qGlm: ids(f('glm')),
+  qIp: ids(f('198.51')),
+  outcome: ids(f('', 'http_error')),
+  combined: ids(f('203.0.113', 'success')),
+  page3: { rows: pr.rows.map(e => e.request_id), page: pr.page, pages: pr.pages, total: pr.total },
+  httpPages: ctx.pageSlice(http, 1, 1).pages,
+}));`
+	want := `{"all":["req-1","req-2","req-3","req-4","req-5"],` +
+		`"qGlm":["req-1","req-3","req-5"],"qIp":["req-2","req-4"],` +
+		`"outcome":["req-2"],"combined":["req-1","req-5"],` +
+		`"page3":{"rows":["req-5"],"page":3,"pages":3,"total":5},"httpPages":1}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("请求记录筛选/分页=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSCreditFilterAndPagination 积分历史：账号筛选 + 分页，header 的「N 条 · 净 X」
+// 跟随筛选（不是当前页），页码按筛选后结果算且越界自动钳位。
+func TestAppJSCreditFilterAndPagination(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const pageStart = src.indexOf('function pageSlice');
+const pageEnd = src.indexOf('function accDoTaskBtn');
+const start = src.indexOf('function creditNum');
+const end = src.indexOf('function creditLimitValue');
+if ([escStart, escEnd, pageStart, pageEnd, start, end].some(v => v < 0) ||
+    escEnd < escStart || pageEnd < pageStart || end < start) throw new Error('credit filter helpers not found');
+const els = {};
+const $ = id => (els[id] || (els[id] = { innerHTML: '', textContent: '', disabled: false }));
+const ctx = { Date, Number, String, Math, RegExp, isNaN, $ };
+vm.createContext(ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(pageStart, pageEnd) + src.slice(start, end) +
+  '\nthis.esc = esc; this.renderCreditHistory = renderCreditHistory;' +
+  'this.setCredit = (f, p, s) => { creditFilter = f; creditPage = p; creditPageSize = s; };' +
+  'this.creditPageNo = () => creditPage;', ctx);
+const t = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+const entries = [
+  { time: t, uid: 'u1', account: '甲', delta: 100, before: 0, after: 100 },
+  { time: t, uid: 'u2', account: '乙', delta: -30, before: 100, after: 70 },
+  { time: t, uid: 'u1', account: '甲', delta: 5, before: 100, after: 105 },
+  { time: t, uid: 'u2', account: '乙', delta: 20, before: 70, after: 90 },
+  { time: t, uid: 'u1', account: '甲', delta: -30, before: 105, after: 75 },
+];
+const out = {};
+const rows = () => (els.creditBody.innerHTML.match(/<tr>/g) || []).length;
+ctx.setCredit({ uid: 'u1' }, 2, 2);
+ctx.renderCreditHistory({ entries: entries });
+out.u1Page2 = {
+  rows: rows(), note: els.creditNote.textContent, count: els.creditCount.textContent,
+  info: els.creditPageInfo.textContent, prev: els.creditPrev.disabled,
+  next: els.creditNext.disabled, page: ctx.creditPageNo(),
+};
+ctx.setCredit({ uid: '' }, 1, 100);
+ctx.renderCreditHistory({ entries: entries });
+out.all = { rows: rows(), note: els.creditNote.textContent, count: els.creditCount.textContent, info: els.creditPageInfo.textContent };
+ctx.setCredit({ uid: 'nope' }, 1, 100);
+ctx.renderCreditHistory({ entries: entries });
+out.none = {
+  rows: rows(), note: els.creditNote.textContent, count: els.creditCount.textContent,
+  noMatch: els.creditBody.innerHTML.indexOf('没有匹配的积分变动记录') >= 0,
+};
+ctx.setCredit({ uid: 'u1' }, 99, 2);
+ctx.renderCreditHistory({ entries: entries });
+out.clamp = { info: els.creditPageInfo.textContent, page: ctx.creditPageNo(), rows: rows() };
+ctx.renderCreditHistory({ entries: null });
+out.nullEntries = { note: els.creditNote.textContent, noMatch: els.creditBody.innerHTML.indexOf('没有匹配') >= 0 };
+process.stdout.write(JSON.stringify(out));`
+	want := `{"u1Page2":{"rows":1,"note":"3 条 · 净 +75","count":"命中 3 / 5 条","info":"2 / 2","prev":false,"next":true,"page":2},` +
+		`"all":{"rows":5,"note":"5 条 · 净 +65","count":"5 条","info":"1 / 1"},` +
+		`"none":{"rows":1,"note":"暂无积分变动记录","count":"命中 0 / 5 条","noMatch":true},` +
+		`"clamp":{"info":"2 / 2","page":2,"rows":1},` +
+		`"nullEntries":{"note":"暂无积分变动记录","noMatch":false}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("积分历史筛选/分页=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSAccountDotaskButton 账号行「做任务」按钮：普通账号渲染 data-a="dotask"，
+// 企业版不渲染（与签到/任务按钮同口径），uid 必须转义；同时钉住前端调用的接口路径。
+func TestAppJSAccountDotaskButton(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const start = src.indexOf('function accDoTaskBtn');
+const end = src.indexOf('// 账号是否处于冷却');
+if ([escStart, escEnd, start, end].some(v => v < 0) || escEnd < escStart || end < start)
+  throw new Error('dotask helper not found');
+const ctx = { String };
+vm.createContext(ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) + '\nthis.accDoTaskBtn = accDoTaskBtn;', ctx);
+const normal = ctx.accDoTaskBtn({ uid: 'uid-1' });
+const bad = ctx.accDoTaskBtn({ uid: 'a"<b>' });
+process.stdout.write(JSON.stringify({
+  normalHasBtn: normal.indexOf('data-a="dotask"') >= 0,
+  normalHasUid: normal.indexOf('data-u="uid-1"') >= 0,
+  normalHasLabel: normal.indexOf('做任务') >= 0,
+  enterpriseEmpty: ctx.accDoTaskBtn({ uid: 'uid-2', enterprise: true }) === '',
+  nilEmpty: ctx.accDoTaskBtn(null) === '',
+  xssEscaped: bad.indexOf('<b>') < 0 && bad.indexOf('&lt;b&gt;') >= 0 && bad.indexOf('&quot;') >= 0,
+}));`
+	want := `{"normalHasBtn":true,"normalHasUid":true,"normalHasLabel":true,"enterpriseEmpty":true,"nilEmpty":true,"xssEscaped":true}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("做任务按钮渲染=%s\nwant %s", got, want)
+	}
+	// 接口路径与「执行中」文案在源码里（行为测试已覆盖渲染；路径改名会让按钮静默 404）。
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/tasks/run", "做任务中…", "runAccountDotask", "a === 'dotask'"} {
+		if !bytes.Contains(js, []byte(want)) {
+			t.Fatalf("app.js 缺少「做任务」实现片段 %q", want)
+		}
+	}
+}
+
+// TestAppJSQueueFilter 任务中心队列：按状态 / 账号关键词筛选（空格分词 AND），
+// 分组在分页后按账号重聚合。1146 账号时全部渲染会卡死，筛+页是可用性底线。
+func TestAppJSQueueFilter(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function queueFlatten');
+const end = src.indexOf('let queueQTimer');
+if (start < 0 || end < 0 || start > end) throw new Error('queue filter helpers not found');
+const ctx = { String, Number, Array, Object, Map, Math, GROWTH_TITLES: { chat_5: '聊天五次' } };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.filterQueueRows = filterQueueRows; this.queueRegroup = queueRegroup;', ctx);
+const groups = [
+  { uid: 'u1', nick: '甲', rows: [
+    { kind: 'growth', code: 'chat_5', status: 'done' },
+    { kind: 'growth', code: 'skill_1', status: 'error' },
+  ] },
+  { uid: 'u2', nick: '乙', rows: [{ kind: 'school', code: 'school_season', status: 'running' }] },
+  { uid: 'u3', nick: '丙', rows: [{ kind: 'growth', code: 'black_cat', status: 'skipped' }] },
+];
+const f = (q, state) => ({ q: q || '', state: state || '' });
+const n = flt => ctx.filterQueueRows(groups, flt).length;
+const rg = ctx.queueRegroup(ctx.filterQueueRows(groups, f('', '')));
+process.stdout.write(JSON.stringify({
+  all: n(f('', '')),
+  stateError: n(f('', 'error')),
+  stateRunning: n(f('', 'running')),
+  qNick: n(f('乙')),
+  qUid: n(f('U1')),
+  qCode: n(f('chat_5')),
+  qTitle: n(f('聊天五次')),
+  qSchool: n(f('开学')),
+  multi: n(f('甲 skill')),
+  multiMiss: n(f('甲 running')),
+  regroup: rg.map(g => [g.uid, g.rows.length]),
+}));`
+	want := `{"all":4,"stateError":1,"stateRunning":1,"qNick":1,"qUid":2,"qCode":1,"qTitle":1,"qSchool":1,"multi":1,"multiMiss":0,"regroup":[["u1",2],["u2",1],["u3",1]]}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("任务队列筛选/分组=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelPaginationWiring 分页/筛选控件必须「index.html 里有、app.js 里也绑定了」：
+// 少一边的表现是「控件在那儿但点了没反应」或「JS 抓到 null」，Go 编译、JS 语法检查、
+// 顶层冒烟都不会报错。断言 id 字符串双侧存在，改 id 时两边必须同步。
+func TestPanelPaginationWiring(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{
+		// 模型锁池
+		"mlQ", "mlState", "mlRealm", "mlPageSize", "mlCount", "mlPrev", "mlPageInfo", "mlNext",
+		// 任务中心队列
+		"tcQ", "tcState", "tcPageSize", "qcCount", "tcPrev", "tcPageInfo", "tcNext",
+		// 运行日志
+		"logQ", "logPageSize", "logCount", "logPrev", "logPageInfo", "logNext",
+		// 请求记录
+		"reqPageSize", "reqPrev", "reqPageInfo", "reqNext",
+		// 积分历史
+		"creditAccount", "creditPageSize", "creditCount", "creditPrev", "creditPageInfo", "creditNext",
+	}
+	for _, id := range ids {
+		if !bytes.Contains(html, []byte(`id="`+id+`"`)) {
+			t.Errorf("index.html 缺少控件 id=%q", id)
+		}
+		if !bytes.Contains(js, []byte(`'`+id+`'`)) {
+			t.Errorf("app.js 未绑定控件 id=%q（元素存在但事件挂不上）", id)
+		}
+	}
+}
+
+// TestAppJSRenderersSmoke 用惰性 DOM 桩执行整份 app.js 后，直接调用本次新增/改写的
+// 渲染函数（账号池 / 模型锁池 / 运行日志 / 请求记录 / 任务队列 / 积分历史）各一次（含
+// 空态与有数据态）：语法检查与顶层求值冒烟都不会进这些分支，而渲染里的
+// ReferenceError / TypeError（漏声明、调错辅助函数）只在真正渲染时出现——表现是
+// 页面局部空白、控制台报错，Go 侧却全绿。
+func TestAppJSRenderersSmoke(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const sandbox = new Proxy({
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+const hook = '\nthis.__r = {' +
+  'accounts: renderAccounts, ml: renderModelLocks, log: renderLogBox, req: renderRequestTable,' +
+  'queue: renderQueue, credit: renderCreditHistory,' +
+  'setLog: v => { logAll = v; }, setReq: v => { reqEntries = v; },' +
+  '};';
+vm.runInContext(src + hook, sandbox, { filename: 'app.js' });
+const r = sandbox.__r;
+const now = new Date().toISOString();
+try {
+  // 空态
+  r.accounts([]);
+  r.ml([]);
+  r.setLog([]); r.log(false);
+  r.setReq([]); r.req();
+  r.queue([], null, '没有待办任务', '全部完成');
+  r.credit({ entries: [] });
+  r.credit(null);   // 积分历史不可用分支
+  // 有数据态（覆盖行渲染、状态标、翻页控件写入）
+  r.accounts([
+    { uid: 'u-1', nickname: '甲', realm: 'cn', credits: 100, credits_total: 200, checkin_done: true,
+      success_count: 3, err_total: 1, in_flight: 0, last_success: now,
+      token_usage: { request_count: 5, total_tokens: 1000, last_latency_ms: 500, last_tokens_per_second: 20 },
+      rate_limited_models: [] },
+    { uid: 'u-2', nickname: '乙', enterprise: true, credits: -1, credits_total: -1, paused: true },
+  ]);
+  r.accounts(Array.from({ length: 130 }, (_, i) => ({ uid: 'u-' + i, nickname: 'n' + i, credits: i })));
+  r.ml([
+    { model: 'cn:glm-5.2', realm: 'cn', state: 'partial', servable: 3, total: 5, locked: 2,
+      unlock_at: now, fully_unlock_at: now, reason: '限流' },
+    { model: 'global:hy3', realm: 'global', state: 'locked', servable: 0, total: 5 },
+  ]);
+  r.setLog([{ ch: 'task', ts: now, text: '签到完成' }, { ch: 'sys', ts: now, text: 'warn 冷却' }]);
+  r.log(true);
+  r.setReq([
+    { time: now, status: 200, outcome: 'success', model: 'cn:glm-5.2', account: '甲',
+      client_ip: '1.2.3.4', user_agent: 'curl', duration_ms: 120, total_tokens: 50,
+      credit_known: true, credit: 0.5, request_id: 'req-1' },
+    { time: now, status: 502, outcome: 'http_error', model: 'cn:hy3', account: '乙',
+      duration_ms: 9, request_id: 'req-2' },
+  ]);
+  r.req();
+  r.queue([
+    { uid: 'u-1', nick: '甲', rows: [{ kind: 'growth', code: 'chat_5', status: 'done' },
+      { kind: 'growth', code: 'skill_1', status: 'error' }] },
+  ], { running: true, items: [{ status: 'done' }, { status: 'error' }] });
+  r.credit({ entries: [
+    { time: now, uid: 'u-1', account: '甲', delta: 50, before: 50, after: 100 },
+    { time: now, uid: 'u-2', account: '乙', delta: -10, before: 100, after: 90 },
+  ] });
+} catch (e) {
+  console.log('RENDER FAIL:', (e && e.stack ? e.stack : e).toString().split('\n').slice(0, 6).join('\n'));
+  process.exit(1);
+}
+console.log('RENDER SMOKE OK');
+process.exit(0);`
+	if got := feNode(t, script); got != "RENDER SMOKE OK" {
+		t.Fatalf("渲染函数冒烟失败：%s", got)
+	}
+}
+
+// TestAppJSAccountDotaskFlow 账号行「做任务」（需求 4）的交互契约：
+//   - 取消 confirm ⇒ 不发请求、不动按钮；
+//   - 确认 ⇒ POST /accounts/{uid}/tasks/run，按钮「做任务中…」禁用，完成后按
+//     summary 弹「成功 X / 跳过 Y / 失败 Z」并刷新 overview；
+//   - 200 + ok:false（企业版/无凭证等门控拒绝）⇒ 弹后端 message，不能当成成功；
+//   - 接口抛错（409/504 等）⇒ 错误 toast，按钮恢复原状。
+//
+// 这些分支只在浏览器里发生，Go 侧与纯函数测试都看不到；字段名（ok/summary.done 等）
+// 与后端 taskRunSummary 契约绑定，改名/漏读会让汇总数字静默变 0。
+func TestAppJSAccountDotaskFlow(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function runAccountDotask');
+const stop = src.indexOf('$(\'accBody\').addEventListener');
+if (start < 0 || stop < 0 || stop < start) throw new Error('runAccountDotask region not found');
+const toasts = [];
+let apiCalls = [], overviewCalls = 0, confirmAnswer = false, apiImpl = null;
+const ctx = {
+  confirm: () => confirmAnswer,
+  api: async (path, opts) => { apiCalls.push([path, opts && opts.method]); return apiImpl(path, opts); },
+  toast: (msg, cls) => toasts.push([msg, cls || '']),
+  loadOverview: () => { overviewCalls++; },
+  encodeURIComponent, Number, String, Object, Array,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop) + '\nthis.runAccountDotask = runAccountDotask;', ctx);
+const btn = () => ({ disabled: false, textContent: '做任务' });
+const out = {};
+(async () => {
+  // ① 取消确认
+  let b = btn();
+  confirmAnswer = false; apiCalls = []; toasts.length = 0;
+  await ctx.runAccountDotask(b, 'u-1');
+  out.cancel = { calls: apiCalls.length, disabled: b.disabled, label: b.textContent, toasts: toasts.length };
+  // ② 正常完成：1 done / 1 skipped / 1 error
+  b = btn(); confirmAnswer = true; toasts.length = 0; overviewCalls = 0;
+  apiImpl = async () => ({ ok: true, uid: 'u-1',
+    results: [{ status: 'done' }, { status: 'skipped' }, { status: 'error' }],
+    summary: { total: 3, done: 1, skipped: 1, error: 1, claimed: 0 } });
+  await ctx.runAccountDotask(b, 'u-1');
+  out.ok = { call: apiCalls.length ? apiCalls[0][0] : '', method: apiCalls.length ? apiCalls[0][1] : '',
+    toast: toasts.length ? toasts[0][0] : '', cls: toasts.length ? toasts[0][1] : '',
+    label: b.textContent, disabled: b.disabled, overview: overviewCalls };
+  // ③ 门控拒绝 200 + ok:false
+  b = btn(); toasts.length = 0; overviewCalls = 0;
+  apiImpl = async () => ({ ok: false, message: '该账号为企业版，无个人成长任务体系', results: [], summary: {} });
+  await ctx.runAccountDotask(b, 'u-2');
+  out.reject = { toast: toasts.length ? toasts[0][0] : '', cls: toasts.length ? toasts[0][1] : '',
+    label: b.textContent, overview: overviewCalls };
+  // ④ 接口抛错（409 等）
+  b = btn(); toasts.length = 0;
+  apiImpl = async () => { throw new Error('HTTP 409'); };
+  await ctx.runAccountDotask(b, 'u-3');
+  out.fail = { toast: toasts.length ? toasts[0][0] : '', cls: toasts.length ? toasts[0][1] : '', label: b.textContent };
+  // ⑤ 没有可执行任务
+  b = btn(); toasts.length = 0;
+  apiImpl = async () => ({ ok: true, results: [], summary: { total: 0, done: 0, skipped: 0, error: 0 } });
+  await ctx.runAccountDotask(b, 'u-4');
+  out.empty = { toast: toasts.length ? toasts[0][0] : '', label: b.textContent };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"cancel":{"calls":0,"disabled":false,"label":"做任务","toasts":0},` +
+		`"ok":{"call":"accounts/u-1/tasks/run","method":"POST",` +
+		`"toast":"做任务完成：成功 1 项，跳过 1 项，失败 1 项","cls":"err",` +
+		`"label":"做任务","disabled":false,"overview":1},` +
+		`"reject":{"toast":"该账号为企业版，无个人成长任务体系","cls":"err","label":"做任务","overview":1},` +
+		`"fail":{"toast":"做任务失败：HTTP 409","cls":"err","label":"做任务"},` +
+		`"empty":{"toast":"没有可执行的任务（可能已全部完成）","label":"做任务"}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("做任务交互=%s\nwant %s", got, want)
+	}
+}

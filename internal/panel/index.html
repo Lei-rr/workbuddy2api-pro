@@ -203,11 +203,6 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header select, .box > header input { width: auto; }
 .box > header h3 { white-space: nowrap; }
 .box .pad { padding: 17px; }
-/* 补偿活动行：昵称 / 状态标 / 截止倒计时 / 额度 / 领取按钮，单行紧凑排布。
-   沿用 .tag 体系染色（ok=已领、warn=待领、bad=临期、mute=中性信息）。 */
-.comp-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
-.comp-row:last-child { border-bottom: none; }
-
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
@@ -714,22 +709,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad" id="expPad"><div id="expList"></div></div>
       </div>
 
-      <!-- 官方补偿活动（issue #189）：「模型服务异常额外补偿 N 积分」这类限时补偿在账号侧
-           可见，但网关原先只在每日签到后盲领一次，「没有 / 已领过 / 领取真失败」三态在
-           日志里同构，补偿带截止日时签到一停就静默过期。这里把它显式摆出来：截止倒计时 +
-           逐号领取 + 全部领取。无生效活动时整卡隐藏——隐藏的是卡片本身、且渲染不依赖用户
-           点它，故不构成 issue #137 那种「入口藏在自己隐藏卡片里」的死锁。 -->
-      <div class="box" id="compBox" hidden>
-        <header>
-          <h3>官方补偿<span class="hint">服务异常等限时补偿 · 查状态后按需领取 · 不占用每日签到</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="compNote"></span>
-          <button class="xs" id="btnCompRefresh">检查</button>
-          <button class="xs" id="btnCompClaimAll">全部领取</button>
-        </header>
-        <div class="pad"><div id="compList"></div></div>
-      </div>
-
       <div class="box" id="accBox">
         <header>
           <h3>账号池</h3>
@@ -787,6 +766,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="mlNote"></span>
         </header>
+        <div class="fbar" id="mlFilter">
+          <input id="mlQ" type="search" placeholder="搜索模型名" aria-label="搜索模型锁池">
+          <select id="mlState" aria-label="按锁池状态筛选">
+            <option value="">全部状态</option>
+            <option value="locked">整池不可用</option>
+            <option value="starved">没号可用</option>
+            <option value="partial">部分限流</option>
+          </select>
+          <select id="mlRealm" aria-label="按地区筛选">
+            <option value="">全部地区</option>
+            <option value="cn">国内版</option>
+            <option value="global">国际版</option>
+          </select>
+          <span class="grow"></span>
+          <span class="flab" id="mlCount"></span>
+          <select id="mlPageSize" aria-label="每页条数">
+            <option value="50">50 / 页</option>
+            <option value="100" selected>100 / 页</option>
+            <option value="200">200 / 页</option>
+            <option value="0">全部</option>
+          </select>
+          <button class="xs ghost" id="mlPrev" aria-label="上一页">‹</button>
+          <span class="flab" id="mlPageInfo">1 / 1</span>
+          <button class="xs ghost" id="mlNext" aria-label="下一页">›</button>
+        </div>
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
@@ -812,6 +816,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnScanAll">扫描待办</button>
           <button class="xs primary" id="btnRunQueue">执行全部待办</button>
         </header>
+        <div class="fbar" id="tcFilter">
+          <input id="tcQ" type="search" placeholder="搜索账号昵称 / uid / 任务代码" aria-label="搜索任务队列">
+          <select id="tcState" aria-label="按执行状态筛选">
+            <option value="">全部状态</option>
+            <option value="pending">排队</option>
+            <option value="running">执行中</option>
+            <option value="done">完成</option>
+            <option value="skipped">跳过</option>
+            <option value="error">失败</option>
+            <option value="scan">待执行</option>
+          </select>
+          <span class="grow"></span>
+          <span class="flab" id="qcCount"></span>
+          <select id="tcPageSize" aria-label="每页条数">
+            <option value="50">50 / 页</option>
+            <option value="100" selected>100 / 页</option>
+            <option value="200">200 / 页</option>
+            <option value="0">全部</option>
+          </select>
+          <button class="xs ghost" id="tcPrev" aria-label="上一页">‹</button>
+          <span class="flab" id="tcPageInfo">1 / 1</span>
+          <button class="xs ghost" id="tcNext" aria-label="下一页">›</button>
+        </div>
         <div class="qprog" id="qProg" hidden>
           <div class="qbar"><i id="qBarFill"></i></div>
           <span class="note" id="qProgText"></span>
@@ -1240,6 +1267,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </select>
           <span class="grow"></span>
           <span class="note" id="reqCount">—</span>
+          <select id="reqPageSize" aria-label="每页条数">
+            <option value="50">50 / 页</option>
+            <option value="100" selected>100 / 页</option>
+            <option value="200">200 / 页</option>
+            <option value="0">全部</option>
+          </select>
+          <button class="xs ghost" id="reqPrev" aria-label="上一页">‹</button>
+          <span class="flab" id="reqPageInfo">1 / 1</span>
+          <button class="xs ghost" id="reqNext" aria-label="下一页">›</button>
           <button class="xs" id="btnReqReload">重新读取</button>
         </div>
         <div class="tbl-wrap req-wrap">
@@ -1267,6 +1303,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="logNote">最近 500 行</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
         </header>
+        <div class="fbar" id="logFilter">
+          <input id="logQ" type="search" placeholder="搜索日志关键词（按 text 包含匹配）" aria-label="搜索运行日志">
+          <span class="grow"></span>
+          <span class="flab" id="logCount"></span>
+          <select id="logPageSize" aria-label="每页条数">
+            <option value="50">50 / 页</option>
+            <option value="100" selected>100 / 页</option>
+            <option value="200">200 / 页</option>
+            <option value="0">全部</option>
+          </select>
+          <button class="xs ghost" id="logPrev" aria-label="上一页">‹</button>
+          <span class="flab" id="logPageInfo">1 / 1</span>
+          <button class="xs ghost" id="logNext" aria-label="下一页">›</button>
+        </div>
         <pre id="logBox"></pre>
       </div>
 
@@ -1276,13 +1326,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="creditNote">—</span>
         </header>
-        <div class="fbar">
+        <div class="fbar" id="creditFilter">
+          <select id="creditAccount" aria-label="按账号筛选">
+            <option value="">全部账号</option>
+          </select>
           <select id="creditLimit" aria-label="读取条数">
             <option value="100" selected>最近 100 条</option>
             <option value="300">最近 300 条</option>
             <option value="1000">最近 1000 条</option>
           </select>
           <span class="grow"></span>
+          <span class="flab" id="creditCount"></span>
+          <select id="creditPageSize" aria-label="每页条数">
+            <option value="50">50 / 页</option>
+            <option value="100" selected>100 / 页</option>
+            <option value="200">200 / 页</option>
+            <option value="0">全部</option>
+          </select>
+          <button class="xs ghost" id="creditPrev" aria-label="上一页">‹</button>
+          <span class="flab" id="creditPageInfo">1 / 1</span>
+          <button class="xs ghost" id="creditNext" aria-label="下一页">›</button>
           <button class="xs" id="btnCreditReload">重新读取</button>
         </div>
         <div class="tbl-wrap">
