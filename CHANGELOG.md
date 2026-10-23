@@ -46,7 +46,7 @@
 
 - 新增测试：scheduler 11 + cmd/server 1 + panel tag 5 + notify 12 + 前端 4/扩展 3；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
 - 前端工程化检查：`panel frontend check: OK (app.js=269.4KB, mobile.js=12.6KB, index.html=94.8KB)`
-- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v231.md`）
+- QA 独立验证（HEAD `0bd0826`）：**252 项检查全 PASS，P0=0 / P1=0**——verify-pro 28/28、v2.0.1 回归 28/28、v2.1 回归 42/42、v2.2 回归 25/25、v2.3 回归 24/24、新增 verify-v231 28/28（前端检查脚本/CI/标签筛选 E2E/meta tags/ETag/通知渠道 wecom+telegram+bark/缺 chat_id 启动失败/checkin_concurrency 热更新）、独立前端 harness 53/53（0 warning）、真实浏览器 11/11、320px/375px 各 13/13；调度器 #11 单测 23 PASS；详见 `D:\dsh\tmp\verify-final-v231.md`
 
 ---
 

@@ -137,6 +137,9 @@ services:
 - v2.3.1 重试分层：429 由 scheduler 重试 1 次；5xx/网络由 upstream 客户端既有重试；4xx 不重试。**不要在两处同时加重试**（会 3×2 放大）。
 - v2.3.1 标签筛选匹配大小写不敏感；`GET meta/tags` 展示拼写=uid 序首个出现的原始拼写（稳定但非最近编辑值）；暂不支持「无标签」筛选（`tag=`=不筛选）。
 - v2.3.1 CI 前端门禁脚本 `scripts/panel_frontend_check.mjs`：改 app.js/index.html 后本地先跑，失败会指出缺失 id/超预算/非法路径。
+- v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。
+- v2.3.1 `meta/tags` 展示拼写取 uid 升序首个出现的写法（如 VIP），匹配本身大小写不敏感；如需统一小写展示可后续归一。
+- v2.3.1 `schedule.checkin_concurrency` 热更新只影响**下一轮**签到（在途 worker 不打断）；`notify.channel` 未知值仅 WARN 关闭通知，而 telegram 缺 chat_id 是启动 fail-fast（口径差异，见 config.normalize）。
 - v2.3.0 Job 触发/取消**暂未进入面板操作审计**（依赖 jobs.json 与 task_runs 追溯）；如需审计可后续加 `jobs_run/job_cancel` action。
 - v2.3.0 备注迁移逐条 PUT：旧本机备注很多时首次打开会产生 N 个请求（当前规模可接受；后续可加批量导入接口）。
 - v2.3.0 Webhook 失败只重试 1 次后 WARN（不落盘待发）；data 允许 ≥7 字段（含 log_tail 摘要时更大），接收端应容忍额外字段。
