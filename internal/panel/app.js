@@ -454,14 +454,23 @@ function hitCountLabel(shown, total, unit) {
   return shown === total ? total + ' ' + unit : '命中 ' + shown + ' / ' + total + ' ' + unit;
 }
 
+/* dotaskBusy 正在执行「做任务」的 uid 集合。
+   5s 轮询会把 #accBody 整块 innerHTML 重建，只改被点击的那个按钮节点会丢状态，
+   按钮看起来又能点（服务端 per-account 锁会回 409，但交互上像卡住/可重复触发）。
+   渲染时查这个集合：进行中的账号直接渲染成 disabled + 「做任务中…」。 */
+const dotaskBusy = new Set();
+
 /* accDoTaskBtn 账号行「做任务」按钮：对单账号执行全部可自动任务（后端
    POST /accounts/{uid}/tasks/run，同步接口，约 1-2 分钟）。企业版没有个人成长
    体系（后端 200 + ok:false 拒绝），与「签到」「任务」按钮同口径不渲染。
-   抽成纯函数便于 node harness 直接钉住「企业版不出按钮」的渲染条件。 */
+   抽成纯函数便于 node harness 直接钉住「企业版不出按钮 / 进行中不可重复点」的渲染条件。 */
 function accDoTaskBtn(s) {
   if (!s || s.enterprise) return '';
-  return '<button class="xs ghost" data-a="dotask" data-u="' + esc(s.uid) +
-    '" title="对该账号一键执行全部可自动任务（含真实对话，约 1-2 分钟）">做任务</button>';
+  const busy = dotaskBusy.has(s.uid);
+  return '<button class="xs ghost" data-a="dotask" data-u="' + esc(s.uid) + '"' +
+    (busy ? ' disabled' : '') +
+    ' title="对该账号一键执行全部可自动任务（含真实对话，约 1-2 分钟）">' +
+    (busy ? '做任务中…' : '做任务') + '</button>';
 }
 
 // 账号是否处于冷却（限流 / 熔断 / 连败降权），与行内状态判定一致。
@@ -770,6 +779,9 @@ async function loadOverview(quiet) {
 async function runAccountDotask(btn, uid) {
   if (!btn || !confirm('将对该账号依次执行全部可自动任务（含真实对话），预计 1-2 分钟。\n执行期间请勿关闭页面。确认继续？')) return;
   const label = btn.textContent;
+  // 标记进行中：5s 轮询重渲染 tbody 后 accDoTaskBtn 会据此继续渲染 disabled，
+  // 不会出现「按钮看起来又能点」的假可用态（服务端 per-account 锁会回 409）。
+  dotaskBusy.add(uid);
   btn.disabled = true;
   btn.textContent = '做任务中…';
   try {
@@ -789,6 +801,7 @@ async function runAccountDotask(btn, uid) {
   } catch (e) {
     toast('做任务失败：' + e.message, 'err');
   } finally {
+    dotaskBusy.delete(uid);
     btn.disabled = false;
     btn.textContent = label;
     loadOverview(true);   // 任务可能写了积分/进度，刷新首页统计

@@ -75,8 +75,10 @@
 - README 改为 Pro 版说明；新增本 CHANGELOG 与 `MAINTAINERS.md`（接手/部署/排障手册）
 - 新增 `UPGRADE_PROPOSALS.md`：15-20 条后续优化建议（性能 / 安全 / 可观测 / 账号运维 / 可靠性 / 工程质量 / 体验），按 P0/P1/P2 分级
 - 质量门禁（2026-10-24 冻结验证）：`go build ./...` · `go vet ./...` · `go test -count=1 ./...`（20 个包全绿）通过；`node --check app.js/mobile.js` 通过
-- 新增测试：Go 6 个（`tasks/run` 路由/未知 uid/企业版/无凭证/账号忙 409/summary 计数）+ 前端 node harness 11 个（分页边界、筛选计数、补偿移除反向守卫、做任务按钮与交互 5 分支、任务队列筛选、控件接线、渲染器冒烟）；接线测试当场抓到并修复「队列分页控件 id 与 HTML 不一致」的真 bug
-- QA 独立验证 `verify-pro.ps1`：25 项全 PASS（本地起服务：`/healthz` 身份与 X-Service、面板标题、overview version=2.0.0-pro、无 token 401、补偿路由 404、tasks/run 未知 uid 404、安全响应头、日志无 panic）
+- 新增测试：Go 7 个（`tasks/run` 路由/未知 uid/企业版/无凭证/账号忙 409/summary 计数 + 账号池三 tab 结构契约）+ 前端 node harness 11 个（分页边界、筛选计数、补偿移除反向守卫、做任务按钮与交互 5 分支、任务队列筛选、控件接线、渲染器冒烟）；接线测试当场抓到并修复「队列分页控件 id 与 HTML 不一致」的真 bug
+- QA 独立验证 `verify-pro.ps1`：26 项全 PASS（本地起服务：`/healthz` 身份与 X-Service、面板标题、overview version=2.0.0-pro、无 token 401、补偿路由 404、tasks/run 未知 uid 404、安全响应头、日志无 panic）
+- 保留并锁定账号池三个二级 tab（账号池 / 模型锁池 / 积分到期）：`tabs_test.go` 钉住结构与顺序，QA 冒烟 C11 + 真实浏览器点击双重验证
+- QA 复核后修补：窄屏移动端「做任务」按钮文案裁切（`ACT_SHORT` 增加 3 字映射 + 映射优先于长度阈值）、进行中按钮被 5s 轮询重渲染后误恢复可点击（`dotaskBusy` 集合）、README 请求体上限文档自相矛盾（8 MiB vs 不限 / WB2A_MAX_BODY_MB 已于上游移除）
 - 旧 fork 的 `LOCAL_CHANGES.md` 内容并入 [MAINTAINERS.md](MAINTAINERS.md) 并删除该文件
 
 ---

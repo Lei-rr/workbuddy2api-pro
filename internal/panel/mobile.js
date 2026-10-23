@@ -91,16 +91,23 @@ function labelTables() {
   document.querySelectorAll('table').forEach(labelTable);
 }
 /* 账号卡底部的操作按钮要在一行里平分宽度（设计要求：全部按钮单行）。上游按钮文案会变长
-   （v1.12.0 起多了「暂停选号」）：320px 下 6 个按钮一行每个只有 ~40px，4 个字放不下、
-   文字被硬裁。这里把超过 3 个字的文案压到 2 个字，完整文案挂到 title，保持单行不裁字。 */
-const ACT_SHORT = { '暂停选号': '暂停', '恢复选号': '恢复' };
+   （v1.12.0 起多了「暂停选号」），本 fork 又多了「做任务」：320px 下 8 个按钮一行每个
+   只有 ~28px，2 个中文字已接近上限、3 个字必被硬裁。这里把 3 字及以上（或命中显式映射）
+   的文案压到 2 个字，完整文案挂到 title，保持单行不裁字。 */
+const ACT_SHORT = {
+  '暂停选号': '暂停', '恢复选号': '恢复',
+  '做任务': '任务', '做任务中…': '执行',   // 做任务中… = 单账号任务执行中的按钮态
+};
 function shortenActLabels() {
   if (!MOBILE_MQ.matches) return;
   for (const b of document.querySelectorAll('.acc .acts button')) {
     const t = (b.textContent || '').trim();
-    if (t.length <= 3) continue;
+    // 显式映射优先于长度阈值：「做任务」正好 3 字，按旧阈值(≥4 才缩短)不会被缩短，
+    // 320px 下会被裁（QA P1-1）；「做任务中…」同理。
+    const short = ACT_SHORT[t];
+    if (!short && t.length <= 3) continue;
     if (!b.title) b.title = t;
-    b.textContent = ACT_SHORT[t] || t.slice(0, 2);
+    b.textContent = short || t.slice(0, 2);
   }
 }
 /* 一次重渲染会连发多条 mutation（整段 tbody 换掉），合并成一次批处理。 */

@@ -75,6 +75,8 @@
 | 面板 API 基建缺口 | 无 gzip、无 ETag、无 `/metrics`、无 `/readyz`、无审计、无限速（grep 为 0） | 本次代码检索 |
 | 调度器心跳 | 单 goroutine 主循环 + 阻塞式 `runBatch`，跨时点不补跑 | `scheduler.go Run/runBatch/nextFire` |
 
+> 注：本节为起草时快照（2026-10-24 00:30，HEAD `3bd2f82` + 在途改动）。此后新增 `tabs_test.go`、前端 11 个 node harness 用例并修订少量文档，前端行数与测试数量有轻微漂移，不影响结论与优先级。
+
 ### 1.2 痛点 → 建议索引
 
 | 痛点 | 对应建议 |

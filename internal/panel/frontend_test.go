@@ -1855,24 +1855,37 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
-const start = src.indexOf('function accDoTaskBtn');
+const start = src.indexOf('const dotaskBusy = new Set();');
 const end = src.indexOf('// 账号是否处于冷却');
 if ([escStart, escEnd, start, end].some(v => v < 0) || escEnd < escStart || end < start)
   throw new Error('dotask helper not found');
 const ctx = { String };
 vm.createContext(ctx);
-vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) + '\nthis.accDoTaskBtn = accDoTaskBtn;', ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) +
+  '\nthis.accDoTaskBtn = accDoTaskBtn; this.markBusy = u => dotaskBusy.add(u); this.clearBusy = u => dotaskBusy.delete(u);', ctx);
 const normal = ctx.accDoTaskBtn({ uid: 'uid-1' });
 const bad = ctx.accDoTaskBtn({ uid: 'a"<b>' });
+// 进行中（5s 轮询重渲染后）必须仍是 disabled + 「做任务中…」，且不影响其他账号。
+ctx.markBusy('uid-1');
+const busy = ctx.accDoTaskBtn({ uid: 'uid-1' });
+const other = ctx.accDoTaskBtn({ uid: 'uid-3' });
+ctx.clearBusy('uid-1');
 process.stdout.write(JSON.stringify({
   normalHasBtn: normal.indexOf('data-a="dotask"') >= 0,
   normalHasUid: normal.indexOf('data-u="uid-1"') >= 0,
   normalHasLabel: normal.indexOf('做任务') >= 0,
+  normalEnabled: normal.indexOf('disabled') < 0,
+  busyDisabled: busy.indexOf('disabled') >= 0,
+  busyLabel: busy.indexOf('做任务中…') >= 0,
+  busyUidKept: busy.indexOf('data-u="uid-1"') >= 0,
+  otherEnabled: other.indexOf('disabled') < 0 && other.indexOf('做任务中…') < 0,
   enterpriseEmpty: ctx.accDoTaskBtn({ uid: 'uid-2', enterprise: true }) === '',
   nilEmpty: ctx.accDoTaskBtn(null) === '',
   xssEscaped: bad.indexOf('<b>') < 0 && bad.indexOf('&lt;b&gt;') >= 0 && bad.indexOf('&quot;') >= 0,
 }));`
-	want := `{"normalHasBtn":true,"normalHasUid":true,"normalHasLabel":true,"enterpriseEmpty":true,"nilEmpty":true,"xssEscaped":true}`
+	want := `{"normalHasBtn":true,"normalHasUid":true,"normalHasLabel":true,"normalEnabled":true,` +
+		`"busyDisabled":true,"busyLabel":true,"busyUidKept":true,"otherEnabled":true,` +
+		`"enterpriseEmpty":true,"nilEmpty":true,"xssEscaped":true}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("做任务按钮渲染=%s\nwant %s", got, want)
 	}
@@ -2079,6 +2092,7 @@ const ctx = {
   api: async (path, opts) => { apiCalls.push([path, opts && opts.method]); return apiImpl(path, opts); },
   toast: (msg, cls) => toasts.push([msg, cls || '']),
   loadOverview: () => { overviewCalls++; },
+  dotaskBusy: new Set(),   // 进行中标记：轮询重渲染后按钮仍 disabled，完成/失败必须清空
   encodeURIComponent, Number, String, Object, Array,
 };
 vm.createContext(ctx);
@@ -2093,13 +2107,17 @@ const out = {};
   out.cancel = { calls: apiCalls.length, disabled: b.disabled, label: b.textContent, toasts: toasts.length };
   // ② 正常完成：1 done / 1 skipped / 1 error
   b = btn(); confirmAnswer = true; toasts.length = 0; overviewCalls = 0;
-  apiImpl = async () => ({ ok: true, uid: 'u-1',
-    results: [{ status: 'done' }, { status: 'skipped' }, { status: 'error' }],
-    summary: { total: 3, done: 1, skipped: 1, error: 1, claimed: 0 } });
+  apiImpl = async () => {
+    out.busyDuring = ctx.dotaskBusy.has('u-1');   // 执行中：轮询重渲染应继续渲染 disabled
+    return ({ ok: true, uid: 'u-1',
+      results: [{ status: 'done' }, { status: 'skipped' }, { status: 'error' }],
+      summary: { total: 3, done: 1, skipped: 1, error: 1, claimed: 0 } });
+  };
   await ctx.runAccountDotask(b, 'u-1');
   out.ok = { call: apiCalls.length ? apiCalls[0][0] : '', method: apiCalls.length ? apiCalls[0][1] : '',
     toast: toasts.length ? toasts[0][0] : '', cls: toasts.length ? toasts[0][1] : '',
     label: b.textContent, disabled: b.disabled, overview: overviewCalls };
+  out.busyAfterOk = ctx.dotaskBusy.size;   // 完成后必须清空，否则按钮永久 disabled
   // ③ 门控拒绝 200 + ok:false
   b = btn(); toasts.length = 0; overviewCalls = 0;
   apiImpl = async () => ({ ok: false, message: '该账号为企业版，无个人成长任务体系', results: [], summary: {} });
@@ -2116,15 +2134,19 @@ const out = {};
   apiImpl = async () => ({ ok: true, results: [], summary: { total: 0, done: 0, skipped: 0, error: 0 } });
   await ctx.runAccountDotask(b, 'u-4');
   out.empty = { toast: toasts.length ? toasts[0][0] : '', label: b.textContent };
+  out.busyEnd = ctx.dotaskBusy.size;   // 各分支（含抛错/门控拒绝）都不允许泄漏 busy 标记
   process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });`
 	want := `{"cancel":{"calls":0,"disabled":false,"label":"做任务","toasts":0},` +
+		`"busyDuring":true,` +
 		`"ok":{"call":"accounts/u-1/tasks/run","method":"POST",` +
 		`"toast":"做任务完成：成功 1 项，跳过 1 项，失败 1 项","cls":"err",` +
 		`"label":"做任务","disabled":false,"overview":1},` +
+		`"busyAfterOk":0,` +
 		`"reject":{"toast":"该账号为企业版，无个人成长任务体系","cls":"err","label":"做任务","overview":1},` +
 		`"fail":{"toast":"做任务失败：HTTP 409","cls":"err","label":"做任务"},` +
-		`"empty":{"toast":"没有可执行的任务（可能已全部完成）","label":"做任务"}}`
+		`"empty":{"toast":"没有可执行的任务（可能已全部完成）","label":"做任务"},` +
+		`"busyEnd":0}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("做任务交互=%s\nwant %s", got, want)
 	}
