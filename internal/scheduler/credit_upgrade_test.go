@@ -2,8 +2,9 @@ package scheduler
 
 // T4 升级场景集成测试（调度器侧）：并发全量余额刷新下的积分留痕一致性。
 //
-// RunBalanceRefreshNow 对每个账号各起一个 goroutine，观察者在各自调用栈上同步回调；
-// 账本必须做到「流水条数 = 各账号真实变化次数之和」，且重启读盘与内存一致。
+// RunBalanceRefreshNow 按有界并发（默认 8，v2.0.1 #10 起不再一号一 goroutine）
+// 刷新，观察者在各账号的调用栈上同步回调；账本必须做到「流水条数 = 各账号真实
+// 变化次数之和」，且重启读盘与内存一致。
 
 import (
 	"encoding/json"

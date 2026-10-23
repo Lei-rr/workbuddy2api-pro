@@ -27,9 +27,25 @@ type Config struct {
 	DNSServers []string `json:"dns_servers,omitempty"`
 
 	Panel struct {
+		// APIKey 面板独立密钥（与网关 /v1 的 api_key 分离，v2.0.1 #4）。
+		// 非空时面板（/panel/*）只认它；/v1/* 仍只认顶层 api_key，两者互不通用。
+		// 空 = 回落顶层 api_key（向后兼容：老配置行为完全不变）。
+		// 环境变量 WB2A_PANEL_KEY。装配期进入 panel.Config，变更需重启。
+		APIKey string `json:"api_key"`
+		// PollIntervalSec 面板前端轮询间隔（秒），默认 5，clamp 2-60。
+		// 经 /panel/api/overview 的 poll_interval_sec 下发给前端；面板保存后热生效。
+		PollIntervalSec int `json:"poll_interval_sec"`
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`
+
+	// Security 安全策略（v2.0.1 #4）。
+	Security struct {
+		// AllowAnonymous 显式允许「非回环监听 + 网关与面板都没有密钥」的匿名访问。
+		// 默认 false：这种组合会在启动时直接拒绝（防止把面板与 /v1 裸奔暴露到网络）。
+		// 仅回环监听（127.0.0.1 / ::1 / localhost）无需本开关即可免密钥自用。
+		AllowAnonymous bool `json:"allow_anonymous"`
+	} `json:"security"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -110,6 +126,22 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// 补跑窗口（v2.0.1 #11）：批次跨过后续计划时点后，若该任务族今天还没成功跑过、
+		// 且计划时点落在最近 catch_up_minutes 内 → 立即补跑一轮（防止保活/活跃整天漏跑）。
+		// 0 = 关闭补跑（保持旧的"错过就等明天"语义）。默认 120，clamp 0-720。
+		CatchUpMinutes int `json:"catch_up_minutes"`
+
+		// 余额后台刷新的并发上限（v2.0.1 #10）：默认 8，clamp 1-32。
+		// 0/负数回落 8；上限 32（1146 号场景下再高只会给上游风控送人头）。
+		BalanceRefreshConcurrency int `json:"balance_refresh_concurrency"`
+		// BalanceRefreshStartupDelay 启动后首次余额刷新的延迟（Go duration，默认 "30s"；
+		// "0" = 不延迟）：避免刚重启就与其它启动动作叠加对全池发起并发请求。
+		// 非法 duration 启动即报错（fail fast，不静默回落到默认）。
+		BalanceRefreshStartupDelay string `json:"balance_refresh_startup_delay"`
+		// BalanceRefreshStartupForce 账号数较大（>200）时是否仍执行启动首刷。
+		// 默认 false = 跳过首刷（交给周期刷新），避免 1146 号池重启瞬间打爆上游。
+		BalanceRefreshStartupForce bool `json:"balance_refresh_startup_force"`
 
 		// 任务补领清扫（issue #174）：周期把「已达标但未领奖」的成长任务领掉——
 		// 这条链路此前完全缺失（成长队列要求有自动动作、一键完成对达标任务直接跳过），
@@ -258,8 +290,10 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
-	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
-	ExpiringSoonDur        time.Duration `json:"-"`
+	// BalanceRefreshStartupDelayDur 解析后的启动首刷延迟（v2.0.1 #10）；0 = 不延迟。
+	BalanceRefreshStartupDelayDur time.Duration `json:"-"`
+	TaskSweepInterval             time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
+	ExpiringSoonDur               time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -277,7 +311,14 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Panel.PollIntervalSec = 5
 	c.Panel.PackageDetailLimit = 5
+	// Security.AllowAnonymous 缺省 false（零值即默认）：非回环监听 + 空密钥会启动失败。
+	// Schedule 里 v2.0.1 新增键的推荐值（scheduler 后续任务消费）。
+	c.Schedule.CatchUpMinutes = 120
+	c.Schedule.BalanceRefreshConcurrency = 8
+	c.Schedule.BalanceRefreshStartupDelay = "30s"
+	c.Schedule.BalanceRefreshStartupForce = false
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -425,6 +466,38 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	// v2.0.1 配置基座（面板分离密钥 / 轮询间隔 / 匿名逃生门 / 调度器参数）。
+	if v := os.Getenv("WB2A_PANEL_KEY"); v != "" {
+		c.Panel.APIKey = v
+	}
+	if v := os.Getenv("WB2A_POLL_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Panel.PollIntervalSec = n
+		}
+	}
+	if v := os.Getenv("WB2A_ALLOW_ANONYMOUS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Security.AllowAnonymous = b
+		}
+	}
+	if v := os.Getenv("WB2A_CATCH_UP_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.CatchUpMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_BALANCE_REFRESH_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.BalanceRefreshConcurrency = n
+		}
+	}
+	if v := os.Getenv("WB2A_BALANCE_REFRESH_STARTUP_DELAY"); v != "" {
+		c.Schedule.BalanceRefreshStartupDelay = v
+	}
+	if v := os.Getenv("WB2A_BALANCE_REFRESH_STARTUP_FORCE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Schedule.BalanceRefreshStartupForce = b
+		}
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -500,6 +573,15 @@ func (c *Config) normalize() error {
 	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
+	}
+	// 面板轮询间隔（v2.0.1 #2）：缺省/<=0 回落 5s；越界 clamp 到 [2,60]——低于 2s
+	// 会把网关打成实际意义上的实时轮询，高于 60s 面板观感接近"卡死"。
+	if c.Panel.PollIntervalSec <= 0 {
+		c.Panel.PollIntervalSec = 5
+	} else if c.Panel.PollIntervalSec < 2 {
+		c.Panel.PollIntervalSec = 2
+	} else if c.Panel.PollIntervalSec > 60 {
+		c.Panel.PollIntervalSec = 60
 	}
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
@@ -635,6 +717,29 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// v2.0.1 #11 补跑窗口：0 = 关闭（合法）；负值钳 0；上限 720 分钟（12h）。
+	if c.Schedule.CatchUpMinutes < 0 {
+		c.Schedule.CatchUpMinutes = 0
+	} else if c.Schedule.CatchUpMinutes > 720 {
+		c.Schedule.CatchUpMinutes = 720
+	}
+	// v2.0.1 #10 余额刷新并发：0/负数回落默认 8；上限 32。
+	if c.Schedule.BalanceRefreshConcurrency <= 0 {
+		c.Schedule.BalanceRefreshConcurrency = 8
+	} else if c.Schedule.BalanceRefreshConcurrency > 32 {
+		c.Schedule.BalanceRefreshConcurrency = 32
+	}
+	// v2.0.1 #10 启动首刷延迟：空值回落默认 30s；"0" 合法（不延迟）；非法/负值
+	// fail fast（静默钳 0 会把保护悄悄关掉，处理风格同 server.read_timeout）。
+	if c.Schedule.BalanceRefreshStartupDelay == "" {
+		c.Schedule.BalanceRefreshStartupDelay = "30s"
+	}
+	if c.BalanceRefreshStartupDelayDur, err = time.ParseDuration(c.Schedule.BalanceRefreshStartupDelay); err != nil {
+		return fmt.Errorf("schedule.balance_refresh_startup_delay: %w", err)
+	}
+	if c.BalanceRefreshStartupDelayDur < 0 {
+		return fmt.Errorf("schedule.balance_refresh_startup_delay: 负时长 %q 无意义", c.Schedule.BalanceRefreshStartupDelay)
 	}
 	// 任务补领清扫：启用时 minutes<=0 回落默认 15；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.TaskSweepEnabled {

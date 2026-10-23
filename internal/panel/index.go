@@ -7,12 +7,20 @@
 //   - mobile.js   手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
 //
 // 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
-// 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
+// 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，声明不收搜索引擎（noindex），
+// 并声明不泄露 Referer 出去。
+//
+// 缓存（v2.0.1 #2）：app.js / mobile.js / mobile.css 内容随二进制固定 → 启动时按
+// SHA-256 算强 ETag + 1 小时公共缓存（must-revalidate 兜底），If-None-Match 命中回
+// 304；index.html 是"必须即时更新"的页面骨架 → 弱 ETag + Cache-Control: no-cache。
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
@@ -26,6 +34,72 @@ var mobileCSS []byte
 
 //go:embed mobile.js
 var mobileJS []byte
+
+// 静态资源 ETag 在包初始化时按嵌入内容计算（内容随二进制发布，运行期不变）：
+// 强 ETag 供脚本/样式使用（内容变化 → ETag 变 → 浏览器重新下载）；
+// index.html 用弱 ETag + no-cache（每次使用前回源校验，改版立即生效）。
+var (
+	indexHTMLEtag = weakAssetETag(indexHTML)
+	appJSEtag     = assetETag(appJS)
+	mobileCSSEtag = assetETag(mobileCSS)
+	mobileJSEtag  = assetETag(mobileJS)
+)
+
+// 缓冲策略常量：
+//   - 脚本/样式内容随二进制固定，允许浏览器缓存 1 小时；must-revalidate 保证过期后
+//     必须回来校验（ETag 命中 304 只花一个往返，改版后最多一次旧内容窗口）。
+//   - index.html 必须即时更新（面板功能依赖新页面结构），no-cache 每次校验弱 ETag。
+const (
+	cacheControlStatic = "public, max-age=3600, must-revalidate"
+	cacheControlIndex  = "no-cache"
+)
+
+// assetETag 返回强 ETag `"sha256-<hex>"`。
+func assetETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"sha256-` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// weakAssetETag 返回弱 ETag `W/"sha256-<hex>"`（语义：内容等价即可复用）。
+func weakAssetETag(body []byte) string {
+	return "W/" + assetETag(body)
+}
+
+// ifNoneMatch 判断 If-None-Match 是否命中给定 ETag（GET/HEAD 用弱比较：
+// 忽略 W/ 前缀；支持多值与 "*"）。
+func ifNoneMatch(r *http.Request, etag string) bool {
+	inm := r.Header.Get("If-None-Match")
+	if inm == "" {
+		return false
+	}
+	want := strings.TrimPrefix(etag, "W/")
+	for _, part := range strings.Split(inm, ",") {
+		p := strings.TrimSpace(part)
+		if p == "*" {
+			return true
+		}
+		if strings.TrimPrefix(p, "W/") == want {
+			return true
+		}
+	}
+	return false
+}
+
+// servePanelAsset 输出内嵌静态资源：先按 ETag 判断 304，再写出内容与缓存头。
+// 304 响应不带 Content-Type/Content-Length（RFC 9110 允许省略），但保留 ETag、
+// Cache-Control 与 Vary 供浏览器更新缓存元数据。
+func servePanelAsset(w http.ResponseWriter, r *http.Request, body []byte, contentType, etag, cacheControl string) {
+	h := w.Header()
+	h.Set("ETag", etag)
+	h.Set("Cache-Control", cacheControl)
+	if ifNoneMatch(r, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	h.Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -50,37 +124,32 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	// 面板是管理界面，不该被搜索引擎收录（v2.0.1 #2）。
+	w.Header().Set("X-Robots-Tag", "noindex")
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
+// no-cache + 弱 ETag：页面结构随版本更新，必须每次回源校验（304 时零传输）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	servePanelAsset(w, r, indexHTML, "text/html; charset=utf-8", indexHTMLEtag, cacheControlIndex)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	servePanelAsset(w, r, appJS, "text/javascript; charset=utf-8", appJSEtag, cacheControlStatic)
 }
 
 // mobileStyle 输出手机端适配样式（同源样式表，CSP style-src 'self' 加载）。
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileCSS)
+	servePanelAsset(w, r, mobileCSS, "text/css; charset=utf-8", mobileCSSEtag, cacheControlStatic)
 }
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileJS)
+	servePanelAsset(w, r, mobileJS, "text/javascript; charset=utf-8", mobileJSEtag, cacheControlStatic)
 }

@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -46,9 +47,19 @@ func travelDay(t time.Time) string {
 // 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
+// 本函数是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走 runTravel。
 func (s *Scheduler) RunTravelNow() {
+	s.runTravel(context.Background())
+}
+
+// runTravel 旅行巡检遍历（ctx 感知）：账号间限速与领养前置等待都改用 sleepCtx，
+// ctx 取消立即收尾（优雅停机不必等限速睡满，剩余账号留给下一轮）。
+func (s *Scheduler) runTravel(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -63,22 +74,27 @@ func (s *Scheduler) RunTravelNow() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 端点企业号 403；切换会话不计分），不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再巡检
+			}
 		}
 		first = false
-		s.travelOne(a)
+		s.travelOne(ctx, a)
+	}
+	if ctx.Err() == nil {
+		s.noteTaskDone(taskTravel, s.now())
 	}
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
-func (s *Scheduler) travelOne(a *auth.Auth) {
+func (s *Scheduler) travelOne(ctx context.Context, a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	if buddy == nil {
-		s.travelAdopt(a)
+		s.travelAdopt(ctx, a)
 		return
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
@@ -132,15 +148,15 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 // 400 "first_buddy task not completed yet"——该门槛的真实来源是"当日无活跃上报"，
 // 不是账号问题（report.go 注释亦明确「解锁 first_buddy 任务（领养前置）」）。
 // conversation 门槛未达标仍属预期行为，记一次当日已试后静默跳过，不再重试。
-func (s *Scheduler) travelAdopt(a *auth.Auth) {
+func (s *Scheduler) travelAdopt(ctx context.Context, a *auth.Auth) {
 	if s.adoptTriedToday(a.UID) {
 		return
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
 	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
-	} else {
-		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
+	} else if !sleepCtx(ctx, adoptReportGap) {
+		return // ctx 取消：不再等前置上报的落地间隔，放弃本号剩余动作（下轮再试）
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
 		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)

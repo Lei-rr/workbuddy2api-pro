@@ -8,7 +8,9 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
-let refTimer = null;
+/* 轮询状态（refTimer / refFailures / pollBaseSec / pageHidden …）集中在文件后段
+   「轮询治理」区声明：只有该区的函数与 api()/loadOverview() 在**调用期**访问它们，
+   放后段不会踩 TDZ；同时便于 node harness 按注释锚点切片测试。 */
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
@@ -50,9 +52,13 @@ async function api(path, opts = {}) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  // 401 = 面板密钥（panel.api_key，未单配时回落网关 api_key）无效。统一交给
+  // onAuthRequired：停掉自动轮询（否则后台标签页每 5s 刷一次 401、反复抢焦点弹
+  // 密钥框），并保证一次失败周期里密钥框只自动弹一次。
+  if (r.status === 401) { onAuthRequired(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  keyPrompted = false;   // 鉴权恢复正常：之后再失效（如换了 panel.api_key）可再自动提示一次
   return d;
 }
 function toast(msg, cls) {
@@ -328,7 +334,25 @@ function formatRate(rate) {
 }
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+/* 面板鉴权用的是「面板密钥」panel.api_key；未单配时后端回落到网关 api_key。
+   localStorage 键（wb2api.key）沿用不改：老浏览器里存的就是当时生效的那把密钥
+   （旧版本是网关 key，分离后可能是面板 key），继续用它发 Authorization 即可。
+
+   openKey 只在 401 时由 onAuthRequired 调用；本机已存过密钥说明「原本能进、后来
+   401」——多半是服务端换了 panel.api_key（升级后分离密钥的典型场景），提示文案
+   要明确指向它，而不是笼统的「密钥不正确」。 */
+function openKey() {
+  const had = !!localStorage.getItem(LS_KEY);
+  const err = $('keyErr');
+  if (err) {
+    err.textContent = had
+      ? '面板密钥可能已变更（panel.api_key），请重新输入。'
+      : '密钥不正确，请重试。';
+    err.hidden = !had;
+  }
+  $('keyVeil').classList.add('on');
+  setTimeout(() => $('keyInput').focus(), 60);
+}
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -337,7 +361,7 @@ $('btnKey').onclick = async () => {
     await api('overview');
     $('keyErr').hidden = true;
     $('keyVeil').classList.remove('on');
-    start();
+    start();   // 手动保存密钥成功 → 重置 401 停表状态并重启轮询
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
@@ -742,6 +766,9 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    // 轮询间隔随 overview 下发（后端 panel.poll_interval_sec，默认 5，clamp 2-60）：
+    // 非法值回落 5。每次成功都刷新一次，面板里改完配置后下一轮 polls 自动跟上。
+    pollBaseSec = pollIntervalSec(d.poll_interval_sec);
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -768,7 +795,8 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+    return true;   // 轮询据此判断本轮成功/失败（失败才退避）
+  } catch (e) { if (!quiet) toast(e.message, 'err'); return false; }
 }
 
 /* runAccountDotask 账号行「做任务」：单账号执行全部可自动任务。
@@ -1233,7 +1261,8 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + filterLogs(logAll, logCh, '').length + ' 行';
     renderCreditHistory(credit);
-  } catch (e) { /* 概览已提示 */ }
+    return true;   // 轮询据此判断本轮成功/失败（失败才退避）
+  } catch (e) { /* 概览已提示 */ return false; }
 }
 
 function renderRequestMetrics(m, entries) {
@@ -1572,12 +1601,24 @@ const CFG_MAP = {
   domestic_account_order: ['pool', 'account_order', 'domestic'],
   international_account_order: ['pool', 'account_order', 'international'],
   listen: ['listen'], api_key: ['api_key'],
+  // v2.0.1 #4：面板密钥与网关密钥分离。panel.api_key 为空 = 回落网关 api_key
+  // （向后兼容），后端启动日志会提示「面板与网关共用密钥，建议分离」。
+  panel_api_key: ['panel', 'api_key'],
+  // v2.0.1 #2：面板轮询间隔（秒），overview 响应带出，默认 5 / clamp 2-60。
+  poll_interval_sec: ['panel', 'poll_interval_sec'],
+  // v2.0.1 #4：非回环监听 + 密钥全空时拒绝启动的显式逃生门（默认 false）。
+  allow_anonymous: ['security', 'allow_anonymous'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  // v2.0.1 #10/#11 子项：全池余额刷新的并发闸门/启动首刷保护，定时任务补跑窗口。
+  balance_refresh_concurrency: ['schedule', 'balance_refresh_concurrency'],
+  balance_refresh_startup_delay: ['schedule', 'balance_refresh_startup_delay'],
+  balance_refresh_startup_force: ['schedule', 'balance_refresh_startup_force'],
+  catch_up_minutes: ['schedule', 'catch_up_minutes'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
@@ -1606,10 +1647,13 @@ const CFG_MAP = {
  * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
  * 而值其实没变（issue #102 附带发现 2：user_agent 清空后 config.json 里仍是旧值）。
  *
- * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
+ * 刻意不含顶层 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
+ *
+ * panel_api_key（panel.api_key）例外：它的空串语义是「回落到网关 api_key」，
+ * 不关闭鉴权，所以必须能照发空串（否则面板与网关分离后就再也切不回来了）。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'panel_api_key']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1659,11 +1703,15 @@ function collectConfig() {
 /* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
    ParseDuration 语法（30m / 2h / 600s / 1h30m，可组合可带小数）。与后端
    config.go normalize() 的 time.ParseDuration 同口径，脏值在前端就地标红，
-   不再等到保存被拒。 */
-const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
+   不再等到保存被拒。
+   单独放行裸 "0"：Go 的 ParseDuration("0") 合法（= 0 时长），多个字段用
+   "0 = 关闭/不延迟"表意（expiring_soon、balance_refresh_startup_delay）；
+   旧正则只认带单位的写法，会把合法的 0 误标红。 */
+const DURATION_RE = /^(0|(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+)$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
-const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'balance_refresh_startup_delay'];
+const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m（0 = 关闭/不延迟）';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
   if (!el) return false;
@@ -1702,13 +1750,29 @@ $('cfgForm').onsubmit = async ev => {
   }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
+  // 保存前的面板密钥现值：用于判断本次是否真的改了 panel.api_key。
+  const prevPanelKey = String(dig(cfgLoaded, ['panel', 'api_key']) || '');
   try {
     const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
     const n = (r.restart_required || []).length;
     toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-    // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    const k = $('cfgKey').value.trim();
-    if (k) localStorage.setItem(LS_KEY, k);
+    // 本机凭据（localStorage: wb2api.key）同步：
+    //  - 网关 api_key 是热生效的，和旧版一样立即沿用新值；
+    //  - 面板密钥 panel.api_key 的生效点是重启后（后端把它列为 restart_required），
+    //    改动含「清空回落网关 key」两种方向。若保存后立刻把本地凭据换成新值，重启
+    //    前每次请求都会 401，所以改动时保持旧凭据；重启后旧凭据 401，密钥框会提示
+    //    「面板密钥可能已变更（panel.api_key）」，用户重新输入即可。
+    const panelKey = (($('cfgPanelKey') || {}).value || '').trim();
+    const gatewayKey = $('cfgKey').value.trim();
+    if (panelKey === prevPanelKey) {
+      const effective = panelKey || gatewayKey;
+      if (effective) localStorage.setItem(LS_KEY, effective);
+    }
+    // 保存成功说明当前凭据仍有效：清掉 401 停表状态，恢复自动轮询。
+    pollAuthStopped = false;
+    keyPrompted = false;
+    refFailures = 0;
+    if (!refTimer && !refInFlight) scheduleNextPoll();
     loadConfig();
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
@@ -1810,26 +1874,159 @@ $('importFile').onchange = async () => {
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
-  b.disabled = true; b.textContent = '刷新中…';
+  const label = b.textContent;
+  b.disabled = true; b.textContent = '已提交…';
   try {
-    await api('balance_all', { method: 'POST' });
-    await loadOverview(true);
-    toast('余额已从上游刷新', 'ok');
-  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { b.disabled = false; b.textContent = '刷新'; }
+    // v2.0.1 #10：后端把 balance_all 改成异步——置位单飞闸门后立即返回
+    // {ok:true,started:true}，不再同步等全池刷完（1146 个账号会让反代 504）。
+    // 所以这里只等「提交成功」；2.5s 后补拉一次 overview 让首批余额先出现，
+    // 剩下的由常规轮询继续刷新。重复点击的 409（同类任务正在执行）由 api()
+    // 抛出，catch 直接展示后端 error 文案。
+    const r = await api('balance_all', { method: 'POST' });
+    if (r && r.ok === false) { toast(r.error || r.message || '刷新提交失败', 'err'); return; }
+    toast('已开始刷新余额（后台执行，完成后自动刷新）', 'ok');
+    setTimeout(() => loadOverview(true), 2500);
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = label; }
   if (view === 'logs') loadLogs();
 };
 
-/* ── 轮询 ─────────────────────────────────────────────────────────── */
-function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
-  else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') reattachQueueView();
+/* ── 轮询治理（v2.0.1 #2）─────────────────────────────────────────────
+   旧实现是 setInterval(refreshVisible, 5000)，有三处浪费（UPGRADE_PROPOSALS
+   #2）：页面隐藏照跑、失败不退避、401 后每 5s 重试并反复抢焦点弹密钥框。
+   现改为「自调度 setTimeout」：
+     - 基础间隔取 overview.poll_interval_sec（后端 panel.poll_interval_sec，
+       默认 5、clamp 2-60、非法回落 5）；首次 overview 成功后才有定时器；
+     - 页面隐藏 → 清定时器、不发请求；恢复可见 → 立即刷一次再重新排期；
+     - 连续失败按 5s → 10s → 30s → 60s 退避（默认基础 5s 时；即基础间隔的
+       1×/2×/6×/12×，上限 60s），成功恢复基础间隔；
+     - 401 → 停表不自动重试，密钥框每个失败周期只自动弹一次；用户手动保存
+       密钥（btnKey）后 start() 恢复；
+     - 每次排期在退避间隔上 ±20% 抖动，避免多标签页同频打后端。
+   纯函数（pollIntervalSec / pollBackoffSec / nextPollDelay /
+   pollVisibilityAction）集中在本段前部，node harness 可按锚点切片断言。 */
+
+let refTimer = null;          // 下一次轮询的 setTimeout 句柄（不是 setInterval）
+let refFailures = 0;          // 连续轮询失败次数（成功清零，驱动退避）
+let refInFlight = false;      // 一轮轮询请求在途（响应慢时避免叠加请求）
+let pollBaseSec = 5;          // 基础轮询间隔（秒），来自 overview.poll_interval_sec
+let pollArmed = false;        // 已进入轮询状态（start() 置位）
+let pollAuthStopped = false;  // 401：暂停自动轮询，等用户手动保存密钥
+let keyPrompted = false;      // 本失败周期密钥框是否已自动弹过（只弹一次）
+let pageHidden = !!(document && document.visibilityState === 'hidden'); // 隐藏即暂停
+
+/* pollIntervalSec 解析 overview.poll_interval_sec → 秒。
+   非法值（缺省/null/空串/非数字）回落 5；合法但越界的 clamp 到 2-60。 */
+function pollIntervalSec(v) {
+  if (v === undefined || v === null || v === '') return 5;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 5;
+  return Math.min(60, Math.max(2, Math.round(n)));
+}
+
+/* pollBackoffSec 连续失败后的退避间隔（秒，未含抖动）：
+   失败 1 次仍按基础间隔重试（瞬时抖动不必惩罚），之后按 2× / 6× / 12× 基础
+   间隔退避；默认基础 5s 时正好是提案里的 5s → 10s → 30s → 60s。 */
+function pollBackoffSec(baseSec, failureCount) {
+  const base = pollIntervalSec(baseSec);
+  const f = Math.max(0, Math.floor(Number(failureCount) || 0));
+  const mult = f <= 1 ? 1 : f === 2 ? 2 : f === 3 ? 6 : 12;
+  return Math.min(60, base * mult);
+}
+
+/* nextPollDelay 返回下一次 setTimeout 的毫秒数：退避间隔 ±20% 抖动。
+   rand01 ∈ [0,1] 由调用方注入（测试可确定化）：0 → -20%，0.5 → 不抖，1 → +20%。
+   抖动后仍封顶 60s —— 退避上限是「实际间隔」的上限，不因抖动被突破。 */
+function nextPollDelay(baseSec, failureCount, rand01) {
+  const base = pollBackoffSec(baseSec, failureCount);
+  const r = Number(rand01);
+  const rand = Number.isFinite(r) ? Math.min(1, Math.max(0, r)) : 0.5;
+  const ms = Math.round(base * (0.8 + 0.4 * rand) * 1000);
+  return Math.min(60000, ms);
+}
+
+/* pollVisibilityAction 可见性状态机：hidden↔visible 的状态转换 → 动作。
+   用「上一次的 hidden 状态」判断，重复的同向 visibilitychange 不重复启停。 */
+function pollVisibilityAction(hiddenNow, wasHidden) {
+  if (!!hiddenNow === !!wasHidden) return 'noop';
+  return hiddenNow ? 'pause' : 'resume';
+}
+
+function stopPollTimer() {
+  if (refTimer) { clearTimeout(refTimer); refTimer = null; }
+}
+
+/* scheduleNextPoll 安排下一次轮询。隐藏 / 401 / 未启动时只清表不排期，
+   因此不会发请求——这是「页面隐藏后流量归零」的实现点。 */
+function scheduleNextPoll() {
+  stopPollTimer();
+  if (!pollArmed || pageHidden || pollAuthStopped) return;
+  refTimer = setTimeout(pollTick, nextPollDelay(pollBaseSec, refFailures, Math.random()));
+}
+
+/* pollTick 一轮轮询：按当前视图分派（accounts/logs/taskscenter，语义与原
+   refreshVisible 一致）。请求返回后才排下一次，天然不重叠；refInFlight 再兜
+   一层「上一轮还没回来、其它路径又触发排期」的并发。 */
+async function pollTick() {
+  refTimer = null;
+  if (!pollArmed || pageHidden || pollAuthStopped) return;
+  if (refInFlight) { scheduleNextPoll(); return; }
+  refInFlight = true;
+  let ok = true;
+  try {
+    ok = (await refreshVisible()) !== false;
+  } catch (e) {
+    ok = false;
+  } finally {
+    refInFlight = false;
+  }
+  if (pollAuthStopped) return;          // 401：不自动重试，等用户手动保存密钥
+  if (ok) refFailures = 0; else refFailures += 1;
+  scheduleNextPoll();
+}
+
+/* onAuthRequired 401 统一处理：停止自动轮询（避免后台标签页反复弹密钥框），
+   密钥框每个失败周期只自动弹一次；btnKey 保存成功 / 配置保存成功后恢复。 */
+function onAuthRequired() {
+  pollAuthStopped = true;
+  stopPollTimer();
+  if (keyPrompted) return;
+  keyPrompted = true;
+  openKey();
+}
+
+/* handleVisibilityChange 可见性切换：隐藏只清定时器（不请求）；恢复立即跑
+   一轮（pollTick 会顺带重新排期）。返回 Promise 便于 node harness 等待。 */
+function handleVisibilityChange() {
+  const hiddenNow = !!(document && document.visibilityState === 'hidden');
+  const action = pollVisibilityAction(hiddenNow, pageHidden);
+  if (action === 'noop') return Promise.resolve();
+  pageHidden = hiddenNow;
+  if (action === 'pause') { stopPollTimer(); return Promise.resolve(); }
+  return pollArmed ? pollTick() : Promise.resolve();
+}
+if (document && document.addEventListener) document.addEventListener('visibilitychange', handleVisibilityChange);
+
+/* refreshVisible 保留原有视图分派语义（accounts / logs / taskscenter）；
+   返回值只服务轮询失败退避：false = 本轮失败。 */
+async function refreshVisible() {
+  if (view === 'accounts') return loadOverview(true);
+  if (view === 'logs') return loadLogs();
+  if (view === 'taskscenter') { reattachQueueView(); return true; }
+  return true;
 }
 function start() {
-  loadOverview(true);
-  if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  pollArmed = true;
+  pollAuthStopped = false;
+  keyPrompted = false;
+  refFailures = 0;
+  stopPollTimer();
+  // 首查：概览数据 + poll_interval_sec（loadOverview 内解析并更新 pollBaseSec）。
+  // 首次成功后按该值建立定时器；首查失败也要排一次重试，否则永远停在空白页。
+  loadOverview(true).then(ok => {
+    if (ok === false) refFailures += 1;
+    scheduleNextPoll();
+  });
   checkAuthGate();
 }
 async function checkAuthGate() {

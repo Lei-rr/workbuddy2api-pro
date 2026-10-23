@@ -859,3 +859,230 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// v2.0.1 配置基座（#2 / #4 / #10 / #11 共用）：键名与 JSON schema 契约。
+// ---------------------------------------------------------------------------
+
+// TestPanelConfigV201 面板配置：api_key 分离、poll_interval_sec 默认 5 / clamp 2-60、
+// security.allow_anonymous 默认 false。
+func TestPanelConfigV201(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Panel.APIKey != "" {
+		t.Errorf("default panel.api_key=%q want empty (回落网关 key)", c.Panel.APIKey)
+	}
+	if c.Panel.PollIntervalSec != 5 {
+		t.Errorf("default panel.poll_interval_sec=%d want 5", c.Panel.PollIntervalSec)
+	}
+	if c.Security.AllowAnonymous {
+		t.Error("default security.allow_anonymous must be false")
+	}
+
+	got, err := ParseConfig([]byte(`{"panel":{"api_key":"sk-panel","poll_interval_sec":10},"security":{"allow_anonymous":true}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.Panel.APIKey != "sk-panel" || got.Panel.PollIntervalSec != 10 || !got.Security.AllowAnonymous {
+		t.Fatalf("parsed panel/security = %+v / %+v", got.Panel, got.Security)
+	}
+
+	// clamp：<2 → 2；<=0（显式 0）→ 默认 5；>60 → 60；边界保留。
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{`{"panel":{"poll_interval_sec":0}}`, 5},
+		{`{"panel":{"poll_interval_sec":-3}}`, 5},
+		{`{"panel":{"poll_interval_sec":1}}`, 2},
+		{`{"panel":{"poll_interval_sec":2}}`, 2},
+		{`{"panel":{"poll_interval_sec":60}}`, 60},
+		{`{"panel":{"poll_interval_sec":61}}`, 60},
+		{`{"panel":{"poll_interval_sec":10000}}`, 60},
+	} {
+		c, err := ParseConfig([]byte(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.body, err)
+		}
+		if c.Panel.PollIntervalSec != tc.want {
+			t.Errorf("%s: poll_interval_sec=%d want %d", tc.body, c.Panel.PollIntervalSec, tc.want)
+		}
+	}
+}
+
+// TestPanelConfigV201Env 面板/安全配置的环境变量覆盖（WB2A_PANEL_KEY 等）。
+func TestPanelConfigV201Env(t *testing.T) {
+	t.Setenv("WB2A_PANEL_KEY", "env-panel-key")
+	t.Setenv("WB2A_POLL_INTERVAL_SEC", "12")
+	t.Setenv("WB2A_ALLOW_ANONYMOUS", "true")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Panel.APIKey != "env-panel-key" {
+		t.Errorf("panel.api_key=%q want env-panel-key", c.Panel.APIKey)
+	}
+	if c.Panel.PollIntervalSec != 12 {
+		t.Errorf("panel.poll_interval_sec=%d want 12", c.Panel.PollIntervalSec)
+	}
+	if !c.Security.AllowAnonymous {
+		t.Error("security.allow_anonymous env ignored")
+	}
+}
+
+// TestScheduleConfigV201Defaults 调度器新键默认值（后续 #10/#11 任务复用这些字段名）。
+func TestScheduleConfigV201Defaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Schedule.CatchUpMinutes != 120 {
+		t.Errorf("default catch_up_minutes=%d want 120", c.Schedule.CatchUpMinutes)
+	}
+	if c.Schedule.BalanceRefreshConcurrency != 8 {
+		t.Errorf("default balance_refresh_concurrency=%d want 8", c.Schedule.BalanceRefreshConcurrency)
+	}
+	if c.Schedule.BalanceRefreshStartupDelay != "30s" || c.BalanceRefreshStartupDelayDur != 30*time.Second {
+		t.Errorf("default startup_delay=%q/%v want 30s", c.Schedule.BalanceRefreshStartupDelay, c.BalanceRefreshStartupDelayDur)
+	}
+	if c.Schedule.BalanceRefreshStartupForce {
+		t.Error("default balance_refresh_startup_force must be false")
+	}
+}
+
+// TestScheduleConfigV201Parsed 显式配置与 clamp 语义。
+func TestScheduleConfigV201Parsed(t *testing.T) {
+	got, err := ParseConfig([]byte(`{"schedule":{"catch_up_minutes":30,"balance_refresh_concurrency":16,"balance_refresh_startup_delay":"90s","balance_refresh_startup_force":true}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.Schedule.CatchUpMinutes != 30 || got.Schedule.BalanceRefreshConcurrency != 16 {
+		t.Errorf("parsed schedule = %+v", got.Schedule)
+	}
+	if got.BalanceRefreshStartupDelayDur != 90*time.Second || !got.Schedule.BalanceRefreshStartupForce {
+		t.Errorf("parsed startup = %q/%v force=%v",
+			got.Schedule.BalanceRefreshStartupDelay, got.BalanceRefreshStartupDelayDur, got.Schedule.BalanceRefreshStartupForce)
+	}
+
+	// "0" 是合法值：不延迟。
+	zero, err := ParseConfig([]byte(`{"schedule":{"balance_refresh_startup_delay":"0"}}`))
+	if err != nil {
+		t.Fatalf("parse zero delay: %v", err)
+	}
+	if zero.BalanceRefreshStartupDelayDur != 0 {
+		t.Errorf("zero delay=%v want 0", zero.BalanceRefreshStartupDelayDur)
+	}
+
+	// clamp：catch_up 负 → 0，>720 → 720；并发 0/负 → 8，>32 → 32。
+	for _, tc := range []struct {
+		body          string
+		catchUp, conc int
+	}{
+		{`{"schedule":{"catch_up_minutes":-5}}`, 0, 8},
+		{`{"schedule":{"catch_up_minutes":721}}`, 720, 8},
+		{`{"schedule":{"catch_up_minutes":720}}`, 720, 8},
+		{`{"schedule":{"balance_refresh_concurrency":0}}`, 120, 8},
+		{`{"schedule":{"balance_refresh_concurrency":-2}}`, 120, 8},
+		{`{"schedule":{"balance_refresh_concurrency":33}}`, 120, 32},
+	} {
+		c, err := ParseConfig([]byte(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.body, err)
+		}
+		if c.Schedule.CatchUpMinutes != tc.catchUp || c.Schedule.BalanceRefreshConcurrency != tc.conc {
+			t.Errorf("%s: catch_up=%d conc=%d want %d/%d", tc.body,
+				c.Schedule.CatchUpMinutes, c.Schedule.BalanceRefreshConcurrency, tc.catchUp, tc.conc)
+		}
+	}
+}
+
+// TestScheduleConfigV201InvalidDelay 非法/负 duration 启动即报错（不静默回落）。
+func TestScheduleConfigV201InvalidDelay(t *testing.T) {
+	for _, body := range []string{
+		`{"schedule":{"balance_refresh_startup_delay":"oops"}}`,
+		`{"schedule":{"balance_refresh_startup_delay":"-5s"}}`,
+	} {
+		if _, err := ParseConfig([]byte(body)); err == nil {
+			t.Fatalf("%s: want error", body)
+		} else if !strings.Contains(err.Error(), "balance_refresh_startup_delay") {
+			t.Errorf("%s: error should name the key: %v", body, err)
+		}
+	}
+}
+
+// TestScheduleConfigV201Env 调度器新键的环境变量覆盖。
+func TestScheduleConfigV201Env(t *testing.T) {
+	t.Setenv("WB2A_CATCH_UP_MINUTES", "45")
+	t.Setenv("WB2A_BALANCE_REFRESH_CONCURRENCY", "12")
+	t.Setenv("WB2A_BALANCE_REFRESH_STARTUP_DELAY", "45s")
+	t.Setenv("WB2A_BALANCE_REFRESH_STARTUP_FORCE", "true")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.CatchUpMinutes != 45 || c.Schedule.BalanceRefreshConcurrency != 12 {
+		t.Errorf("env schedule = %+v", c.Schedule)
+	}
+	if c.BalanceRefreshStartupDelayDur != 45*time.Second || !c.Schedule.BalanceRefreshStartupForce {
+		t.Errorf("env startup = %q/%v force=%v",
+			c.Schedule.BalanceRefreshStartupDelay, c.BalanceRefreshStartupDelayDur, c.Schedule.BalanceRefreshStartupForce)
+	}
+	// 非法 env duration 同一套 fail fast。
+	t.Setenv("WB2A_BALANCE_REFRESH_STARTUP_DELAY", "not-a-duration")
+	if _, err := Load(""); err == nil {
+		t.Fatal("invalid env startup delay should fail load")
+	}
+}
+
+// TestConfigExampleJSONParsesAndHasV201Keys config.example.json 必须与 Default+normalize
+// 同步（可直接加载），且包含 v2.0.1 新增的 7 个键（前端配置页按此渲染）。
+func TestConfigExampleJSONParsesAndHasV201Keys(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("read config.example.json: %v", err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("parse config.example.json: %v", err)
+	}
+	// 示例文件 api_key 是占位符 test_key：panel.api_key 留空（回落），不触发启动校验。
+	if c.Panel.PollIntervalSec != 5 {
+		t.Errorf("example panel.poll_interval_sec=%d want 5", c.Panel.PollIntervalSec)
+	}
+	if c.Security.AllowAnonymous {
+		t.Error("example security.allow_anonymous should be false")
+	}
+	if c.Schedule.CatchUpMinutes != 120 || c.Schedule.BalanceRefreshConcurrency != 8 {
+		t.Errorf("example schedule new keys = %+v", c.Schedule)
+	}
+	if c.BalanceRefreshStartupDelayDur != 30*time.Second || c.Schedule.BalanceRefreshStartupForce {
+		t.Errorf("example startup refresh = %q/%v force=%v",
+			c.Schedule.BalanceRefreshStartupDelay, c.BalanceRefreshStartupDelayDur, c.Schedule.BalanceRefreshStartupForce)
+	}
+	// 7 个键在原始 JSON 里必须真实存在（前端 frontend2 按这些 JSON 键名接线）。
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("re-parse example: %v", err)
+	}
+	var panel map[string]json.RawMessage
+	_ = json.Unmarshal(probe["panel"], &panel)
+	for _, k := range []string{"api_key", "poll_interval_sec"} {
+		if _, ok := panel[k]; !ok {
+			t.Errorf("config.example.json missing panel.%s", k)
+		}
+	}
+	var sched map[string]json.RawMessage
+	_ = json.Unmarshal(probe["schedule"], &sched)
+	for _, k := range []string{"catch_up_minutes", "balance_refresh_concurrency", "balance_refresh_startup_delay", "balance_refresh_startup_force"} {
+		if _, ok := sched[k]; !ok {
+			t.Errorf("config.example.json missing schedule.%s", k)
+		}
+	}
+	var sec map[string]json.RawMessage
+	_ = json.Unmarshal(probe["security"], &sec)
+	if _, ok := sec["allow_anonymous"]; !ok {
+		t.Error("config.example.json missing security.allow_anonymous")
+	}
+}

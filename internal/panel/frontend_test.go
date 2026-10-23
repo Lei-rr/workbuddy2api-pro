@@ -2151,3 +2151,628 @@ const out = {};
 		t.Fatalf("做任务交互=%s\nwant %s", got, want)
 	}
 }
+
+// TestAppJSNextPollDelay v2.0.1 #2 轮询治理的纯函数（间隔解析/clamp、失败退避、
+// ±20% 抖动、可见性状态机）。这些函数只吃数值、不碰 DOM，是整条调度链唯一能
+// 逐项钉死的地方：15s 写成 15 或上限写错只会表现为「轮询过密/过疏」，肉眼极难发现。
+//
+// 规则（与 app.js 注释一致）：
+//   - poll_interval_sec：缺省/null/空串/非数字 → 5；越界 clamp 2-60（四舍五入）。
+//   - 失败退避：失败 1 次仍按基础间隔，之后 2x/6x/12x，上限 60s；
+//     默认基础 5s 时即 5s → 10s → 30s → 60s。
+//   - nextPollDelay：退避间隔 ±20% 抖动（rand 0=下限、0.5=原值、1=上限），
+//     最终毫秒数封顶 60000（抖动不得突破退避上限）。
+//   - visibility：hidden↔visible 的转换 → pause/resume，同向重复事件 noop。
+func TestAppJSNextPollDelay(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function pollIntervalSec');
+const stop = src.indexOf('function stopPollTimer');
+if (start < 0 || stop < 0 || stop < start) throw new Error('poll pure functions not found');
+const ctx = { Number, Math, String, JSON };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop) +
+  '\nthis.pollIntervalSec = pollIntervalSec; this.pollBackoffSec = pollBackoffSec;' +
+  ' this.nextPollDelay = nextPollDelay; this.pollVisibilityAction = pollVisibilityAction;', ctx);
+const out = {
+  parse: [undefined, null, '', 'abc', NaN, 0, 1, 2, 5, 60, 61, 1000, '7', 5.4].map(v => ctx.pollIntervalSec(v)),
+  backoff: [[5,0],[5,1],[5,2],[5,3],[5,4],[5,9],[10,1],[10,2],[10,3],[10,4],[2,3],[2,4],[2,9],[60,0],[60,4],[1000,0],[1000,4],[5,-1],[5,'2']].map(([b,f]) => ctx.pollBackoffSec(b,f)),
+  delay: [[5,0,0.5],[5,0,0],[5,0,1],[5,2,0.5],[5,3,0.5],[5,4,0.5],[5,4,1],[60,4,0],[60,4,1],[5,0,-5],[5,0,99],[5,0,NaN]].map(([b,f,r]) => ctx.nextPollDelay(b,f,r)),
+  vis: [[false,false],[true,false],[true,true],[false,true]].map(([h,w]) => ctx.pollVisibilityAction(h,w)),
+};
+process.stdout.write(JSON.stringify(out));`
+	want := `{"parse":[5,5,5,5,5,2,2,2,5,60,60,60,7,5],` +
+		`"backoff":[5,5,10,30,60,60,10,20,60,60,12,24,24,60,60,60,60,5,10],` +
+		`"delay":[5000,4000,6000,10000,30000,60000,60000,48000,60000,4000,6000,5000],` +
+		`"vis":["noop","pause","noop","resume"]}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("轮询纯函数=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSPollingStateMachine v2.0.1 #2 的可见性/退避/401 状态机（真实函数执行、
+// 定时器用桩替身）。纯函数测试看不出「隐藏时到底停没停表」这类接线错误：
+// 少一处 scheduleNextPoll 判断就会在后台标签页继续打请求，而 Go 测试与语法检查全绿。
+//
+// 断言链路：
+//  1. start() 首查成功后按默认 5s（±20%）排期，且注册了 visibilitychange；
+//  2. 隐藏 → 清表、不新排期；隐藏期间 pollTick 直接返回（0 请求）；
+//  3. 恢复可见 → 立即刷一次并重新排期；
+//  4. 连续失败 4 次 → 5s/10s/30s/60s 四档退避且始终 ≤60s；成功一次回到基础间隔；
+//  5. 401 → 停表、不自动重试、密钥框只自动弹一次；手动保存密钥后 start() 恢复；
+//  6. refreshVisible 的视图分派（accounts/logs/taskscenter/其它）语义不变。
+func TestAppJSPollingStateMachine(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('let refTimer = null;');
+const stop = src.indexOf('\nstart();', start);
+if (start < 0 || stop < 0 || stop < start) throw new Error('polling section not found');
+const timers = [];
+const cleared = [];
+let timerSeq = 0;
+const handlers = {};
+const doc = { visibilityState: 'visible', addEventListener: (ev, fn) => { handlers[ev] = fn; } };
+let loadCalls = 0, loadResult = true, logCalls = 0, reattachCalls = 0, openKeyCalls = 0;
+const ctx = {
+  document: doc,
+  view: 'accounts',
+  loadOverview: async () => { loadCalls++; return loadResult; },
+  loadLogs: async () => { logCalls++; return true; },
+  reattachQueueView: () => { reattachCalls++; },
+  openKey: () => { openKeyCalls++; },
+  api: async () => ({}),
+  setTimeout: (fn, ms) => { timers.push(ms); return ++timerSeq; },
+  clearTimeout: id => { cleared.push(id); },
+  Math, Number, String, Promise, JSON,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop) + '\nthis.__p = {\n' +
+  '  start, pollTick, onAuthRequired, handleVisibilityChange, refreshVisible,\n' +
+  '  state: () => ({ base: pollBaseSec, failures: refFailures, authStop: pollAuthStopped,\n' +
+  '                  prompted: keyPrompted, hidden: pageHidden, armed: pollArmed, timer: refTimer }),\n' +
+  '};', ctx);
+const P = ctx.__p;
+const inRange = (v, lo, hi) => v >= lo && v <= hi;
+const lastDelay = () => timers.length ? timers[timers.length - 1] : -1;
+const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+(async () => {
+  const out = {};
+  loadCalls = 0; loadResult = true;
+  P.start();
+  await flush();
+  let s = P.state();
+  out.start = { armed: s.armed, timer: s.timer !== null, loads: loadCalls,
+                listener: typeof handlers.visibilitychange === 'function',
+                delayOk: inRange(lastDelay(), 4000, 6000) };
+  doc.visibilityState = 'hidden';
+  const beforeTimers = timers.length, beforeClears = cleared.length;
+  await P.handleVisibilityChange();
+  s = P.state();
+  out.hide = { hidden: s.hidden, timerGone: s.timer === null, clearedOne: cleared.length > beforeClears,
+               noNewTimer: timers.length === beforeTimers };
+  const beforeLoads = loadCalls;
+  await P.pollTick();
+  out.hiddenTick = { loads: loadCalls - beforeLoads, timerGone: P.state().timer === null };
+  doc.visibilityState = 'visible';
+  const loadsB = loadCalls, timersB = timers.length;
+  await P.handleVisibilityChange();
+  s = P.state();
+  out.resume = { loads: loadCalls - loadsB, visible: !s.hidden, timer: s.timer !== null,
+                 newTimer: timers.length === timersB + 1, delayOk: inRange(lastDelay(), 4000, 6000) };
+  loadResult = false;
+  const fails = [];
+  for (let i = 0; i < 4; i++) { await P.pollTick(); fails.push(lastDelay()); }
+  out.backoff = [
+    inRange(fails[0], 4000, 6000),
+    inRange(fails[1], 8000, 12000),
+    inRange(fails[2], 24000, 36000),
+    inRange(fails[3], 48000, 60000),
+  ];
+  out.backoffCapped = fails.every(d => d <= 60000);
+  loadResult = true;
+  await P.pollTick();
+  out.recovered = { delayOk: inRange(lastDelay(), 4000, 6000), failures: P.state().failures };
+  const before401Timers = timers.length;
+  P.onAuthRequired();
+  P.onAuthRequired();
+  s = P.state();
+  out.auth401 = { authStop: s.authStop, prompted: s.prompted, openKey: openKeyCalls,
+                  timerGone: s.timer === null, noRetryTimer: timers.length === before401Timers };
+  await P.pollTick();
+  out.auth401.noRequest = P.state().timer === null;
+  loadResult = true;
+  P.start();
+  await flush();
+  s = P.state();
+  out.manualResume = { authStop: s.authStop, prompted: s.prompted, timer: s.timer !== null,
+                       delayOk: inRange(lastDelay(), 4000, 6000) };
+  ctx.view = 'logs'; logCalls = 0;
+  const logsRet = await P.refreshVisible();
+  ctx.view = 'taskscenter'; reattachCalls = 0;
+  const tcRet = await P.refreshVisible();
+  ctx.view = 'usage'; const usRet = await P.refreshVisible();
+  out.dispatch = { logs: logsRet === true && logCalls === 1, taskscenter: tcRet === true && reattachCalls === 1,
+                   other: usRet === true };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"start":{"armed":true,"timer":true,"loads":1,"listener":true,"delayOk":true},` +
+		`"hide":{"hidden":true,"timerGone":true,"clearedOne":true,"noNewTimer":true},` +
+		`"hiddenTick":{"loads":0,"timerGone":true},` +
+		`"resume":{"loads":1,"visible":true,"timer":true,"newTimer":true,"delayOk":true},` +
+		`"backoff":[true,true,true,true],"backoffCapped":true,` +
+		`"recovered":{"delayOk":true,"failures":0},` +
+		`"auth401":{"authStop":true,"prompted":true,"openKey":1,"timerGone":true,"noRetryTimer":true,"noRequest":true},` +
+		`"manualResume":{"authStop":false,"prompted":false,"timer":true,"delayOk":true},` +
+		`"dispatch":{"logs":true,"taskscenter":true,"other":true}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("轮询状态机=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSConfigNewFields v2.0.1 #4/#10/#11 新增 7 个配置项的表单接线：
+//   - CFG_MAP 的 JSON 路径必须与后端配置键完全一致（panel.api_key /
+//     panel.poll_interval_sec / security.allow_anonymous / schedule.catch_up_minutes /
+//     schedule.balance_refresh_concurrency / schedule.balance_refresh_startup_delay /
+//     schedule.balance_refresh_startup_force）；
+//   - collectConfig 类型：number → Number、checkbox → bool、duration → string；
+//   - 面板密钥空串必须照发（= 回落网关 key），数字/duration 空串不下发；
+//   - loadConfig 回填数字/复选框/密钥；
+//   - duration 校验覆盖新字段，且裸 "0" 合法（Go ParseDuration 同口径）。
+func TestAppJSConfigNewFields(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP');
+const stop = src.indexOf('/* ── 添加账号');
+if (start < 0 || stop < 0 || stop < start) throw new Error('config section not found');
+const elements = {};
+const mkEl = (type, value) => ({ type, value, checked: false, classList: { toggle() {} }, title: '' });
+for (const n of ['panel_api_key','poll_interval_sec','allow_anonymous','catch_up_minutes',
+                 'balance_refresh_concurrency','balance_refresh_startup_delay','balance_refresh_startup_force']) {
+  elements[n] = mkEl(n === 'allow_anonymous' || n === 'balance_refresh_startup_force' ? 'checkbox' : 'text', '');
+}
+elements.poll_interval_sec.type = 'number';
+elements.catch_up_minutes.type = 'number';
+elements.balance_refresh_concurrency.type = 'number';
+elements.panel_api_key.type = 'password';
+const cfgForm = { elements, addEventListener() {}, onsubmit: null };
+const nodes = { cfgForm, cfgPath: { textContent: '' }, cfgNote: { textContent: '' },
+                btnEye: {}, btnCfgReload: {}, btnCfgSave: { disabled: false, textContent: '' },
+                cfgKey: mkEl('password', ''), cfgPanelKey: mkEl('password', '') };
+const toasts = [];
+let cfgResp = { path: '/tmp/config.json', config: {} };
+const ctx = {
+  $: id => nodes[id],
+  api: async () => cfgResp,
+  toast: (msg, cls) => toasts.push([msg, cls || '']),
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop) + '\nthis.cfgMap = CFG_MAP;' +
+  ' this.collectConfig = collectConfig; this.loadConfig = loadConfig;' +
+  ' this.durationBad = durationBad; this.durationFields = DURATION_FIELDS;' +
+  ' this.clearable = CLEARABLE_CFG;', ctx);
+const out = {};
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+const wantMap = {
+  panel_api_key: ['panel', 'api_key'],
+  poll_interval_sec: ['panel', 'poll_interval_sec'],
+  allow_anonymous: ['security', 'allow_anonymous'],
+  catch_up_minutes: ['schedule', 'catch_up_minutes'],
+  balance_refresh_concurrency: ['schedule', 'balance_refresh_concurrency'],
+  balance_refresh_startup_delay: ['schedule', 'balance_refresh_startup_delay'],
+  balance_refresh_startup_force: ['schedule', 'balance_refresh_startup_force'],
+};
+out.map = Object.keys(wantMap).map(k => JSON.stringify(ctx.cfgMap[k]) === JSON.stringify(wantMap[k]));
+elements.panel_api_key.value = 'panel-secret';
+elements.poll_interval_sec.value = '7';
+elements.allow_anonymous.checked = true;
+elements.catch_up_minutes.value = '45';
+elements.balance_refresh_concurrency.value = '6';
+elements.balance_refresh_startup_delay.value = '1m30s';
+elements.balance_refresh_startup_force.checked = true;
+const cfg = ctx.collectConfig();
+out.collect = {
+  panelKey: (cfg.panel || {}).api_key,
+  interval: (cfg.panel || {}).poll_interval_sec,
+  intervalIsNumber: typeof (cfg.panel || {}).poll_interval_sec === 'number',
+  anonymous: (cfg.security || {}).allow_anonymous,
+  anonymousIsBool: typeof (cfg.security || {}).allow_anonymous === 'boolean',
+  catchUp: (cfg.schedule || {}).catch_up_minutes,
+  catchUpIsNumber: typeof (cfg.schedule || {}).catch_up_minutes === 'number',
+  conc: (cfg.schedule || {}).balance_refresh_concurrency,
+  delay: (cfg.schedule || {}).balance_refresh_startup_delay,
+  force: (cfg.schedule || {}).balance_refresh_startup_force,
+  forceIsBool: typeof (cfg.schedule || {}).balance_refresh_startup_force === 'boolean',
+};
+elements.panel_api_key.value = '';
+elements.poll_interval_sec.value = '';
+elements.balance_refresh_startup_delay.value = '';
+const cfg2 = ctx.collectConfig();
+out.cleared = {
+  clearable: ctx.clearable.has('panel_api_key'),
+  panelKeySentEmpty: has(cfg2.panel, 'api_key') && cfg2.panel.api_key === '',
+  intervalSkipped: !has(cfg2.panel, 'poll_interval_sec'),
+  delaySkipped: !has(cfg2.schedule, 'balance_refresh_startup_delay'),
+  checkboxStillSent: has(cfg2.schedule, 'balance_refresh_startup_force') && cfg2.schedule.balance_refresh_startup_force === true,
+};
+cfgResp = { path: '/etc/config.json', config: {
+  panel: { api_key: 'pk-secret', poll_interval_sec: 11 },
+  security: { allow_anonymous: true },
+  schedule: { catch_up_minutes: 60, balance_refresh_concurrency: 4,
+              balance_refresh_startup_delay: '45s', balance_refresh_startup_force: true },
+} };
+(async () => {
+  await ctx.loadConfig();
+  out.load = {
+    path: nodes.cfgPath.textContent,
+    panelKey: elements.panel_api_key.value,
+    interval: String(elements.poll_interval_sec.value),
+    anonymous: elements.allow_anonymous.checked,
+    catchUp: String(elements.catch_up_minutes.value),
+    conc: String(elements.balance_refresh_concurrency.value),
+    delay: elements.balance_refresh_startup_delay.value,
+    force: elements.balance_refresh_startup_force.checked,
+    noteEmpty: nodes.cfgNote.textContent === '',
+  };
+  const bad = v => { elements.balance_refresh_startup_delay.value = v; return ctx.durationBad('balance_refresh_startup_delay'); };
+  out.duration = {
+    inFields: ctx.durationFields.indexOf('balance_refresh_startup_delay') >= 0,
+    ok30s: !bad('30s'), ok0: !bad('0'), okMix: !bad('1h30m'),
+    badNoUnit: bad('30'), badNegative: bad('-5s'), badText: bad('abc'), emptyOk: !bad(''),
+  };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"map":[true,true,true,true,true,true,true],` +
+		`"collect":{"panelKey":"panel-secret","interval":7,"intervalIsNumber":true,"anonymous":true,` +
+		`"anonymousIsBool":true,"catchUp":45,"catchUpIsNumber":true,"conc":6,"delay":"1m30s",` +
+		`"force":true,"forceIsBool":true},` +
+		`"cleared":{"clearable":true,"panelKeySentEmpty":true,"intervalSkipped":true,` +
+		`"delaySkipped":true,"checkboxStillSent":true},` +
+		`"load":{"path":"/etc/config.json","panelKey":"pk-secret","interval":"11","anonymous":true,` +
+		`"catchUp":"60","conc":"4","delay":"45s","force":true,"noteEmpty":true},` +
+		`"duration":{"inFields":true,"ok30s":true,"ok0":true,"okMix":true,"badNoUnit":true,` +
+		`"badNegative":true,"badText":true,"emptyOk":true}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("配置新字段=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSBalanceRefreshAsync v2.0.1 #10：顶部「刷新」按钮对异步 balance_all 的交互：
+//   - 点击 → 按钮「已提交…」+ 禁用 → POST balance_all；
+//   - 成功 → toast「已开始刷新余额（后台执行，完成后自动刷新）」，2.5s 后补拉一次
+//     overview（让首批余额先出现），按钮恢复原文案；
+//   - 409（同类任务正在执行）→ api() 抛错，catch 原样展示后端 error 文案；
+//   - 不再同步等待、也不再谎报「余额已从上游刷新」。
+func TestAppJSBalanceRefreshAsync(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf("$('btnRefresh').onclick");
+const stop = src.indexOf('/* ── 轮询治理');
+if (start < 0 || stop < 0 || stop < start) throw new Error('btnRefresh region not found');
+const btn = { disabled: false, textContent: '刷新' };
+const apiCalls = [];
+const toasts = [];
+const timers = [];
+let overviewCalls = 0, logCalls = 0, apiErr = null;
+const during = {};
+const ctx = {
+  $: id => (id === 'btnRefresh' ? btn : null),
+  api: async (path, opts) => {
+    apiCalls.push([path, opts && opts.method]);
+    during.text = btn.textContent;
+    during.disabled = btn.disabled;
+    if (apiErr) throw new Error(apiErr);
+    return { ok: true, started: true };
+  },
+  toast: (m, c) => toasts.push([m, c || '']),
+  loadOverview: () => { overviewCalls++; },
+  loadLogs: () => { logCalls++; },
+  view: 'accounts',
+  setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop), ctx);
+(async () => {
+  const out = {};
+  await btn.onclick();
+  out.ok = { calls: apiCalls.splice(0), during: { text: during.text, disabled: during.disabled },
+             toast: toasts.splice(0), timers: timers.map(t => t.ms),
+             label: btn.textContent, disabled: btn.disabled };
+  timers.splice(0).forEach(t => t.fn());
+  out.ok.overviewAfterTimer = overviewCalls;
+  overviewCalls = 0; timers.length = 0; apiErr = '正在执行余额刷新任务，请稍后重试';
+  await btn.onclick();
+  out.conflict = { calls: apiCalls.splice(0), toast: toasts.splice(0),
+                   timers: timers.length, label: btn.textContent, disabled: btn.disabled,
+                   overview: overviewCalls };
+  apiErr = null; logCalls = 0; ctx.view = 'logs';
+  await btn.onclick();
+  for (const t of timers.splice(0)) t.fn();
+  out.logsView = { logCalls };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"ok":{"calls":[["balance_all","POST"]],"during":{"text":"已提交…","disabled":true},` +
+		`"toast":[["已开始刷新余额（后台执行，完成后自动刷新）","ok"]],"timers":[2500],` +
+		`"label":"刷新","disabled":false,"overviewAfterTimer":1},` +
+		`"conflict":{"calls":[["balance_all","POST"]],` +
+		`"toast":[["刷新失败：正在执行余额刷新任务，请稍后重试","err"]],"timers":0,` +
+		`"label":"刷新","disabled":false,"overview":0},` +
+		`"logsView":{"logCalls":1}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("顶部刷新交互=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelConfigNewControls 配置页新增控件的「双侧接线」：index.html 里有控件
+// （name/id/type + 中文提示），app.js 的 CFG_MAP 有对应路径，且轮询/密钥门的
+// 关键接线存在。只改一边时表单看起来正常，但值会被静默丢弃或永远不生效。
+func TestPanelConfigNewControls(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, j := string(html), string(js)
+	form := h
+	if i := strings.Index(h, `<form id="cfgForm">`); i >= 0 {
+		form = h[i:]
+		if k := strings.Index(form, "</form>"); k >= 0 {
+			form = form[:k]
+		}
+	} else {
+		t.Fatal("index.html 缺少配置表单 #cfgForm")
+	}
+	controls := []struct{ name, id, typ string }{
+		{"panel_api_key", "cfgPanelKey", "password"},
+		{"poll_interval_sec", "cfgPollInterval", "number"},
+		{"allow_anonymous", "cfgAllowAnonymous", "checkbox"},
+		{"catch_up_minutes", "cfgCatchUp", "number"},
+		{"balance_refresh_concurrency", "cfgBalConc", "number"},
+		{"balance_refresh_startup_delay", "cfgBalDelay", ""},
+		{"balance_refresh_startup_force", "cfgBalForce", "checkbox"},
+	}
+	// 逐个控件按 <input ...> 标签整体校验：name 决定 collectConfig 取值，
+	// id 决定 app.js 里 $('cfgXxx') 能否取到，type 决定 number/bool/string 转换。
+	for _, c := range controls {
+		tagRe := regexp.MustCompile(`<input[^>]*\bname="` + regexp.QuoteMeta(c.name) + `"[^>]*>`)
+		tag := tagRe.FindString(form)
+		if tag == "" {
+			t.Errorf("配置表单缺少控件 name=%q（CFG_MAP 有键但表单没有 → 无法回填/保存）", c.name)
+			continue
+		}
+		if !strings.Contains(tag, `id="`+c.id+`"`) {
+			t.Errorf("控件 %q 的标签缺少 id=%q：%s", c.name, c.id, tag)
+		}
+		if c.typ != "" && !strings.Contains(tag, `type="`+c.typ+`"`) {
+			t.Errorf("控件 %q 类型应为 %q：%s", c.name, c.typ, tag)
+		}
+	}
+	// CFG_MAP 的 JSON 路径必须与后端键完全一致（写错层级 = 保存后不生效）。
+	for _, want := range []string{
+		"panel_api_key: ['panel', 'api_key']",
+		"poll_interval_sec: ['panel', 'poll_interval_sec']",
+		"allow_anonymous: ['security', 'allow_anonymous']",
+		"catch_up_minutes: ['schedule', 'catch_up_minutes']",
+		"balance_refresh_concurrency: ['schedule', 'balance_refresh_concurrency']",
+		"balance_refresh_startup_delay: ['schedule', 'balance_refresh_startup_delay']",
+		"balance_refresh_startup_force: ['schedule', 'balance_refresh_startup_force']",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js CFG_MAP 缺少映射 %q", want)
+		}
+	}
+	// 提示文案要点：回落语义、2-60 clamp、非回环空 key 拒绝启动、补跑/并发/首刷。
+	for _, want := range []string{"留空 = 回落网关 API 密钥", "2–60 秒", "拒绝启动", "补跑窗口", "余额刷新并发", "启动首刷"} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 新配置提示缺少 %q", want)
+		}
+	}
+	// 登录框与 401 文案区分「网关密钥 / 面板密钥」。
+	for _, want := range []string{"面板密钥", "panel.api_key", "网关"} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 密钥门文案缺少 %q（需区分网关密钥与面板密钥）", want)
+		}
+	}
+	if !strings.Contains(j, "面板密钥可能已变更（panel.api_key）") {
+		t.Error("app.js 401 提示未指向「面板密钥可能已变更（panel.api_key）」")
+	}
+	if !strings.Contains(j, "const LS_KEY = 'wb2api.key'") {
+		t.Error("localStorage 键必须沿用 wb2api.key（兼容旧版本已存凭据）")
+	}
+}
+
+// TestPanelPollingWiring 轮询治理的源码接线：防「纯函数都对、但主链路没用上」。
+//   - overview 成功时用响应里的 poll_interval_sec 更新基础间隔；
+//   - 自调度 setTimeout 走 nextPollDelay（带抖动/退避），不再是无条件 setInterval；
+//   - visibilitychange 已注册；401 走 onAuthRequired（不直接 openKey 抢焦点）；
+//   - 页面隐藏/401/退避的判断都在 scheduleNextPoll 里。
+func TestPanelPollingWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		"pollBaseSec = pollIntervalSec(d.poll_interval_sec)",
+		"refTimer = setTimeout(pollTick, nextPollDelay(pollBaseSec, refFailures, Math.random()))",
+		"document.addEventListener('visibilitychange', handleVisibilityChange)",
+		"if (!pollArmed || pageHidden || pollAuthStopped) return;",
+		"if (r.status === 401) { onAuthRequired(); throw new Error('密钥无效或未填写'); }",
+		"function onAuthRequired() {",
+		"keyPrompted = true;",
+		"function pollVisibilityAction(hiddenNow, wasHidden)",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 轮询接线缺少 %q", want)
+		}
+	}
+	// 旧实现必须彻底移除：无条件 5s setInterval / 401 直接 openKey / 旧的刷新成功文案。
+	// （注释里允许保留「旧实现是 setInterval…」的说明，故只钉代码形态。）
+	for _, forbidden := range []string{
+		"refTimer = setInterval(",
+		"余额已从上游刷新",
+		"if (r.status === 401) { openKey()",
+	} {
+		if strings.Contains(j, forbidden) {
+			t.Errorf("app.js 仍残留旧轮询实现 %q", forbidden)
+		}
+	}
+}
+
+// TestAppJSPollIntervalFromOverview 运行时验证「间隔可配」的完整链路：整份 app.js 在
+// 惰性 DOM 沙箱里求值，fetch 返回带 poll_interval_sec 的 overview，再逐次改响应值调用
+// loadOverview，断言 pollBaseSec 被正确解析/clamp。纯函数测试只证明解析器本身对，
+// 这条证明 overview → 调度状态真的接上了（漏接时前端永远 5s，Go 侧全绿）。
+func TestAppJSPollIntervalFromOverview(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+let overviewResp = { version: '2.0.1-pro', uptime_sec: 1, total: 0, healthy: 0, cooling: 0,
+  disabled: 0, paused: 0, sticky_sessions: 0, in_flight_full: 0, accounts: [], model_locks: [],
+  balance_refresh_sec: 0, poll_interval_sec: 11 };
+const sandbox = new Proxy({
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert,
+              addEventListener() {}, documentElement: inert, head: inert, body: inert,
+              createElement: () => inert, cookie: '' },
+  fetch: () => Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(overviewResp) }),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set,
+  RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent,
+  decodeURIComponent, URL, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__r = { loadOverview, getBase: () => pollBaseSec };', sandbox, { filename: 'app.js' });
+(async () => {
+  // start() 的首次 overview 是异步的：轮询等待它把 11 写进 pollBaseSec（最多 2s），
+  // 固定 sleep 在慢机器/并行测试下会偶发假失败。
+  for (let i = 0; i < 200 && sandbox.__r.getBase() === 5; i++) {
+    await new Promise(r => setTimeout(r, 10));
+  }
+  const out = {};
+  out.fromStart = sandbox.__r.getBase();
+  const setAndLoad = async v => {
+    overviewResp = Object.assign({}, overviewResp, { poll_interval_sec: v });
+    await sandbox.__r.loadOverview(true);
+    return sandbox.__r.getBase();
+  };
+  out.updated = await setAndLoad(3);
+  out.clampedHigh = await setAndLoad(100);
+  out.clampedLow = await setAndLoad(1);
+  out.fallback = await setAndLoad('oops');
+  out.nullFallback = await setAndLoad(null);
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"fromStart":11,"updated":3,"clampedHigh":60,"clampedLow":2,"fallback":5,"nullFallback":5}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("overview 轮询间隔=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSCfgSaveCredentialSync 配置保存后的本机凭据（localStorage: wb2api.key）同步：
+//   - 面板密钥未变（含留空回落网关 key）→ 沿用当前生效凭据（网关 key 是热生效的）；
+//   - 面板密钥变了（设置新值或清空回落）→ 必须保持旧凭据：panel.api_key 是重启项，
+//     提前切换会让重启前所有请求 401；
+//   - 保存失败 → 不动凭据、不恢复轮询；保存成功 → 清 401 停表状态并重新排期。
+//
+// 这条链路只在浏览器里发生（重启前后各一次），漏掉任何一个分支都会让面板「保存后
+// 立刻踢自己下线」，且 Go 侧完全无感。
+func TestAppJSCfgSaveCredentialSync(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf("$('cfgForm').onsubmit");
+const stop = src.indexOf('/* ── 添加账号');
+if (start < 0 || stop < 0 || stop < start) throw new Error('cfg save handler not found');
+const sets = [], toasts = [], apiCalls = [];
+let apiErr = null, schedCalls = 0;
+const cfgKey = { value: '' }, cfgPanelKey = { value: '' };
+const saveBtn = { disabled: false, textContent: '保存配置' };
+const nodes = { cfgForm: { elements: {}, onsubmit: null }, btnCfgSave: saveBtn, cfgKey, cfgPanelKey };
+const ctx = {
+  $: id => nodes[id],
+  LS_KEY: 'wb2api.key',
+  localStorage: { setItem: (k, v) => sets.push([k, v]) },
+  dig: (o, p) => p.reduce((x, k) => (x == null ? undefined : x[k]), o),
+  cfgLoaded: null,
+  collectConfig: () => ({ marker: 1 }),
+  api: async (path, opts) => {
+    apiCalls.push([path, opts && opts.method]);
+    if (apiErr) throw new Error(apiErr);
+    return { restart_required: ['panel.api_key'] };
+  },
+  toast: (m, c) => toasts.push([m, c || '']),
+  markDurationFields: () => {},
+  durationBad: () => false,
+  DURATION_FIELDS: [],
+  pollAuthStopped: true, keyPrompted: true, refFailures: 3, refTimer: null, refInFlight: false,
+  scheduleNextPoll: () => { schedCalls++; },
+  loadConfig: () => {}, loadOverview: () => {},
+  JSON,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, stop), ctx);
+const onSubmit = nodes.cfgForm.onsubmit;
+const run = async (prevPanel, panelVal, gatewayVal, err) => {
+  sets.length = 0; toasts.length = 0; apiCalls.length = 0; schedCalls = 0;
+  apiErr = err || null;
+  ctx.cfgLoaded = { panel: { api_key: prevPanel } };
+  ctx.pollAuthStopped = true; ctx.keyPrompted = true; ctx.refFailures = 3;
+  cfgPanelKey.value = panelVal;
+  cfgKey.value = gatewayVal;
+  await onSubmit({ preventDefault() {} });
+  return {
+    sets: sets.slice(), toast: toasts.length ? toasts[toasts.length - 1] : null,
+    calls: apiCalls.slice(),
+    state: { authStop: ctx.pollAuthStopped, prompted: ctx.keyPrompted,
+             failures: ctx.refFailures, sched: schedCalls, label: saveBtn.textContent, disabled: saveBtn.disabled },
+  };
+};
+(async () => {
+  const out = {};
+  out.fallbackChanged = await run('', '', 'new-gw', null);
+  out.fallbackEmpty = await run('', '', '', null);
+  out.panelUnchanged = await run('pk', 'pk', 'new-gw', null);
+  out.panelChanged = await run('old-pk', 'new-pk', '', null);
+  out.panelCleared = await run('old-pk', '', 'gw', null);
+  out.saveFail = await run('', '', 'new-gw', 'HTTP 400');
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	okState := `"toast":["配置已保存，其中 1 项需重启进程生效","ok"],"calls":[["config","POST"]],` +
+		`"state":{"authStop":false,"prompted":false,"failures":0,"sched":1,` +
+		`"label":"保存配置","disabled":false}}`
+	want := `{"fallbackChanged":{"sets":[["wb2api.key","new-gw"]],` + okState +
+		`,"fallbackEmpty":{"sets":[],` + okState +
+		`,"panelUnchanged":{"sets":[["wb2api.key","pk"]],` + okState +
+		`,"panelChanged":{"sets":[],` + okState +
+		`,"panelCleared":{"sets":[],` + okState +
+		`,"saveFail":{"sets":[],"toast":["保存失败：HTTP 400","err"],"calls":[["config","POST"]],` +
+		`"state":{"authStop":true,"prompted":true,"failures":3,"sched":0,` +
+		`"label":"保存配置","disabled":false}}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("配置保存凭据同步=%s\nwant %s", got, want)
+	}
+}

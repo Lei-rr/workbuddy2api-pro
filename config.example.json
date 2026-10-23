@@ -8,7 +8,12 @@
     "read_timeout": "300s"
   },
   "panel": {
+    "api_key": "",
+    "poll_interval_sec": 5,
     "package_detail_limit": 5
+  },
+  "security": {
+    "allow_anonymous": false
   },
   "logging": {
     "request_archive_enabled": true,
@@ -35,6 +40,10 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "balance_refresh_concurrency": 8,
+    "balance_refresh_startup_delay": "30s",
+    "balance_refresh_startup_force": false,
+    "catch_up_minutes": 120,
     "include_disabled_in_tasks": false
   },
   "global": {

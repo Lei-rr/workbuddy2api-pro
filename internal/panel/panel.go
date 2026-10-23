@@ -11,8 +11,12 @@
 package panel
 
 import (
+	"bytes"
+	"compress/gzip"
+	"container/list"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -37,9 +41,16 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	APIKey    string               // 网关密钥（空 = 不鉴权）；PanelAPIKey 为空时面板也用它；与 Live 同时给出时 Live 优先
+	// PanelAPIKey 面板独立密钥（v2.0.1 #4：与网关 api_key 分离）。非空时 /panel/*
+	// 只认它，/v1/* 仍只认网关 api_key；空 = 回落网关密钥（向后兼容）。
+	// 装配期读取，变更需重启进程（SaveConfig 的 restart_required 会列出 panel.api_key）。
+	PanelAPIKey string
+	// PollIntervalSec 前端轮询间隔（秒），经 /panel/api/overview 的 poll_interval_sec
+	// 下发；Live 快照有值时以快照为准（保存配置热生效），否则用本静态值，<=0 回落 5。
+	PollIntervalSec int
+	RedisMode       string // "upstash" / "noop"，仅观测透出
+	Version         string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -77,6 +88,10 @@ type Panel struct {
 	mux     *http.ServeMux
 	started time.Time
 	logs    *Ring
+
+	// authFailures 面板鉴权失败限速（v2.0.1 #4-3）：按来源 IP 的 token bucket，
+	// 20 次/分钟，成功后清桶，内存 LRU 上限 1 万 IP。
+	authFailures *authFailLimiter
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -136,11 +151,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:          cfg,
+		mux:          http.NewServeMux(),
+		started:      time.Now(),
+		logs:         NewRing(500),
+		logins:       map[string]loginSession{},
+		authFailures: newAuthFailLimiter(authFailLimiterMaxIPs),
 	}
 	p.routes()
 	return p
@@ -196,32 +212,76 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
 
-// ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
-// 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// ServeHTTP 统一入口：先写安全响应头，再按来源 IP 做鉴权失败限速前置，最后
+// 用 gzip 包装写面板响应（仅面板——server 包的 /v1/* 不经过这里，SSE 不受影响）。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	p.mux.ServeHTTP(w, r)
+	// 压缩能力声明对所有面板响应生效（含未压缩的小响应与 304），便于反代/CDN 正确分桶缓存。
+	w.Header().Set("Vary", "Accept-Encoding")
+
+	// 鉴权失败限速前置：被限的 IP 暂时连正确 key 也回 429，客户端按 Retry-After 退避。
+	// 只作用于 /panel/api/*：页面本身无秘密、可匿名加载，不必一并掐掉（否则被限 IP
+	// 连页面都刷新不了，体验上与"面板挂了"无异）。
+	if isPanelAPIPath(r.URL.Path) && p.authFailures != nil {
+		if blocked, retryAfter := p.authFailures.blocked(rateLimitIP(r)); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeErr(w, http.StatusTooManyRequests, "too many failed authentication attempts; retry after "+strconv.Itoa(retryAfter)+"s")
+			return
+		}
+	}
+
+	// 缓冲后统一决定是否压缩：面板无流式接口，缓冲让 Content-Length/1KB 阈值判断
+	// 都能如实进行；HEAD/204/304/已编码响应在 close 里跳过压缩。
+	gw := &gzipResponseWriter{ResponseWriter: w, req: r}
+	defer gw.close(acceptsGzip(r))
+	p.mux.ServeHTTP(gw, r)
 }
 
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
+// withAuth 面板 Bearer 鉴权（经 httpauth 常量时间比较）：
+//   - 密钥取 apiKey()（PanelAPIKey 优先，空则回落到网关 api_key / Live 快照）；
+//   - 成功一次清空该 IP 的失败计数（v2.0.1 #4-3：正常用户不会因为隔壁暴力尝试被拖累）；
+//   - 失败一次计入限速桶（容量 20/分钟，超限由 ServeHTTP 前置返回 429+Retry-After）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := rateLimitIP(r)
 		if !httpauth.VerifyBearer(r, p.apiKey()) {
+			if p.authFailures != nil {
+				p.authFailures.fail(ip)
+			}
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
+		}
+		if p.authFailures != nil {
+			p.authFailures.success(ip)
 		}
 		next(w, r)
 	}
 }
 
-// apiKey 当前生效密钥（Live 优先，回落静态字段）。
+// apiKey 当前生效的面板密钥：PanelAPIKey（独立面板密钥，需重启）优先；
+// 未配置时回落到网关 api_key（Live 快照优先于静态字段，保持既有热改语义）。
 func (p *Panel) apiKey() string {
+	if p.cfg.PanelAPIKey != "" {
+		return p.cfg.PanelAPIKey
+	}
 	if p.cfg.Live != nil {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// pollIntervalSec 面板前端轮询间隔（秒）：livecfg 快照优先（面板保存后热生效），
+// 否则用装配期静态值；非法值回落默认 5。
+func (p *Panel) pollIntervalSec() int {
+	if p.cfg.Live != nil {
+		if v := p.cfg.Live.Load().PollIntervalSec; v > 0 {
+			return v
+		}
+	}
+	if p.cfg.PollIntervalSec > 0 {
+		return p.cfg.PollIntervalSec
+	}
+	return defaultPollIntervalSec
 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
@@ -259,25 +319,28 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
-		"redis_mode":      p.cfg.RedisMode,
-		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"version":       p.cfg.Version,
+		"uptime_sec":    int(time.Since(p.started).Seconds()),
+		"auth_required": p.apiKey() != "",
+		// poll_interval_sec 面板前端轮询间隔（秒，2-60；v2.0.1 #2）：前端据此安排
+		// 5s 默认轮询并可在线改配置，后端不感知前端实现。
+		"poll_interval_sec": p.pollIntervalSec(),
+		"redis_mode":        p.cfg.RedisMode,
+		"sticky_sessions":   sticky,
+		"total":             total,
+		"healthy":           healthy,
+		"cooling":           cooling,
+		"disabled":          disabled,
+		"paused":            paused,
+		"in_flight_full":    inFlightFull,
+		"accounts":          p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -754,65 +817,122 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 批量任务
+// 批量任务（v2.0.1 #10：同 kind 单飞 + 异步 + 409）
+//
+// 五个 *_all 端点共用调度器的任务单飞 gate（scheduler.BeginTask/EndTask）：
+// 置位成功 → 起后台 goroutine 执行并立即返回 {ok:true,started:true}；置位失败
+// （同类全池任务正在执行，手动双击或定时批次撞车）→ 409 + {"error":"…正在执行中"}。
+// 前端 api() 会把非 2xx 的 error 文案原样 toast（frontend2 已接 409 文案）。
+//
+// balance_all 过去是「同步等全池刷完再返回 + 随响应带回 accounts」——1146 号池
+// 会让反代 60s 超时（504），且与 #10 的并发闸门叠加时页面长时间无反馈。现改为
+// 异步：先占 gate → 立即返回 → 后台按有界并发跑完（含昵称同步），前端 2.5s 后
+// 补拉 overview 看到首批余额，其余交给常规轮询。旧响应字段 ok/started 保留。
 // ---------------------------------------------------------------------------
+
+// writeBatchConflict 已是同类任务执行中：409 + 与其它面板冲突接口同口径的 error 文案。
+func writeBatchConflict(w http.ResponseWriter, msg string) {
+	writeErr(w, http.StatusConflict, msg)
+}
 
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
+	sch := p.cfg.Scheduler
+	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
+	if !sch.BeginTask(scheduler.TaskCheckin) {
+		writeBatchConflict(w, "全量签到正在执行中，请等本轮结束后再试")
+		return
+	}
+	go func() {
+		defer sch.EndTask(scheduler.TaskCheckin)
+		sch.RunCheckinNow()
+	}()
+	log.Printf("panel: 手动全量签到已触发（含连登管家；后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // travelAll 手动触发全量猫猫旅行巡检（异步执行）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
+	sch := p.cfg.Scheduler
+	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
-	log.Printf("panel: 手动全量旅行巡检已触发")
+	if !sch.BeginTask(scheduler.TaskTravel) {
+		writeBatchConflict(w, "全量旅行巡检正在执行中，请等本轮结束后再试")
+		return
+	}
+	go func() {
+		defer sch.EndTask(scheduler.TaskTravel)
+		sch.RunTravelNow()
+	}()
+	log.Printf("panel: 手动全量旅行巡检已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
+	sch := p.cfg.Scheduler
+	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
-	log.Printf("panel: 手动全量活跃上报已触发")
+	if !sch.BeginTask(scheduler.TaskActivity) {
+		writeBatchConflict(w, "全量活跃上报正在执行中，请等本轮结束后再试")
+		return
+	}
+	go func() {
+		defer sch.EndTask(scheduler.TaskActivity)
+		sch.RunActivityNow()
+	}()
+	log.Printf("panel: 手动全量活跃上报已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // keepaliveAll 手动触发全量 token 保活（异步执行）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
+	sch := p.cfg.Scheduler
+	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
-	log.Printf("panel: 手动全量保活已触发")
+	if !sch.BeginTask(scheduler.TaskKeepalive) {
+		writeBatchConflict(w, "全量 token 保活正在执行中，请等本轮结束后再试")
+		return
+	}
+	go func() {
+		defer sch.EndTask(scheduler.TaskKeepalive)
+		sch.RunKeepaliveNow()
+	}()
+	log.Printf("panel: 手动全量保活已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
-// 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
-// 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+// balanceAll 手动全量刷新余额：异步执行（v2.0.1 #10）。
+// 先占单飞 gate 再立即返回 {ok:true,started:true}；后台按
+// schedule.balance_refresh_concurrency 有界并发查上游、写回池内 credits（含解冻
+// 语义）并同步昵称——不再让 HTTP 请求挂到全池刷完（1146 号池会触发反代 504）。
+// 重复点击/后台周期刷新撞车 → 409。前端补拉 overview 获取结果。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
+	sch := p.cfg.Scheduler
+	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
-	p.syncNicknames()
-	log.Printf("panel: 手动全量余额刷新完成")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+	if !sch.BeginTask(scheduler.TaskBalance) {
+		writeBatchConflict(w, "全量余额刷新正在执行中，请等本轮结束后再试")
+		return
+	}
+	go func() {
+		defer sch.EndTask(scheduler.TaskBalance)
+		sch.RunBalanceRefreshNow()
+		p.syncNicknames()
+	}()
+	log.Printf("panel: 手动全量余额刷新已触发（后台执行）")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
@@ -1005,4 +1125,310 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 中间件：gzip 压缩 + 鉴权失败限速（v2.0.1 #2 / #4）
+// ---------------------------------------------------------------------------
+
+// defaultPollIntervalSec 面板前端默认轮询间隔（秒），与 cmd/server 的配置默认一致。
+const defaultPollIntervalSec = 5
+
+// gzipMinSize 只压缩超过该字节数的响应：小 JSON/错误页压缩收益为负（头部开销
+// 可能超过节省的字节），且会让 401/429 这类响应更难在抓包里直接读。
+const gzipMinSize = 1024
+
+// gzipWriterPool 复用 gzip.Writer（每次 Reset 到目标 writer），避免每次请求分配
+// ~1.2MB 的压缩窗口/哈希表。Close 不归还底层 writer（Reset 已切断引用）。
+var gzipWriterPool = sync.Pool{
+	New: func() any { return gzip.NewWriter(nil) },
+}
+
+// acceptsGzip 解析 Accept-Encoding，是否接受 gzip（含 q=0 显式拒绝）。
+func acceptsGzip(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		enc, params, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(enc), "gzip") {
+			continue
+		}
+		// gzip;q=0 / q=0.0 表示显式拒绝；其余参数（无 q / q=0.5 / q=1）都可压缩。
+		return !gzipQZero(params)
+	}
+	return false
+}
+
+// gzipQZero 判断 Accept-Encoding 编码参数里的 q 值是否为 0（= 显式拒绝）。
+func gzipQZero(params string) bool {
+	for _, p := range strings.Split(params, ";") {
+		p = strings.TrimSpace(p)
+		if !strings.HasPrefix(p, "q=") {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(p[2:]), 64)
+		return err == nil && q == 0
+	}
+	return false
+}
+
+// isCompressibleContentType 面板可压缩的内容类型（JSON 接口 + 页面/脚本/样式）。
+// 不碰 text/event-stream、图片等（面板目前没有，但显式白名单能防未来新增接口时误压）。
+func isCompressibleContentType(ct string) bool {
+	mt, _, _ := strings.Cut(ct, ";")
+	switch strings.ToLower(strings.TrimSpace(mt)) {
+	case "application/json",
+		"text/html",
+		"text/javascript",
+		"application/javascript",
+		"text/css":
+		return true
+	}
+	return false
+}
+
+// gzipResponseWriter 缓冲面板响应，在 close 时按内容类型/大小/Accept-Encoding
+// 决定是否 gzip 后一次性写给真实 ResponseWriter。
+//
+// 为什么缓冲而不是边写边压：面板没有流式接口，缓冲后才能在写响应头前知道
+// 完整长度（>1KB 阈值）并准确维护 Content-Length；流式响应（SSE）在 server 包、
+// 不经过本包装，故不受影响。
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	req    *http.Request
+	buf    bytes.Buffer
+	status int
+	wrote  bool
+}
+
+func (g *gzipResponseWriter) WriteHeader(status int) {
+	if g.wrote {
+		return
+	}
+	g.status = status
+	g.wrote = true
+}
+
+func (g *gzipResponseWriter) Write(p []byte) (int, error) {
+	if !g.wrote {
+		g.status = http.StatusOK
+		g.wrote = true
+	}
+	return g.buf.Write(p)
+}
+
+// close 把缓冲内容按需压缩并写出（ServeHTTP defer 调用；幂等）。
+func (g *gzipResponseWriter) close(compressOK bool) {
+	status := g.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	h := g.Header()
+	body := g.buf.Bytes()
+
+	noBody := g.req != nil && g.req.Method == http.MethodHead
+	// 304/204 无实体；已编码（如上游/未来中间件自己压过）不二次压缩。
+	compressible := compressOK &&
+		!noBody &&
+		status != http.StatusNoContent &&
+		status != http.StatusNotModified &&
+		status != http.StatusPartialContent &&
+		h.Get("Content-Encoding") == "" &&
+		len(body) > gzipMinSize &&
+		isCompressibleContentType(h.Get("Content-Type"))
+
+	if compressible {
+		// 压缩后长度不可预知：删掉可能存在的 Content-Length，由 net/http 决定
+		// （小响应会自动计算，大响应走 chunked）。
+		h.Del("Content-Length")
+		h.Set("Content-Encoding", "gzip")
+		g.ResponseWriter.WriteHeader(status)
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gz.Reset(g.ResponseWriter)
+		_, _ = gz.Write(body)
+		_ = gz.Close()
+		gzipWriterPool.Put(gz)
+		return
+	}
+
+	g.ResponseWriter.WriteHeader(status)
+	if noBody {
+		return
+	}
+	_, _ = g.ResponseWriter.Write(body)
+}
+
+// ---------------------------------------------------------------------------
+// 面板鉴权失败限速（v2.0.1 #4-3）
+// ---------------------------------------------------------------------------
+
+const (
+	// authFailLimit 每个来源 IP 每分钟允许的鉴权失败次数（token bucket 容量）：
+	// 超过后新请求回 429 + Retry-After；正常用户每分钟输错 20 次已远超现实。
+	authFailLimit = 20
+	// authFailWindow token bucket 回满周期 = 每分钟 20 个令牌。
+	authFailWindow = time.Minute
+	// authFailLimiterMaxIPs 内存 LRU 上限：1 万 IP，防止被伪造 XFF 刷爆内存。
+	authFailLimiterMaxIPs = 10000
+)
+
+// authFailBucket 单个 IP 的令牌桶。
+type authFailBucket struct {
+	tokens float64
+	last   time.Time
+	elem   *list.Element // LRU 节点（front = 最近使用）
+}
+
+// authFailLimiter 按来源 IP 的鉴权失败 token bucket + LRU 上限，并发安全。
+// 语义：
+//   - blocked：该 IP 令牌耗尽 → 拒绝新请求（不消耗令牌），并给出 Retry-After 秒数；
+//   - fail：鉴权失败消耗 1 个令牌（首次失败建桶，容量 authFailLimit）；
+//   - success：鉴权成功清桶（正常客户端不被同 IP 的异常尝试拖累）。
+//
+// 状态全在内存：重启清零（可接受，攻击者也要重来）。
+type authFailLimiter struct {
+	mu      sync.Mutex
+	maxIPs  int
+	buckets map[string]*authFailBucket
+	lru     *list.List
+	now     func() time.Time // 测试可注入时钟
+}
+
+func newAuthFailLimiter(maxIPs int) *authFailLimiter {
+	if maxIPs <= 0 {
+		maxIPs = authFailLimiterMaxIPs
+	}
+	return &authFailLimiter{
+		maxIPs:  maxIPs,
+		buckets: make(map[string]*authFailBucket),
+		lru:     list.New(),
+		now:     time.Now,
+	}
+}
+
+// refill 按经过时间补充令牌（上限 authFailLimit）；now 为零值时用当前时间。
+func (l *authFailLimiter) refill(b *authFailBucket, now time.Time) {
+	rate := float64(authFailLimit) / authFailWindow.Seconds() // 令牌/秒
+	b.tokens += now.Sub(b.last).Seconds() * rate
+	if b.tokens > authFailLimit {
+		b.tokens = authFailLimit
+	}
+	if b.tokens < 0 {
+		b.tokens = 0
+	}
+	b.last = now
+}
+
+// touch 把桶移到 LRU 头部（最近使用）。
+func (l *authFailLimiter) touch(b *authFailBucket) {
+	if b.elem != nil {
+		l.lru.MoveToFront(b.elem)
+	}
+}
+
+// lookup 取桶并刷新 LRU（不存在返回 nil，调用方持锁）。
+func (l *authFailLimiter) lookup(ip string) *authFailBucket {
+	b := l.buckets[ip]
+	if b != nil {
+		l.touch(b)
+	}
+	return b
+}
+
+// getOrCreate 取桶，必要时新建并按 LRU 上限淘汰最旧 IP（调用方持锁）。
+func (l *authFailLimiter) getOrCreate(ip string, now time.Time) *authFailBucket {
+	if b := l.buckets[ip]; b != nil {
+		l.touch(b)
+		return b
+	}
+	b := &authFailBucket{tokens: authFailLimit, last: now}
+	b.elem = l.lru.PushFront(ip)
+	l.buckets[ip] = b
+	for len(l.buckets) > l.maxIPs {
+		oldest := l.lru.Back()
+		if oldest == nil {
+			break
+		}
+		oldIP, _ := oldest.Value.(string)
+		l.lru.Remove(oldest)
+		delete(l.buckets, oldIP)
+	}
+	return b
+}
+
+// blocked 该 IP 当前是否被限速；返回建议的 Retry-After 秒数（最小 1）。
+func (l *authFailLimiter) blocked(ip string) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.lookup(ip)
+	if b == nil {
+		return false, 0
+	}
+	now := l.now()
+	l.refill(b, now)
+	if b.tokens >= 1 {
+		return false, 0
+	}
+	// 距离攒够 1 个令牌的时间 = (1 - tokens) / rate。
+	rate := float64(authFailLimit) / authFailWindow.Seconds()
+	wait := time.Duration((1 - b.tokens) / rate * float64(time.Second))
+	if wait < time.Second {
+		wait = time.Second
+	}
+	secs := int((wait + time.Second - 1) / time.Second) // 向上取整
+	if secs < 1 {
+		secs = 1
+	}
+	return true, secs
+}
+
+// fail 记录一次鉴权失败（消耗 1 个令牌；耗尽后保持 0，由 blocked 拒绝）。
+func (l *authFailLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	b := l.getOrCreate(ip, now)
+	l.refill(b, now)
+	if b.tokens >= 1 {
+		b.tokens--
+	} else {
+		b.tokens = 0
+	}
+}
+
+// success 鉴权成功：清空该 IP 的失败记录（下次失败从满桶重新计数）。
+func (l *authFailLimiter) success(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[ip]
+	if b == nil {
+		return
+	}
+	if b.elem != nil {
+		l.lru.Remove(b.elem)
+	}
+	delete(l.buckets, ip)
+}
+
+// isPanelAPIPath 是否面板数据接口路径（限速只作用于这些路径；页面/静态资源可匿名加载）。
+func isPanelAPIPath(path string) bool {
+	return strings.HasPrefix(path, "/panel/api/")
+}
+
+// rateLimitIP 提取限速用的来源 IP：X-Forwarded-For 首段 → X-Real-IP → TCP 对端。
+// 口径与 server/logging.go 的 clientIPForLog 一致（反代后拿真实客户端；直连回落
+// RemoteAddr，避免所有直连请求共用一个空 key 被一起限速）。
+func rateLimitIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if ip := upstream.ExtractClientIP(r); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	return host
 }

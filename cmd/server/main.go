@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.0.0-pro"
+const appVersion = "2.0.1-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -71,6 +72,22 @@ func main() {
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+
+	// 安全前置（v2.0.1 #4-2）：非回环监听 + 网关/面板均无密钥 + 未显式允许匿名 →
+	// 直接拒绝启动。必须在建立任何监听/加载账号之前执行，错误信息给出可操作的修复路径。
+	if err := validateListenSecurity(cfg); err != nil {
+		log.Fatalf("startup security check: %v", err)
+	}
+	// 面板密钥分离提示（v2.0.1 #4-1）：只配了 api_key 时面板与 /v1 共用同一把密钥，
+	// 任何拿到网关 key 的下游调用方都能调面板管理接口——提示但不改变行为（向后兼容）。
+	switch {
+	case cfg.Panel.APIKey != "":
+		log.Printf("面板密钥已与网关密钥分离（panel.api_key 生效；/v1/* 只认 api_key）")
+	case cfg.APIKey != "":
+		log.Printf("WARN: panel.api_key 未配置，面板与网关共用同一把 api_key（建议分离；panel.api_key 变更需重启）")
+	case cfg.Security.AllowAnonymous:
+		log.Printf("WARN: api_key 与 panel.api_key 均为空且 security.allow_anonymous=true：网关与面板均无鉴权（仅限可信网络）")
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -205,6 +222,14 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// v2.0.1 #10 子项：余额全量刷新有界并发（默认 8，上限 32）与启动首刷保护
+		// （延迟 + 大池跳过）。后台周期刷新与面板手动刷新共用该并发闸门/单飞 gate。
+		BalanceRefreshConcurrency:  cfg.Schedule.BalanceRefreshConcurrency,
+		BalanceRefreshStartupDelay: cfg.BalanceRefreshStartupDelayDur,
+		BalanceRefreshStartupForce: cfg.Schedule.BalanceRefreshStartupForce,
+		// v2.0.1 #11 子项：补跑窗口（默认 120 分钟，0=关闭）。批次跨过后续时点
+		// 或进程重启后，把「今天尚未跑过且在窗口内」的任务族立即补跑一轮。
+		CatchUpMinutes: cfg.Schedule.CatchUpMinutes,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -239,7 +264,14 @@ func main() {
 	case !cfg.Schedule.BalanceRefreshEnabled:
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
 	case cfg.BalanceRefreshInterval > 0:
-		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新；并发上限 %d）",
+			cfg.BalanceRefreshInterval, cfg.Schedule.BalanceRefreshConcurrency)
+	}
+	if cfg.Schedule.CatchUpMinutes > 0 {
+		log.Printf("调度补跑窗口：%d 分钟（批次跨过后续时点/重启后补跑当天未跑的任务族）",
+			cfg.Schedule.CatchUpMinutes)
+	} else {
+		log.Printf("调度补跑窗口已关闭（schedule.catch_up_minutes=0：错过的时点等下一轮）")
 	}
 	switch {
 	case !cfg.Schedule.TaskSweepEnabled:
@@ -253,13 +285,14 @@ func main() {
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	// live 承载可热改字段（api_key/soft_rate/脱敏开关/面板轮询间隔），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		PollIntervalSec:      cfg.Panel.PollIntervalSec,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -305,6 +338,11 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 面板安全（v2.0.1 #4）：独立面板密钥（空 = 回落网关 api_key，向后兼容）与
+		// 前端轮询间隔（overview 下发 poll_interval_sec）。两者都在装配期进入面板，
+		// panel.api_key 变更需重启；轮询间隔经上面的 live 快照热生效。
+		PanelAPIKey:     cfg.Panel.APIKey,
+		PollIntervalSec: cfg.Panel.PollIntervalSec,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -450,11 +488,16 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - panel.poll_interval_sec → livecfg 快照（overview 下发的 poll_interval_sec 立即变）
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//   - panel.api_key：装配期进入 panel.Config，热改会让面板与网关密钥状态错位
+//
+// 危险值拦截：把 api_key 保存为空（除非 security.allow_anonymous=true）会被拒绝并
+// 不落盘——避免运行期自废鉴权（v2.0.1 #4-2）。
 //
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
@@ -477,6 +520,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
 	newCfg, err := ParseConfig(mergedJSON(merged))
 	if err != nil {
+		return nil, err
+	}
+	// 2.1) 危险值拦截（v2.0.1 #4-2）：拒绝把网关 api_key 保存为空（除非显式
+	// security.allow_anonymous=true）——否则一次手滑/一次提权就能在运行期自废鉴权，
+	// 且重启后无法自愈（见 UPGRADE_PROPOSALS.md #4/#15）。
+	if err := rejectClearingAPIKey(cur, incoming, newCfg); err != nil {
 		return nil, err
 	}
 
@@ -525,6 +574,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		PollIntervalSec:      newCfg.Panel.PollIntervalSec,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -549,8 +599,39 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	// v2.0.1 #10/#11：余额刷新并发上限与补跑窗口均支持热生效（下一轮读新值）；
+	// 启动首刷的延迟/强制开关只在 StartBalanceRefresh 启动时消费一次，列入
+	// restartRequiredFields 提示重启。
+	sch.SetBalanceRefreshConcurrency(newCfg.Schedule.BalanceRefreshConcurrency)
+	sch.SetCatchUpMinutes(newCfg.Schedule.CatchUpMinutes)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// rejectClearingAPIKey 拦截「把网关 api_key 保存为空」（v2.0.1 #4-2）。
+//
+// 判据：本次提交显式写了空的 api_key，或磁盘上原本有 key 而保存后变空；且
+// security.allow_anonymous 未显式打开。例外只放行两类合法场景：
+//   - 本来就没有 key 且本次没动它（老配置/无鉴权测试环境；启动校验会挡住非回环监听）；
+//   - 提交里同时把 security.allow_anonymous 设为 true（用户明确接受匿名）。
+//
+// 注意不拦 panel.api_key 清空：空 = 回落网关 key，是既有的向后兼容语义。
+func rejectClearingAPIKey(cur, incoming map[string]any, newCfg *Config) error {
+	if newCfg.Security.AllowAnonymous || newCfg.APIKey != "" {
+		return nil
+	}
+	curKey, _ := cur["api_key"].(string)
+	clearedExplicitly := false
+	if v, ok := incoming["api_key"]; ok {
+		s, _ := v.(string)
+		clearedExplicitly = strings.TrimSpace(s) == ""
+	}
+	if curKey == "" && !clearedExplicitly {
+		return nil
+	}
+	return fmt.Errorf("api_key 不能保存为空：网关 /v1/* 与面板将失去鉴权，且重启后无法自愈。" +
+		"如确需匿名访问，请同时设置 security.allow_anonymous=true；" +
+		"否则请填入一个随机密钥（例如 `openssl rand -hex 24` 的输出）")
 }
 
 // applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
@@ -588,6 +669,14 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// panel.api_key 在装配期进入 panel.Config（面板鉴权读取的静态字段），运行期
+	// 不再读配置——热改会让「面板认新 key、进程内旧实例认旧 key」错位，故要求重启。
+	// panel.poll_interval_sec 走 livecfg 快照热生效，不在此列。
+	out = append(out, "panel.api_key")
+	// v2.0.1 #10：启动首刷的延迟/强制开关只在 StartBalanceRefresh 启动时读一次，
+	// 运行期热改无效（改后需重启才按新策略决定首刷），故列入重启清单。
+	// schedule.balance_refresh_concurrency / catch_up_minutes 走 setter 热生效，不在此列。
+	out = append(out, "schedule.balance_refresh_startup_delay", "schedule.balance_refresh_startup_force")
 	return out
 }
 

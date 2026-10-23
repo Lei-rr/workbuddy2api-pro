@@ -57,4 +57,6 @@ func (s *Scheduler) RunBlackcatNow() {
 		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
 		time.Sleep(activityAccountDelay)
 	}
+	// 补跑窗口（v2.0.1 #11）：夜猫子属小时制排程，记录今天已跑避免批内跨时点后重复补。
+	s.noteTaskDone(taskBlackcat, s.now())
 }

@@ -66,6 +66,61 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// BalanceRefreshConcurrency 余额全量刷新的并发上限（v2.0.1 #10）：<=0 回落
+	// 默认 8，clamp 1..32。后台周期刷新、启动首刷与面板手动刷新共用同一闸门——
+	// 1146 号池下每个账号一个无上限 goroutine 会把上游打成风暴（风控风险）。
+	BalanceRefreshConcurrency int
+
+	// BalanceRefreshStartupDelay 进程启动后首次余额刷新的延迟（v2.0.1 #10）：
+	// 0 = 不延迟（Config 零值，测试/老调用方行为不变）；生产由配置默认给 30s。
+	// 目的是避免刚重启就与监听/预热等启动动作叠加对全池发起并发请求。
+	BalanceRefreshStartupDelay time.Duration
+
+	// BalanceRefreshStartupForce 账号数超过启动首刷保护阈值（>200）时是否仍强制
+	// 首刷（v2.0.1 #10）。缺省 false：大池跳过首刷交给周期刷新，避免重启瞬间
+	// 打爆上游；需要立即刷新时显式打开。
+	BalanceRefreshStartupForce bool
+
+	// CatchUpMinutes 补跑窗口（v2.0.1 #11）：批次跨过后续计划时点后（如 09:00
+	// 签到批次跑到 10:05，跨过 activity_hours 的 10:00），若该任务族今天的计划
+	// 时点落在 (now-catch_up_minutes, now] 内且今天尚未成功跑过 → 立即补跑一轮。
+	// 0 = 关闭（Config 零值 = 旧行为「错过就等明天」，对老调用方零影响）。
+	CatchUpMinutes int
+}
+
+const (
+	// defaultBalanceRefreshConcurrency 余额刷新默认并发（v2.0.1 #10 的推荐值 8：
+	// 1146 号场景下再高只会给上游 WAF 送人头，再低则全量刷新慢到失去时效）。
+	defaultBalanceRefreshConcurrency = 8
+	// maxBalanceRefreshConcurrency 并发硬顶 32。
+	maxBalanceRefreshConcurrency = 32
+	// balanceStartupSkipThreshold 启动首刷的账号数阈值：> 该值且未显式 force 时跳过
+	// 首刷（1146 号池重启瞬间的并发风暴是 #10 要消除的最危险路径）。
+	balanceStartupSkipThreshold = 200
+	// maxCatchUpMinutes 补跑窗口上限 720 分钟（12h）；再宽等价于「全天都补」。
+	maxCatchUpMinutes = 720
+)
+
+// TaskKind 全池批量任务族标识（单飞 gate 键）。面板批量端点（*_all）与定时
+// 批次共用同一把 gate：同一时刻最多一轮同类全池任务，手动/定时不叠加打上游。
+type TaskKind string
+
+const (
+	TaskCheckin   TaskKind = "checkin"
+	TaskTravel    TaskKind = "travel"
+	TaskActivity  TaskKind = "activity"
+	TaskKeepalive TaskKind = "keepalive"
+	TaskBalance   TaskKind = "balance"
+)
+
+// valid 报告是否为已知任务族（未知 kind 一律拒绝占 gate，避免拼写错误静默放行）。
+func (k TaskKind) valid() bool {
+	switch k {
+	case TaskCheckin, TaskTravel, TaskActivity, TaskKeepalive, TaskBalance:
+		return true
+	}
+	return false
 }
 
 // Scheduler 调度器。
@@ -97,6 +152,21 @@ type Scheduler struct {
 	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
 	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
 	lastBalanceRefresh atomic.Int64
+
+	// balanceConcurrency 余额全量刷新并发上限（v2.0.1 #10）。atomic 读写：面板保存
+	// 配置经 SetBalanceRefreshConcurrency 热改，下一轮刷新生效。
+	balanceConcurrency atomic.Int64
+
+	// nowFn 可注入时钟（测试用；生产恒为 time.Now）。补跑窗口判定与 lastRun 记录
+	// 共用同一时钟，保证「窗口边界/跨天」用例可确定性复现（不随运行环境墙钟漂移）。
+	nowFn func() time.Time
+
+	// runStateMu 保护运行期瞬时状态：单飞 gate（running）与各任务族最近成功跑完
+	// 的时刻（lastRun）。两者都只服务「本轮/今天是否已跑」的进程内判断，重启即
+	// 清零；不参与选号与持久化，无需落盘。
+	runStateMu sync.Mutex
+	running    map[TaskKind]bool
+	lastRun    map[taskKind]time.Time
 }
 
 // New 构建。
@@ -116,13 +186,130 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	// v2.0.1 #10/#11 新配置的零值归一：并发 <=0 → 默认 8、上限 32；补跑窗口
+	// 负值钳 0（=关闭）、上限 720。config 的 normalize 已做同一套夹取，这里兜底
+	// 直接构造 Config 的调用方（测试/嵌入式用法），保证运行期只见到合法值。
+	cfg.BalanceRefreshConcurrency = normalizeBalanceRefreshConcurrency(cfg.BalanceRefreshConcurrency)
+	if cfg.CatchUpMinutes < 0 {
+		cfg.CatchUpMinutes = 0
+	} else if cfg.CatchUpMinutes > maxCatchUpMinutes {
+		cfg.CatchUpMinutes = maxCatchUpMinutes
+	}
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
+		nowFn:         time.Now,
+		running:       make(map[TaskKind]bool),
+		lastRun:       make(map[taskKind]time.Time),
 	}
+	s.balanceConcurrency.Store(int64(cfg.BalanceRefreshConcurrency))
+	return s
+}
+
+// normalizeBalanceRefreshConcurrency 归一余额刷新并发：<=0 回落默认 8，上限 32。
+func normalizeBalanceRefreshConcurrency(n int) int {
+	if n <= 0 {
+		return defaultBalanceRefreshConcurrency
+	}
+	if n > maxBalanceRefreshConcurrency {
+		return maxBalanceRefreshConcurrency
+	}
+	return n
+}
+
+// now 返回调度器当前时刻（生产 time.Now；测试可替换 nowFn 注入固定时钟）。
+// 注意 &Scheduler{} 这类直接字面量构造（老测试）没有初始化 nowFn，也必须可用。
+func (s *Scheduler) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
+}
+
+// ---------------------------------------------------------------------------
+// 任务单飞 gate（v2.0.1 #10 子项）：按任务族互斥，手动与定时共用
+// ---------------------------------------------------------------------------
+
+// BeginTask 尝试占用一类全池任务的单飞 gate：未被占用则占位并返回 true；同类
+// 任务正在执行返回 false。调用方**必须**在任务结束后调用 EndTask（defer 最稳）。
+// 手动入口（面板 *_all）与定时批次（runBatch/补跑）共用，保证同一时刻最多一轮
+// 同类全池任务打上游——双击按钮、或定时与手动同时触发都不会叠加两轮。
+func (s *Scheduler) BeginTask(kind TaskKind) bool {
+	if !kind.valid() {
+		return false
+	}
+	s.runStateMu.Lock()
+	defer s.runStateMu.Unlock()
+	if s.running == nil {
+		s.running = make(map[TaskKind]bool)
+	}
+	if s.running[kind] {
+		return false
+	}
+	s.running[kind] = true
+	return true
+}
+
+// EndTask 释放单飞 gate。未持有也安全（幂等删除），便于 defer 收尾。
+func (s *Scheduler) EndTask(kind TaskKind) {
+	s.runStateMu.Lock()
+	delete(s.running, kind)
+	s.runStateMu.Unlock()
+}
+
+// TaskRunning 报告某任务族当前是否正在执行（面板重复点击判定 409 用）。
+func (s *Scheduler) TaskRunning(kind TaskKind) bool {
+	s.runStateMu.Lock()
+	defer s.runStateMu.Unlock()
+	return s.running[kind]
+}
+
+// gateKindOf 把内部排程 kind 映射为导出 TaskKind；夜猫子/成长不在单飞范围
+// （无面板批量入口，成长队列另有自身单飞），返回 false 表示不做 gate。
+func gateKindOf(k taskKind) (TaskKind, bool) {
+	switch k {
+	case taskCheckin:
+		return TaskCheckin, true
+	case taskTravel:
+		return TaskTravel, true
+	case taskActivity:
+		return TaskActivity, true
+	case taskKeepalive:
+		return TaskKeepalive, true
+	case taskBalance:
+		return TaskBalance, true
+	}
+	return "", false
+}
+
+// noteTaskDone 记录某任务族最近一次成功跑完的时刻（内存，重启清零）。
+// 补跑窗口据此判断「今天该族是否已成功跑过」：正常到点执行的那轮也要记，
+// 否则批内跨过后续时点后会把「今天已经跑过」的族再补一遍。
+func (s *Scheduler) noteTaskDone(k taskKind, at time.Time) {
+	s.runStateMu.Lock()
+	if s.lastRun == nil {
+		s.lastRun = make(map[taskKind]time.Time)
+	}
+	s.lastRun[k] = at
+	s.runStateMu.Unlock()
+}
+
+// taskRanOn 报告该任务族在 day 所属自然日是否已成功跑过。
+func (s *Scheduler) taskRanOn(k taskKind, day time.Time) bool {
+	s.runStateMu.Lock()
+	at, ok := s.lastRun[k]
+	s.runStateMu.Unlock()
+	return ok && sameLocalDay(at, day)
+}
+
+// sameLocalDay 判断两个时刻是否同一自然日（按 day 的时区解释，与 nextFire 用
+// now.Location() 构造时点的口径一致）。
+func sameLocalDay(a, b time.Time) bool {
+	a = a.In(b.Location())
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -172,6 +359,40 @@ func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 	s.schedMu.Lock()
 	s.cfg.IncludeDisabledInTasks = v
 	s.schedMu.Unlock()
+}
+
+// SetCatchUpMinutes 热更新补跑窗口（分钟，0=关闭；越界 clamp 0..720）。
+// 面板保存 schedule.catch_up_minutes 后立即生效（下一轮补跑判定读新值）。
+func (s *Scheduler) SetCatchUpMinutes(minutes int) {
+	if minutes < 0 {
+		minutes = 0
+	} else if minutes > maxCatchUpMinutes {
+		minutes = maxCatchUpMinutes
+	}
+	s.schedMu.Lock()
+	s.cfg.CatchUpMinutes = minutes
+	s.schedMu.Unlock()
+}
+
+// catchUpWindow 当前补跑窗口（0=关闭）；schedMu 下读，与 Reconfigure/SetCatchUpMinutes 同步。
+func (s *Scheduler) catchUpWindow() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return time.Duration(s.cfg.CatchUpMinutes) * time.Minute
+}
+
+// SetBalanceRefreshConcurrency 热更新余额全量刷新并发上限：<=0 回落默认 8，上限 32。
+// 只影响下一轮刷新（已在途的请求按旧闸门跑完）；面板保存后立即生效。
+func (s *Scheduler) SetBalanceRefreshConcurrency(n int) {
+	s.balanceConcurrency.Store(int64(normalizeBalanceRefreshConcurrency(n)))
+}
+
+// BalanceRefreshConcurrency 当前余额全量刷新并发上限（供日志/观测）。
+func (s *Scheduler) BalanceRefreshConcurrency() int {
+	if v := s.balanceConcurrency.Load(); v > 0 {
+		return int(v)
+	}
+	return defaultBalanceRefreshConcurrency
 }
 
 func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
@@ -239,6 +460,9 @@ const (
 	taskKeepalive
 	taskBlackcat
 	taskGrowth
+	// taskBalance 没有小时制排程（由独立 ticker 驱动），仅用于 lastRun 记录与
+	// 单飞 gate 映射，使余额族的完成时刻与其它族同口径。
+	taskBalance
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -376,6 +600,15 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
+		// 补跑窗口（v2.0.1 #11）：启动后首轮、以及每批任务结束后（循环回到顶部）
+		// 先检查一次「今天错过的时点」。批次/补跑本身可能跨过后续时点（如 09:00
+		// 签到批次跑到 10:05，跨过 10:00 活跃上报）——nextWake 对已过时点返回
+		// 明天，不在这里补就会整天漏跑（保活/活跃的 P0 漏跑风险）。补跑走单飞
+		// gate 且每族当天只补一次，循环有界；窗口关闭（0）时是空操作。
+		s.runCatchUps(ctx, s.now())
+		if ctx.Err() != nil {
+			return
+		}
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
 			// 四类任务全部禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
@@ -416,29 +649,145 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 		wg.Add(1)
 		go func(k taskKind) {
 			defer wg.Done()
-			switch k {
-			case taskCheckin:
-				s.RunCheckinNow()
-			case taskTravel:
-				s.RunTravelNow()
-			case taskActivity:
-				s.runActivity(ctx)
-			case taskKeepalive:
-				s.RunKeepaliveNow()
-			case taskBlackcat:
-				s.RunBlackcatNow()
-			case taskGrowth:
-				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
-				s.schedMu.Lock()
-				hook := s.cfg.GrowthHook
-				s.schedMu.Unlock()
-				if hook != nil {
-					hook()
-				}
-			}
+			s.executeTaskKind(ctx, k)
 		}(k)
 	}
 	wg.Wait()
+}
+
+// executeTaskKind 在单飞 gate 保护下执行一类任务；同类已在跑返回 false（本轮跳过）。
+// 定时批次与补跑共用本入口，保证「上一轮没跑完时不会叠加第二轮全池任务」。
+// 任务体自身负责在成功跑完后记录 lastRun（补跑窗口据此去重）。
+func (s *Scheduler) executeTaskKind(ctx context.Context, k taskKind) bool {
+	if gk, gated := gateKindOf(k); gated {
+		if !s.BeginTask(gk) {
+			log.Printf("scheduler: %s 任务正在执行中，本轮跳过（同类单飞）", gk)
+			return false
+		}
+		defer s.EndTask(gk)
+	}
+	switch k {
+	case taskCheckin:
+		s.runCheckin(ctx)
+	case taskTravel:
+		s.runTravel(ctx)
+	case taskActivity:
+		s.runActivity(ctx)
+	case taskKeepalive:
+		s.RunKeepaliveNow()
+	case taskBlackcat:
+		s.RunBlackcatNow()
+	case taskGrowth:
+		// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+		s.schedMu.Lock()
+		hook := s.cfg.GrowthHook
+		s.schedMu.Unlock()
+		if hook == nil {
+			return false
+		}
+		hook()
+		// 队列已启动（内部单飞）：标今天已跑，补跑窗口不再重复触发。
+		s.noteTaskDone(taskGrowth, s.now())
+	case taskBalance:
+		s.RunBalanceRefreshNow()
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// 补跑窗口（v2.0.1 #11 子项）
+// ---------------------------------------------------------------------------
+
+// catchUpDue 返回 now 时刻应补跑的任务族列表。
+//
+// 判定：某族**今天**的某个计划整点落在 (now-catch_up, now] 内（左开右闭）、该族
+// 今天尚未成功跑过、且窗口开启 → 需要补跑。典型场景是两个任务的交接点：
+//   - 09:00 签到+旅行批次在 1146 号下跑到 10:05，跨过 activity_hours 的 10:00；
+//   - 21:00 签到批次跨过 22:00 保活、23:00 夜猫子同理。
+//
+// nextWake 对「已经过去的时点」一律返回明天，所以这些时点一旦被批次跨过就会
+// 整天漏跑；本函数是唯一的挽回入口。正常到点执行的那轮已记 lastRun，因此不会
+// 重复补跑（补跑只补一次/天/族）。
+func (s *Scheduler) catchUpDue(now time.Time) []taskKind {
+	s.schedMu.Lock()
+	minutes := s.cfg.CatchUpMinutes
+	checkinHours := s.cfg.CheckinHours
+	travelHours := s.cfg.TravelHours
+	activityHours := s.cfg.ActivityHours
+	keepaliveHours := s.cfg.KeepaliveHours
+	blackcatHours := s.cfg.BlackcatHours
+	growthHours := s.cfg.GrowthHours
+	checkinOff, travelOff := s.cfg.CheckinDisabled, s.cfg.TravelDisabled
+	activityOff, keepaliveOff := s.cfg.ActivityDisabled, s.cfg.KeepaliveDisabled
+	blackcatOff, growthOff := s.cfg.BlackcatDisabled, s.cfg.GrowthDisabled
+	s.schedMu.Unlock()
+	if minutes <= 0 {
+		return nil
+	}
+	windowStart := now.Add(-time.Duration(minutes) * time.Minute)
+	type family struct {
+		kind  taskKind
+		hours []int
+		off   bool
+	}
+	families := []family{
+		{taskCheckin, checkinHours, checkinOff},
+		{taskTravel, travelHours, travelOff},
+		{taskActivity, activityHours, activityOff},
+		{taskKeepalive, keepaliveHours, keepaliveOff},
+		{taskBlackcat, blackcatHours, blackcatOff},
+		{taskGrowth, growthHours, growthOff},
+	}
+	var due []taskKind
+	for _, f := range families {
+		if f.off || s.taskRanOn(f.kind, now) {
+			continue
+		}
+		for _, h := range f.hours {
+			slot := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+			// 窗口左开右闭：(now-catch_up, now]；恰好等于窗口起点的时点不补
+			// （避免窗口边缘抖动导致「差一秒补一整轮」）。
+			if slot.After(windowStart) && !slot.After(now) {
+				due = append(due, f.kind)
+				break
+			}
+		}
+	}
+	return due
+}
+
+// runCatchUps 立即补跑窗口命中的任务族；返回实际启动的族（测试/日志可观测）。
+// 每个族都走与定时批次相同的单飞 gate：同类正在执行时跳过本轮（绝不在一轮全池
+// 任务之上再叠一轮）。补跑只补一次/天/族：任务体跑完即记 lastRun，下次判定不再命中。
+func (s *Scheduler) runCatchUps(ctx context.Context, now time.Time) []taskKind {
+	if ctx.Err() != nil {
+		return nil
+	}
+	due := s.catchUpDue(now)
+	if len(due) == 0 {
+		return nil
+	}
+	log.Printf("scheduler: 补跑窗口命中 %v（%d 分钟内错过的时点，今天尚未跑过）",
+		due, s.catchUpWindow()/time.Minute)
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		started []taskKind
+	)
+	for _, k := range due {
+		wg.Add(1)
+		go func(k taskKind) {
+			defer wg.Done()
+			if !s.executeTaskKind(ctx, k) {
+				return
+			}
+			mu.Lock()
+			started = append(started, k)
+			mu.Unlock()
+		}(k)
+	}
+	wg.Wait()
+	return started
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -463,10 +812,22 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
+// 本函数是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走 runCheckin。
 func (s *Scheduler) RunCheckinNow() {
+	s.runCheckin(context.Background())
+}
+
+// runCheckin 签到遍历（ctx 感知）：ctx 取消后不再发起新的上游请求、不记「今天
+// 已跑」——剩余账号留给下一轮（优雅停机不把半轮当整轮）。
+func (s *Scheduler) runCheckin(ctx context.Context) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
+		// v2.0.1 #11：时间敏感循环内的可取消等待/检查（本循环无 sleep，但整轮
+		// 1146 号可能跑近一小时，停机信号要在账号之间及时生效）。
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -519,6 +880,9 @@ func (s *Scheduler) RunCheckinNow() {
 		})
 	}
 	s.RunStreakBonusNow()
+	if ctx.Err() == nil {
+		s.noteTaskDone(taskCheckin, s.now())
+	}
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -572,6 +936,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+	}
+	if ctx.Err() == nil {
+		s.noteTaskDone(taskActivity, s.now())
 	}
 }
 
@@ -628,6 +995,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
+	s.noteTaskDone(taskKeepalive, s.now())
 }
 
 // poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，
@@ -649,8 +1017,16 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
-// 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
+//
+// v2.0.1 #10：并发**有界**（信号量 = schedule.balance_refresh_concurrency，默认
+// 8、上限 32），绝不再对 1146 个账号各起一个 goroutine（无上限并发是上游风控
+// 风暴最危险的路径）。后台周期刷新/启动首刷/面板手动刷新共用本函数与同一把
+// 单飞 gate（见 refreshBalanceGated），不会叠加两轮全池余额查询。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	conc := s.BalanceRefreshConcurrency()
+	// sem 即并发闸门：满载时遍历端阻塞，因此同时在途的 goroutine 数恒 <= conc，
+	// 与账号总数无关（账号 1 万也只会有 conc 个 goroutine 存活于本函数）。
+	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
@@ -663,8 +1039,10 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -679,10 +1057,29 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
-			}(a, st.UID)
+		}(a, st.UID)
 	}
 	wg.Wait()
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
+	s.noteTaskDone(taskBalance, s.now())
+}
+
+// refreshBalanceGated 在单飞 gate 保护下跑一轮全量余额刷新（后台周期/启动首刷
+// 用）：同类（面板手动 balance_all）正在执行时返回 false 并跳过本轮，绝不叠加
+// 两轮全池余额查询打上游。
+func (s *Scheduler) refreshBalanceGated() bool {
+	if !s.BeginTask(TaskBalance) {
+		return false
+	}
+	defer s.EndTask(TaskBalance)
+	s.RunBalanceRefreshNow()
+	return true
+}
+
+// balanceStartupSkip 启动首刷是否因账号数过大而跳过（纯函数便于单测）：
+// 未显式 force 且账号数 > 阈值（200）→ 跳过，交给周期刷新。
+func balanceStartupSkip(accounts int, force bool) bool {
+	return !force && accounts > balanceStartupSkipThreshold
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -695,10 +1092,16 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 	}
 	s.balanceInterval.Store(int64(interval))
 	go func() {
-		// 启动即刷一轮：进程重启（含升级到带按日批次的版本）后旧 state 可能没有
-		// credits_expiry_buckets；不等第一个 ticker，首页快照就能拿到与「检查」
-		// 同口径的完整数据，避免升级后前 5 分钟仍显示旧口径。
-		s.RunBalanceRefreshNow()
+		// 启动首刷保护（v2.0.1 #10）：不再「启动即全池无上限刷」。
+		// 1) 先按 schedule.balance_refresh_startup_delay 延迟（0=不延迟），让监听/
+		//    预热等启动动作先稳定，避免重启瞬间与其它启动流量叠加；
+		// 2) 账号数 > 200 且未显式 schedule.balance_refresh_startup_force=true →
+		//    跳过首刷（打日志说明恢复方式），把首次全量刷新交给周期 ticker；
+		// 3) 执行时同样走单飞 gate（与面板手动刷新互斥）。
+		// ctx 在延迟期间取消 → 直接退出（不抢跑首刷）。
+		if !s.balanceFirstRefresh(ctx) {
+			return
+		}
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -723,10 +1126,43 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				if !s.refreshBalanceGated() {
+					log.Printf("scheduler: 余额周期刷新跳过（全量余额刷新正在执行中）")
+				}
 			}
 		}
 	}()
+}
+
+// balanceFirstRefresh 启动首刷（延迟 + 大池跳过 + 单飞 gate）。返回 false 表示
+// ctx 在延迟期间被取消、goroutine 应直接退出；其余情况返回 true（首刷可能被
+// 跳过，但周期循环照常）。
+func (s *Scheduler) balanceFirstRefresh(ctx context.Context) bool {
+	s.schedMu.Lock()
+	delay := s.cfg.BalanceRefreshStartupDelay
+	force := s.cfg.BalanceRefreshStartupForce
+	poolRef := s.cfg.Pool
+	s.schedMu.Unlock()
+
+	if delay > 0 {
+		log.Printf("scheduler: 余额启动首刷延迟 %s（schedule.balance_refresh_startup_delay）", delay)
+		if !sleepCtx(ctx, delay) {
+			return false
+		}
+	}
+	accounts := 0
+	if poolRef != nil {
+		accounts = len(poolRef.List())
+	}
+	if balanceStartupSkip(accounts, force) {
+		log.Printf("scheduler: 账号数 %d > %d，跳过启动首刷（schedule.balance_refresh_startup_force=false 时大池默认跳过，避免重启瞬间打爆上游；周期刷新照常）",
+			accounts, balanceStartupSkipThreshold)
+		return true
+	}
+	if !s.refreshBalanceGated() {
+		log.Printf("scheduler: 启动首刷跳过（全量余额刷新正在执行中）")
+	}
+	return true
 }
 
 // StartTaskSweep 后台周期性任务补领清扫（独立 ticker goroutine，ctx 取消即停）。
