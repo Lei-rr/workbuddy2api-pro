@@ -196,7 +196,7 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 企业版**没有个人成长体系**：签到 / 成长任务 / 连登管家 / 猫猫旅行 / 夜猫子
 // 在上游一律被拒——实测（2026-10-07，同一时刻 A/B 对照）：
 //   - POST /v2/billing/meter/daily-checkin                → 400 code 10001「企业账号不支持该操作」
-//   - POST /billing/meter/claim-gift / claim-compensation → 400 code 10001 同上
+//   - POST /billing/meter/claim-gift                    → 400 code 10001 同上
 //   - GET  /activity/growth/{streak,buddy/info,heatmap,lottery/summary}
 //     与 GET /v2/activity/growth/tasks                    → 403「growth system is only available for personal users」
 //

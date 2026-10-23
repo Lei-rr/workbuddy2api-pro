@@ -36,19 +36,14 @@ func (s *Scheduler) RunStreakBonusNow() {
 	}
 }
 
-// streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
+// streakBonusAccount 单账号：补签保连登 → 新手礼包 → 兑换所有已解锁档位 → 抽完所有 chances。
 func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
-	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
+	// 0.5 新手礼包（每号一次，无则业务错误静默跳过）。
 	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
 		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
 	}
-	// 补偿改为「先查状态 → 待领才领」（issue #189）：旧写法 `if credit, err :=
-	// ClaimCompensation(...); err == nil` 把「没有补偿」「已经领过」与「领取真的
-	// 失败」压成同一形态，补偿带截止日（实测那次为 10/22）时签到一旦停摆就静默
-	// 过期。现在无待领不记日志，但状态查询失败与领取失败一律显式告警。
-	s.claimCompensationQuiet(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {

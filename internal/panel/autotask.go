@@ -1305,3 +1305,130 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusGatewayTimeout, "执行超时（任务仍在后台继续）")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 单账号「做任务」接口（POST /panel/api/accounts/{uid}/tasks/run）
+// ---------------------------------------------------------------------------
+
+// taskRunSummary 单账号「做任务」的汇总计数（响应里的 summary 字段）。
+//
+// 合同（前端按字段名消费，勿改名）：
+//   - total：results 条目数（含 runAutoAll 的两条「(批量接受)」合成行）；
+//   - done / skipped / error：results[].status 对应计数；
+//   - claimed：results[].claimed == true 的条目数，即**本轮成功走完领奖流程**的任务数。
+//     注意含上游幂等返回「此前已领取」的情形（此时 credit/energy 为 0，消息里写
+//     「奖励此前已领取」）——它们同样代表该条奖励已确认到账，计入 claimed 便于前端
+//     展示「领奖 N」，但不代表本轮新增了 N 份积分。
+type taskRunSummary struct {
+	Total   int `json:"total"`
+	Done    int `json:"done"`
+	Skipped int `json:"skipped"`
+	Error   int `json:"error"`
+	Claimed int `json:"claimed"`
+}
+
+// summarizeTaskRun 统计 runAutoAll 的逐项结果（纯函数，单测直接钉计数口径）。
+func summarizeTaskRun(results []map[string]any) taskRunSummary {
+	var s taskRunSummary
+	s.Total = len(results)
+	for _, item := range results {
+		switch item["status"] {
+		case "done":
+			s.Done++
+		case "skipped":
+			s.Skipped++
+		case "error":
+			s.Error++
+		}
+		if claimed, _ := item["claimed"].(bool); claimed {
+			s.Claimed++
+		}
+	}
+	return s
+}
+
+// accountTasksRun 单账号「做任务」：对该账号执行全部可自动任务，返回逐项结果 + 汇总。
+//
+// 路由：POST /panel/api/accounts/{uid}/tasks/run（无请求体）。
+//
+// 语义：与 auto_all 共用同一个执行器（runAutoAll：批量 accept → 逐项行为链路 →
+// 达标自动领奖，见本文件），不另造一套执行逻辑；区别只在响应契约——前端「做任务」
+// 按钮直接拿 summary 展示计数，不必自己遍历 results。同步返回（可能耗时数分钟）。
+//
+// 成功响应（200）：
+//
+//	{"ok":true,"uid":"<uid>",
+//	 "results":[{"task_code":"...","status":"done|skipped|error","message":"..."}, ...],
+//	 "summary":{"total":N,"done":N,"skipped":N,"error":N,"claimed":N}}
+//
+// results 原样透传 runAutoAll 的条目（附 desc/claimed/credit/energy/progress_after
+// 等扩展字段；前端只依赖 task_code/status/message 三字段）。summary 口径见
+// taskRunSummary 注释。
+//
+// 门控与状态码（tasks_run_test.go 钉住）：
+//   - 未知 uid → 404 {"ok":false,"error":"account not found"}；
+//   - 企业版 / 企业切换会话（无个人成长体系，行为事件会被上游忽略）→ **200 + ok:false
+//     + message**，不发起任何上游请求（与前端「跳过并提示」的交互约定一致）；
+//   - 无凭证 → 同 200 + ok:false + message；
+//   - 同账号已有任务动作在跑（per-account 锁被占）→ 409；
+//   - 执行超时 → 504（后台流水线继续跑，锁由 goroutine 释放）。
+//
+// 两个 ok:false 分支也返回 results:[] 与 summary 零值，保持响应形状稳定，前端可以
+// 无条件读 .results/.summary，只看 .ok 决定成功还是展示 .message。
+func (p *Panel) accountTasksRun(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	a := p.accountByUID(w, uid)
+	if a == nil {
+		return
+	}
+	// 门控拒绝统一回 200 + ok:false（不是 4xx）：前端 api() 只看 HTTP 状态码，
+	// 4xx 会被当成请求失败弹通用错误，拿不到这里的可读原因。
+	reject := func(msg string) {
+		log.Printf("panel: 做任务 uid=%s 跳过: %s", uid, msg)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      false,
+			"uid":     uid,
+			"message": msg,
+			"results": []map[string]any{},
+			"summary": taskRunSummary{},
+		})
+	}
+	if a.IsEnterpriseSession() {
+		reject("该账号为企业版/企业切换会话，无个人成长任务体系（成长任务行为事件会被上游忽略），无法执行做任务")
+		return
+	}
+	if a.AccessTokenValue() == "" {
+		reject("该账号无有效凭证（未登录或 token 已清空），无法执行做任务")
+		return
+	}
+	// per-account 互斥与单任务/auto_all 共用一把锁：正在跑就 409，不并发重跑。
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "该账号有任务动作正在执行中，请等本轮结束后再试")
+		return
+	}
+	// 与 auto_all 同口径的 context 兜底超时（多项任务串联 + 每项可能含真实对话）。
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	done := make(chan []map[string]any, 1)
+	go func() {
+		defer p.unlockAccount(uid) // 流水线真正结束才放锁（HTTP 超时不影响）
+		done <- p.runAutoAll(a)
+	}()
+	select {
+	case results := <-done:
+		if results == nil {
+			results = []map[string]any{} // JSON 输出 []（而不是 null），前端可直接 length
+		}
+		summary := summarizeTaskRun(results)
+		log.Printf("panel: 单号做任务 uid=%s 共 %d 项（完成 %d 跳过 %d 失败 %d 领奖 %d）",
+			uid, summary.Total, summary.Done, summary.Skipped, summary.Error, summary.Claimed)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"uid":     uid,
+			"results": results,
+			"summary": summary,
+		})
+	case <-ctx.Done():
+		writeErr(w, http.StatusGatewayTimeout, "执行超时（任务仍在后台继续）")
+	}
+}
