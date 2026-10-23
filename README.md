@@ -1059,7 +1059,17 @@ v2.0.1 起，非回环监听 + 双空密钥会被**拒绝启动**（防止面板
   static_configs: [{ targets: ["127.0.0.1:7863"] }]
 ```
 
-`GET /panel/api/readyz` 用于就绪探针（配置/目录可写 + 池已加载，失败 503）。
+`GET /panel/api/readyz` 用于就绪探针（配置/目录可写 + 池已加载，失败 503）。K8s 探针需注入面板 Bearer，例如：
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /panel/api/readyz
+    port: 7863
+    httpHeaders: [{ name: Authorization, value: "Bearer <panel.api_key 或 api_key>" }]
+```
+
+> 注意：readyz 的目录检查会创建/删除临时文件，容器挂载需可写；`read_only: true` 部署请改用 `/healthz` 做存活探针。
 
 ### 改错了配置怎么回滚（v2.2.0）？
 

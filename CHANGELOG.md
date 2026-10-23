@@ -68,7 +68,7 @@
 
 - 新增测试：优雅停机 9 + 自检 11 + state 备份 5 + 配置备份 8 + 审计/JSONL/可观测/任务历史（5 文件 1000+ 行）+ 前端 3 组
 - `go build` / `go vet` / `go test -count=1 ./...` 全绿（20 包）；Lead E2E 冒烟 14/14（readyz/metrics/配置保存 .bak/回滚恢复/审计动作/401）
-- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v22.md`）
+- QA 独立验证（HEAD `0389299`）：**189 项检查全 PASS，P0=0 / P1=0**——verify-pro 28/28、v2.0.1 回归 28/28、v2.1 回归 42/42、新增 verify-v22 25/25（readyz 正常/失败、metrics 8 指标、审计留痕、config .bak/rollback/无备份 400、损坏 state+.bak 恢复与隔离、Go1.24/compose/CI 静态）、独立前端 harness 43/43（0 warning）、真实浏览器 11/11、320px/375px 各 12/12；详见 `D:\dsh\tmp\verify-final-v22.md`
 
 ---
 

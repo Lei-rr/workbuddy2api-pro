@@ -121,7 +121,10 @@ services:
 - v2.0.1 鉴权失败限速是**进程内 best-effort**（重启清零；XFF 可伪造分散计数），依赖可信反代；如需强防护需外置 WAF/反代限流。
 - v2.2.0 `data/panel-audit.jsonl` / `data/task-runs.jsonl` **目前只追加不轮转**：写操作/任务批次每行约 100-300B，按日任务量评估（当前量级年增长 <10MB），后续 wave 可接 reqlog 的 rotate/prune 模式；磁盘紧张时手动清理旧文件即可（运行日志 ring 不受影响）。
 - v2.2.0 state 备份：`state.json.bak` 保留 1 份；损坏主文件会被隔离为 `state.json.corrupt-<ts>`，确认无需抢救后可删除这些文件。
-- v2.2.0 优雅停机依赖容器编排发 SIGTERM：`docker stop`/`compose down` 默认即 SIGTERM；`docker kill` 仍会硬杀（不做优雅收尾）。
+- v2.2.0 优雅停机依赖容器编排发 SIGTERM：`docker stop`/`compose down` 默认即 SIGTERM；`docker kill` 仍会硬杀（不做优雅收尾）；Windows 本机不便注入信号，进程级验证以单测 + Linux 容器 `docker stop` 为准。
+- v2.2.0 `/panel/api/readyz` 与 `/metrics` 均需面板 Bearer（Prometheus 用 `authorization.credentials`、K8s probe 用 `httpHeaders` 注入 key）；readyz 的目录可写检查会**创建并删除临时文件**，只读挂载（`read_only: true`）下会报不可写——这是有意区分于 `/healthz`（只判进程存活）。
+- v2.2.0 配置回滚是「恢复到 `config.json.bak`」单步操作、**没有 redo**：当前生效配置不会先另存，若回滚后又想回滚回滚前状态需手动保存或依赖 .bak 单份覆盖语义。  
+- v2.2.0 `state.json.corrupt-<ts>` 隔离文件**不会自动清理**（保留现场供抢救），确认无用后可手动删除。
 - `panel.api_key` 改动**需重启**（已列入 `restart_required`）；`panel.poll_interval_sec`/`catch_up_minutes`/`balance_refresh_concurrency` 热生效。
 
 ## 跟随上游（如果上游/fork 恢复更新）
