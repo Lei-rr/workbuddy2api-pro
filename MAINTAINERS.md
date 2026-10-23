@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.0.1-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.1.0-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -54,6 +54,7 @@ node --check internal/panel/mobile.js
 4. **单账号「做任务」**：`POST /panel/api/accounts/{uid}/tasks/run` = 复用 `auto_all` 执行器，返回 `results + summary{total,done,skipped,error,claimed}`。
 5. **保留原 fork 定制**：账号池筛选/分页、三 tab（账号池/模型锁池/积分到期）、到期独立分页、单号积分弹窗、重新扫描按钮、`packages?uid=` 单号必填。
 6. **v2.0.1 P0 优化**（2026-10-24）：面板 gzip/ETag/轮询治理；`panel.api_key` 与网关 key 分离 + 空密钥非回环阻断 + 鉴权失败限速；余额刷新有界并发（默认 8）+ 启动首刷保护（>200 号默认跳过）；5 个 `*_all` 单飞（409）且 `balance_all` 异步；调度补跑窗口 `schedule.catch_up_minutes`（默认 120）。
+7. **v2.1.0 账号池服务端分页**（2026-10-24）：新增 `GET /panel/api/accounts`（筛选/排序/分页/light 投影 + ETag/304）与 `overview?lite=1`；前端账号池轮询改为 lite + 当前页，完整 overview 仅页面加载/到期 tab 懒加载；默认 overview 与 `/status` 保持兼容。**后续改前端分页逻辑必须走服务端参数，不要再恢复全量 overview 轮询**。
 
 ## 部署链路
 
@@ -91,7 +92,9 @@ services:
 
 ## 实测基线（原 fork，1146 账号，供回归对照）
 
-- `/panel/api/overview`：约 689 KB / 13 ms；前端 5s 轮询只渲染当前页
+- `/panel/api/overview`：约 689 KB / 13 ms（v2.0.x 旧轮询口径；v2.1.0 起账号池不再每 5s 拉它）
+- v2.1.0 轮询口径：`overview?lite=1`（实测约 330–340 B）+ `accounts?page=..&page_size=100&fields=light`（实测约 46 KB / gzip 约 1.1–1.5 KB；无状态变化时 304 空 body）
+- v2.1.0 量化：25 账号 full overview 12,192 B → lite 335 B；300 账号 full 139,444 B → lite 341 B；1146 账号投影下旧版 5s 全量轮询约 532 KB（gzip ~14 KB）→ 新版约 1.8 KB/轮询（约 -99.7%）
 - 容器：CPU 约 0.04%，内存约 16.4 MB
 - `accounts/rescan`：`scanned=1146 added=0 removed=0`，约 160 ms
 - `packages?uid=<真实>` 200 / 未知 404 / 无 uid 400
@@ -104,7 +107,10 @@ services:
 - `auths/` 若出现属主混杂（如部分 `root:root`，容器以 10001 运行），可能 token 刷新失败：`chown -R 10001:10001 auths`。
 - 面板只有单 `api_key` 鉴权，**公网部署必须置于 HTTPS 反代之后**并加访问限流；`auths/` 内是明文 access/refresh token，勿泄露。
 - 单号积分构成弹窗为按需 1 次上游请求；整池全量查询入口已刻意封闭，不要恢复成页面自动全量查询（1000+ 账号时会触发风控）。
-- 前端分页依赖 `overview`/`request_logs` 全量返回；若将来改服务端分页，需同步改 `renderAccounts`/`renderRequestTable` 等纯前端切片逻辑与测试。
+- 账号池已是**服务端分页/筛选**（v2.1.0）：改 `renderAccounts`/`accQueryString` 时保持「以响应 page/pages 为准」与 ETag/304 缓存语义；其它列表（运行日志/请求日志/积分历史/模型锁池/任务队列）仍为纯前端分页。
+- 账号池 `light` 投影没有 `cool_remaining_sec`（秒级易变字段不参与 ETag）：前端倒计时用 `until`/`breaker_until`/`degrade_until` 本地算，不要依赖该字段。
+- 完整 overview 仅页面加载后台补一次 + 「积分到期」tab 按 60s 新鲜窗口拉取；列表 tab 不要再拉全量。
+- **已知 P2（v2.2 待修）**：`poolAccountList()` 优先用完整 overview 快照，账号增删后积分历史下拉/积分条基准可能滞后（建议增删号后后台补拉一次全量）；`page_size=0` 在 >2000 账号池会静默截断 2000（前端应提示改用分页）。
 - v2.0.1 面板 gzip 有 **1KB 阈值**：空池 overview / 401 / 429 等小响应不压缩属预期；大池 overview 与静态资源才受益（实测 app.js 222 KB → 74 KB wire）。
 - v2.0.1 鉴权失败限速是**进程内 best-effort**（重启清零；XFF 可伪造分散计数），依赖可信反代；如需强防护需外置 WAF/反代限流。
 - `panel.api_key` 改动**需重启**（已列入 `restart_required`）；`panel.poll_interval_sec`/`catch_up_minutes`/`balance_refresh_concurrency` 热生效。

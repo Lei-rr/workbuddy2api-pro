@@ -8,6 +8,32 @@
 
 ---
 
+## v2.1.0-pro（2026-10-24）
+
+### #1 面板数据面重构（P0，v2.1 第一项）
+
+- 新增 **`GET /panel/api/accounts`**：服务端筛选（`q` / `state` / `realm` / `enterprise`）+ 排序（`uid` / `credits` / `last_success` / `cool_remaining`）+ 分页（`page` / `page_size`，0=全部、上限 2000、超界钳末页）+ 字段投影（`fields=light` 默认，省略 `credits_expiry_buckets` / `cool_remaining_sec`；`full` 完整）；响应 `{ok,now,total,filtered,page,page_size,pages,rows}`
+- **ETag/304**：弱 ETag（hash 覆盖归一化查询 + 稳定投影，`cool_remaining_sec` / `in_flight` / `breaker_fails` / `token_usage.last_used_at` 归零）；`If-None-Match` 命中 → `304` 空 body —— 无状态变化时轮询零解析/零渲染
+- **`GET /panel/api/overview?lite=1`**：无 accounts 的轻量汇总（计数/元信息/model_locks/poll_interval_sec + 新增 `credits_sum` / `credits_total_sum`）；默认 overview 行为完全不变（只新增两个汇总字段，脚本零破坏）
+- **前端**：账号池改服务端分页/筛选/排序（防抖 250ms、条件变化回第 1 页、请求序号丢弃过期响应、以响应 `page`/`pages` 为准）；轮询 = lite overview + 当前页 accounts（304 复用缓存）；「积分到期」tab 懒加载完整 overview（60s 新鲜窗口）；冷却倒计时改为绝对 `until` 本地计算 + 200 时钟偏差校准（**304 后倒计时继续走**）；统计条改用 `credits_sum`
+- **性能**（估算；QA 实测见交付报告）：1146 账号下原「每 5s 689 KB 全量 overview」→「lite ~1–2 KB + light 单页 ~60 KB（gzip 后 ~8–15 KB），无变化时 304」
+
+### 兼容性
+
+- `/panel/api/overview`（不带 lite）与 `/status` 默认行为不变；新增字段只增不改
+- 外部脚本如需全量账号仍可拉 `overview`；新脚本建议 `GET /panel/api/accounts`
+- 前端账号池「全部」模式上限 2000 行（更多请配合筛选）；其它列表分页仍为纯前端
+
+### 测试与验证
+
+- 新增 `internal/panel/accounts_page_test.go`（10 个测试函数：分页边界/筛选 18 组/排序/light-full 投影/ETag 稳定与变化/304/易变字段规范化/lite/401/积分合计）
+- 前端新增/调整 5+ node harness 测试（服务端参数映射、304 跨轮询倒计时、lite 数据流与懒加载、控件接线、credits_sum）
+- `go build` / `go vet` / `go test -count=1 ./...` 全绿（20 包）
+- QA 独立验证（HEAD `544f7cc`）：**157 项检查全 PASS，P0=0 / P1=0**——verify-pro.ps1 28/28、verify-v21.ps1 42/42（25/300 伪造账号池的分页/筛选/排序/投影/ETag 304/lite/量化）、v2.0.1 回归 28/28、独立前端 harness 38/38（0 warning）、真实浏览器 10/10、320px/375px 各 11/11
+- **量化收益**：#1 实测——25 账号 full overview 12,192 B vs lite 335 B（2.75%）；300 账号 full 139,444 B vs lite 341 B（0.24%）、light 100 行页 46,312 B（gzip 1,454 B）；按 1146 账号投影，旧版每 5s 全量轮询约 532 KB（gzip 约 14 KB）→ 新版 lite 约 341 B + 页 gzip 约 1.5 KB，**约 99.7% 流量下降**，且无状态变化时 304 零解析
+
+---
+
 ## v2.0.1-pro（2026-10-24）
 
 P0 优化批次（对应 `UPGRADE_PROPOSALS.md` 的 #2 / #4 / #10 子项 / #11 子项）。

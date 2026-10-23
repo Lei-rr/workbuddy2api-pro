@@ -19,14 +19,15 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.0.1-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.1.0-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
 > 2. **移除「官方补偿」前后端**：面板「官方补偿」卡片、`compensation` 状态查询/领取接口、签到排程内的补偿调用全部删除——网关不再调用 `claim-compensation`，打开面板不再逐号请求上游；
 > 3. **列表分页与筛选补齐**：账号池 / 运行日志 / 请求日志 / 积分历史 / 模型锁池 / 任务队列；
 > 4. **单账号「做任务」按钮 + 接口**：`POST /panel/api/accounts/{uid}/tasks/run`；
-> 5. **v2.0.1 P0 优化**：面板 gzip / 静态缓存 / 轮询治理、面板密钥与网关密钥分离、鉴权失败限速、余额刷新有界并发与启动首刷保护、批量任务单飞（409）、调度补跑窗口。
+> 5. **v2.0.1 P0 优化**：面板 gzip / 静态缓存 / 轮询治理、面板密钥与网关密钥分离、鉴权失败限速、余额刷新有界并发与启动首刷保护、批量任务单飞（409）、调度补跑窗口；
+> 6. **v2.1.0 面板数据面重构**：账号池改为**服务端分页/筛选/排序**（`GET /panel/api/accounts`，light 投影 + ETag/304），轮询拆为 `overview?lite=1` + 当前页（客服端不再每 5s 拉全量）；到期 tab 懒加载完整 overview。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -768,11 +769,11 @@ http://127.0.0.1:7863/panel/
 
 ### 分页与筛选（Pro）
 
-1000+ 账号池下，面板所有长列表默认只渲染当前页；筛选与页码在 5s 轮询刷新后保持不变（轮询只换数据，不重置交互状态）：
+1000+ 账号池下，面板所有长列表默认只渲染当前页；筛选与页码在轮询刷新后保持不变。**v2.1.0 起账号池分页/筛选/排序已下沉到服务端**（`GET /panel/api/accounts`，支持 ETag/304），其余列表仍为纯前端分页：
 
 | 列表 | 筛选 | 分页 |
 |---|---|---|
-| 账号池 | 关键词（昵称 / UID）、状态（可用 / 冷却 / 暂停 / 禁用）、版本（国内 / 国际 / 企业） | 50 / 100 / 200 / 全部 |
+| 账号池 | **服务端**：关键词（昵称 / UID）、状态（可用 / 冷却 / 暂停 / 禁用）、版本（国内 / 国际 / 企业）、排序（uid / credits / last_success / cool_remaining） | **服务端** 50 / 100 / 200 / 全部（上限 2000 行；响应带 ETag，无变化 304） |
 | 积分到期 | — | 50 / 100 / 200 / 全部（独立分页，不影响账号池） |
 | 运行日志 | 频道（任务 / 对话 / 系统）+ 关键词 | 50 / 100 / 200 / 全部 |
 | 请求日志 | 关键词（IP / UA / 模型 / 账号 / 请求 ID，空格分词 AND）、结果、时间范围 | 50 / 100 / 200 / 全部（先筛选后分页） |
@@ -780,7 +781,7 @@ http://127.0.0.1:7863/panel/
 | 模型锁池 | 模型关键词、状态、地区 | 分页 |
 | 任务中心队列 | 状态、账号关键词 | 分页 / 分批渲染 |
 
-> 本版分页为**纯前端**：`overview` / `request_logs` 等接口协议未改，5s 轮询仍按既有口径取数。服务端分页、增量推送（SSE/ETag）等列入 [UPGRADE_PROPOSALS.md](UPGRADE_PROPOSALS.md) 的后续建议。
+> **v2.1.0 数据流**：账号池视图轮询 = `overview?lite=1`（实测约 **330–340 B**）+ 当前页 `accounts`（light 100 行实测约 46 KB，gzip 后约 **1.1–1.5 KB**；无状态变化时 `304` 0 字节）。对比旧版 1146 账号每 5s 全量 overview（约 532 KB，gzip 约 14 KB）：**轮询流量约下降 99.7%**。完整 overview 只在页面加载补一次与「积分到期」tab 激活时按 60s 新鲜窗口懒加载。其余列表仍为纯前端分页；SSE/增量推送列入 [UPGRADE_PROPOSALS.md](UPGRADE_PROPOSALS.md) 的后续建议。
 
 ### 调用来源（客户端 IP / User-Agent）
 
@@ -800,13 +801,15 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview`（默认全量；`?lite=1` 无 accounts、约 1–2 KB）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
+
+> **账号池分页接口（v2.1.0）**：`GET accounts` 的 `light` 投影省略 `credits_expiry_buckets` 与 `cool_remaining_sec`（前端用 `until`/`breaker_until`/`degrade_until` 本地倒计时），`full` 返回完整字段；响应头带弱 ETag（`If-None-Match` 命中返回 `304` 空 body），无状态变化时轮询零解析。`overview` 全量接口保留（脚本兼容），新增 `credits_sum`/`credits_total_sum` 汇总字段。
 
 > **批量端点语义（v2.0.1）**：`checkin_all` / `travel_all` / `activity_all` / `keepalive_all` / `balance_all` 同类任务**单飞**——空闲时立即返回 `{ok:true,started:true}`（`balance_all` 已异步化，后台有界并发执行，不再返回 `accounts`），同类正在执行时返回 `409 {"ok":false,"error":"…正在执行中…"}`。
 
