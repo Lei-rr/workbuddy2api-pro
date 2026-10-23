@@ -8,6 +8,70 @@
 
 ---
 
+## v2.2.0-pro（2026-10-24）
+
+工程与可靠性批次（UPGRADE_PROPOSALS #5 / #8 / #9 / #13 子项 / #14 / #15 / #16 / #17 + v2.1 P2 修复）。
+
+### #14 优雅停机（滚动升级不再断流）
+
+- 收到 SIGINT/SIGTERM：停止接新请求 → `http.Server.Shutdown`（上限 `server.shutdown_timeout`，默认 30s，可配 5–120s）→ 后台任务收敛 → **最后** `pool.Flush`（修复旧实现 flush 在 Shutdown 前的顺序问题）→ usage/reqlog/session 收尾 → 退出码 0
+- 二次信号立即强制退出（130）；日志含各阶段与 `graceful shutdown complete in Xms`
+- compose `stop_grace_period: 35s`（30s 上限 + 5s 余量）
+
+### #13 state.json 可靠性（子项）
+
+- 主文件写成功后把上一版滚动为 `state.json.bak`（tmp+rename、0600；写失败不覆盖备份）
+- 启动时主文件损坏 → 隔离为 `state.json.corrupt-<ts>` → 自动从 .bak 恢复并回写；无/坏备份时空池启动（不 fatal、不静默覆盖证据）
+- 启动自检（WARN 非 fatal）：auth_dir/state 目录可写性（临时文件探测）、磁盘 <100MiB、chown/挂载修复提示（Windows kernel32 / Unix Statfs 双实现）
+
+### #16 / #17 工具链与运行时
+
+- **Go 1.22.5 → 1.24**（go.mod/Dockerfile/CI 跟随，`go mod tidy` 清理，五平台交叉编译通过）
+- Dockerfile：`golang:1.24-alpine`、`COPY go.mod go.sum`（依赖层缓存稳定）；运行用户/HEALTHCHECK 保留
+- CI：test job 增加 `go vet ./...`，setup-go 显式 cache
+- compose：json-file 日志轮转（20MB × 3）+ `stop_grace_period: 35s`
+
+### #15 配置安全（备份 / 回滚 / 危险值）
+
+- 保存配置：校验 → 备份 `config.json.bak` → 原子写盘 → 热应用（校验失败不触碰备份；写失败备份仍是当前生效版）
+- 新增 `POST /panel/api/config/rollback`：用 .bak 恢复并热应用，返回 `restart_required`；无备份/非法备份/危险值 400 且不改动当前配置
+- 新增危险值拦截（空 auth_dir/state_file）、监听面变化审计日志
+
+### #8 可观测（面板侧）
+
+- `GET /panel/api/readyz`：config / auth_dir_writable / state_dir_writable / pool_loaded（失败 503）
+- `GET /panel/api/metrics`：Prometheus text v0.0.4（手写零依赖）——`workbuddy_up`、`uptime_seconds`、`accounts_total{state=...}`、`in_flight`、`credits_sum`、`credits_total_sum`、`model_locks`、`panel_requests_total`
+
+### #5 面板操作审计
+
+- 路由级 `withAudit` 中间件统一埋点（26 个写操作动作，成功/失败都记），落 `data/panel-audit.jsonl`（0600、追加、mutex、写失败仅 WARN）
+- `GET /panel/api/audit?limit=200`；面板「运行日志」页新增只读「操作审计」区块（点击拉取，不轮询）
+
+### #9 任务执行历史
+
+- 落 `data/task-runs.jsonl`：单号做任务/签到/余额、手动 `*_all`×5、成长队列、补领清扫（kind/trigger/起止/总数/完成/失败/跳过/错误）
+- `GET /panel/api/task_runs?limit=100`；面板「运行日志」页新增只读「任务执行历史」区块
+
+### 前端（含 v2.1 P2 修复）
+
+- 账号增删/重扫/登录/导入后**后台补拉完整 overview**（积分历史下拉、积分条基准、到期快照即时更新）
+- `page_size=0` 超 2000 行时显示截断提示（建议筛选/分页）
+- 新增审计/任务历史只读 UI（移动端自动卡片化）
+
+### 兼容性
+
+- `/panel/api/config` 保存响应字段不变（备份/回滚为新增端点）；`/panel/api/overview`、`/status` 行为不变
+- 新增配置键 `server.shutdown_timeout`（默认 `30s`，env `WB2A_SHUTDOWN_TIMEOUT`），老配置零影响
+- 审计/任务历史/备份文件均为新增数据文件（data/ 下），不影响既有运行数据
+
+### 测试与验证
+
+- 新增测试：优雅停机 9 + 自检 11 + state 备份 5 + 配置备份 8 + 审计/JSONL/可观测/任务历史（5 文件 1000+ 行）+ 前端 3 组
+- `go build` / `go vet` / `go test -count=1 ./...` 全绿（20 包）；Lead E2E 冒烟 14/14（readyz/metrics/配置保存 .bak/回滚恢复/审计动作/401）
+- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v22.md`）
+
+---
+
 ## v2.1.0-pro（2026-10-24）
 
 ### #1 面板数据面重构（P0，v2.1 第一项）

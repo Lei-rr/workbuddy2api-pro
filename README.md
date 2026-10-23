@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.1.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.2.0-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -27,7 +27,8 @@
 > 3. **列表分页与筛选补齐**：账号池 / 运行日志 / 请求日志 / 积分历史 / 模型锁池 / 任务队列；
 > 4. **单账号「做任务」按钮 + 接口**：`POST /panel/api/accounts/{uid}/tasks/run`；
 > 5. **v2.0.1 P0 优化**：面板 gzip / 静态缓存 / 轮询治理、面板密钥与网关密钥分离、鉴权失败限速、余额刷新有界并发与启动首刷保护、批量任务单飞（409）、调度补跑窗口；
-> 6. **v2.1.0 面板数据面重构**：账号池改为**服务端分页/筛选/排序**（`GET /panel/api/accounts`，light 投影 + ETag/304），轮询拆为 `overview?lite=1` + 当前页（客服端不再每 5s 拉全量）；到期 tab 懒加载完整 overview。
+> 6. **v2.1.0 面板数据面重构**：账号池改为**服务端分页/筛选/排序**（`GET /panel/api/accounts`，light 投影 + ETag/304），轮询拆为 `overview?lite=1` + 当前页（客服端不再每 5s 拉全量）；到期 tab 懒加载完整 overview；
+> 7. **v2.2.0 工程与可靠性批次**：优雅停机（SIGTERM 收尾 + state flush）、state.json 滚动备份/损坏回退/启动自检、Go 1.24、CI vet + 容器日志轮转/stop_grace_period、配置保存 .bak + 一键回滚、`/panel/api/readyz` + `/metrics`（Prometheus）、操作审计（JSONL）、任务执行历史（JSONL）。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -387,6 +388,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
+| `server.shutdown_timeout` | `30s` | **优雅停机**（v2.2.0）等待在途请求/后台任务收敛的上限（clamp 5–120s；0/负/非法启动报错）；超时后继续收尾并退出；改动需重启 |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `panel.api_key` | 空 | **面板专用密钥**（v2.0.1）：空 = 回落 `api_key`（面板与网关共用）；设置后仅面板使用此 key，`/v1/*` 仍只认 `api_key`。改动需重启 |
 | `panel.poll_interval_sec` | `5` | 面板轮询间隔（秒，2–60，热生效）；前端按约 ±20% 抖动，页面隐藏时暂停 |
@@ -455,7 +457,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
 
 ## 核心行为语义
 
@@ -802,10 +804,11 @@ http://127.0.0.1:7863/panel/
 | 分组 | 端点 |
 |---|---|
 | 只读 | `GET overview`（默认全量；`?lite=1` 无 accounts、约 1–2 KB）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 可观测（v2.2.0） | `GET readyz`（就绪探测：config/auth_dir/state_dir 可写 + pool_loaded，失败 503）· `GET metrics`（Prometheus text v0.0.4：池计数/在途/积分合计/模型锁/面板请求计数）· `GET audit?limit=200`（面板操作审计 JSONL，新的在前）· `GET task_runs?limit=100`（任务执行历史 JSONL） |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
-| 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
+| 写入 | `POST config`（校验 → 备份 `config.json.bak` → 落盘 → 热应用，返回需重启字段清单）· **`POST config/rollback`（v2.2.0：用 .bak 恢复并热应用；无备份/非法备份 400）** · `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
@@ -910,12 +913,14 @@ http://127.0.0.1:7863/panel/
 
 ### Docker 镜像
 
-多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
+多阶段镜像（`golang:1.24-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
 - 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
+- **优雅停机**（v2.2.0）：SIGTERM 后停止接新请求 → 等在途请求 ≤ `server.shutdown_timeout`（默认 30s）→ 后台任务收敛 → state 落盘 → 退出；compose 已配 `stop_grace_period: 35s`
+- **容器日志轮转**（v2.2.0）：compose `logging` = json-file / 20MB × 3，避免长期运行撑满磁盘
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
@@ -1042,6 +1047,23 @@ v2.0.1 起，非回环监听 + 双空密钥会被**拒绝启动**（防止面板
 3. 明确接受无鉴权（可信内网）：`security.allow_anonymous` 设为 `true`。
 
 > 删除 `config.json` 让程序重新生成时，会自动写入随机 `api_key`。
+
+### 如何把面板指标接入 Prometheus（v2.2.0）？
+
+`GET /panel/api/metrics`（Bearer 鉴权，面板 key 或网关 key 视配置）返回 Prometheus text v0.0.4，包含 `workbuddy_up`、`workbuddy_accounts_total{state=...}`、`workbuddy_in_flight`、`workbuddy_credits_sum` 等。示例 scrape 配置：
+
+```yaml
+- job_name: workbuddy
+  metrics_path: /panel/api/metrics
+  authorization: { credentials: "<panel.api_key 或 api_key>" }
+  static_configs: [{ targets: ["127.0.0.1:7863"] }]
+```
+
+`GET /panel/api/readyz` 用于就绪探针（配置/目录可写 + 池已加载，失败 503）。
+
+### 改错了配置怎么回滚（v2.2.0）？
+
+每次保存配置前会自动把上一版备份为 `config.json.bak`（保留最近 1 份）。调用 `POST /panel/api/config/rollback`（Bearer 鉴权）即可恢复并热应用，响应含 `restart_required`；无备份或备份非法返回 400 且不改动当前配置。
 
 ### 账号被 Disable 后如何恢复？
 

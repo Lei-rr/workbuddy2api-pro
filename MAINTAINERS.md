@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.1.0-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.2.0-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -55,6 +55,7 @@ node --check internal/panel/mobile.js
 5. **保留原 fork 定制**：账号池筛选/分页、三 tab（账号池/模型锁池/积分到期）、到期独立分页、单号积分弹窗、重新扫描按钮、`packages?uid=` 单号必填。
 6. **v2.0.1 P0 优化**（2026-10-24）：面板 gzip/ETag/轮询治理；`panel.api_key` 与网关 key 分离 + 空密钥非回环阻断 + 鉴权失败限速；余额刷新有界并发（默认 8）+ 启动首刷保护（>200 号默认跳过）；5 个 `*_all` 单飞（409）且 `balance_all` 异步；调度补跑窗口 `schedule.catch_up_minutes`（默认 120）。
 7. **v2.1.0 账号池服务端分页**（2026-10-24）：新增 `GET /panel/api/accounts`（筛选/排序/分页/light 投影 + ETag/304）与 `overview?lite=1`；前端账号池轮询改为 lite + 当前页，完整 overview 仅页面加载/到期 tab 懒加载；默认 overview 与 `/status` 保持兼容。**后续改前端分页逻辑必须走服务端参数，不要再恢复全量 overview 轮询**。
+8. **v2.2.0 工程与可靠性**（2026-10-24）：优雅停机 + `server.shutdown_timeout`；state.json 滚动 .bak/损坏回退/启动自检；Go 1.24；CI vet + compose 日志轮转/stop_grace_period；配置保存 .bak + `POST /panel/api/config/rollback`；`/panel/api/readyz`、`/panel/api/metrics`；操作审计 `data/panel-audit.jsonl`、任务历史 `data/task-runs.jsonl`。**新增数据文件会随运行增长（当前未做自动 rotate/prune，见已知注意点）**。
 
 ## 部署链路
 
@@ -63,6 +64,7 @@ node --check internal/panel/mobile.js
 - 运行数据（**不在仓库里，升级时必须保留**）：`auths/`、`data/`、`config.json`
 - 从旧 `workbuddy2api-panel` 迁移：停旧容器 → 部署目录改 `image:` / `container_name:` → `docker pull ghcr.io/lei-rr/workbuddy2api-pro:latest` → `docker compose up -d`。配置 schema 未变，无需改 `config.json`；宿主健康探测若按旧 `service == "workbuddy2api"` 判据需同步改名。
 - **v2.0.1 升级注意**：① 若 `listen` 为非回环（如 `:7863`）且 `api_key` / `panel.api_key` 均为空，新版本会**拒绝启动**——先配置 key（或 `security.allow_anonymous: true`，或改回环监听）；② 建议设置 `panel.api_key` 把面板密钥与网关 API key 分开；③ `balance_all` 已异步化、批量端点会返回 409，外部脚本/监控需适配；④ 新增 7 个配置键（见 `config.example.json` 与 README「字段速查」）。
+- **v2.2.0 升级注意**：① 停机流程改为 SIGTERM 优雅收尾（compose `stop_grace_period: 35s`，`server.shutdown_timeout` 默认 30s）——`docker restart`/`compose up -d` 会先等在途请求；② 配置保存会生成 `config.json.bak`，可用 `POST /panel/api/config/rollback` 回滚；③ 新增 `data/panel-audit.jsonl` / `data/task-runs.jsonl`（0600）与 `state.json.bak`/`state.json.corrupt-*`，备份时把整个 `data/` 一起打包即可；④ Go 工具链升至 1.24（二进制/镜像重新构建）。
 
 参考 `docker-compose.yml`（仓库内已改名）：
 
@@ -79,6 +81,10 @@ services:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json
+    stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
 ```
 
 **发布流程**：`git push origin main` → GitHub Actions 构建并推送 GHCR（约 2-3 分钟）→ `docker pull` → `docker compose up -d`。
@@ -113,6 +119,9 @@ services:
 - **已知 P2（v2.2 待修）**：`poolAccountList()` 优先用完整 overview 快照，账号增删后积分历史下拉/积分条基准可能滞后（建议增删号后后台补拉一次全量）；`page_size=0` 在 >2000 账号池会静默截断 2000（前端应提示改用分页）。
 - v2.0.1 面板 gzip 有 **1KB 阈值**：空池 overview / 401 / 429 等小响应不压缩属预期；大池 overview 与静态资源才受益（实测 app.js 222 KB → 74 KB wire）。
 - v2.0.1 鉴权失败限速是**进程内 best-effort**（重启清零；XFF 可伪造分散计数），依赖可信反代；如需强防护需外置 WAF/反代限流。
+- v2.2.0 `data/panel-audit.jsonl` / `data/task-runs.jsonl` **目前只追加不轮转**：写操作/任务批次每行约 100-300B，按日任务量评估（当前量级年增长 <10MB），后续 wave 可接 reqlog 的 rotate/prune 模式；磁盘紧张时手动清理旧文件即可（运行日志 ring 不受影响）。
+- v2.2.0 state 备份：`state.json.bak` 保留 1 份；损坏主文件会被隔离为 `state.json.corrupt-<ts>`，确认无需抢救后可删除这些文件。
+- v2.2.0 优雅停机依赖容器编排发 SIGTERM：`docker stop`/`compose down` 默认即 SIGTERM；`docker kill` 仍会硬杀（不做优雅收尾）。
 - `panel.api_key` 改动**需重启**（已列入 `restart_required`）；`panel.poll_interval_sec`/`catch_up_minutes`/`balance_refresh_concurrency` 热生效。
 
 ## 跟随上游（如果上游/fork 恢复更新）
