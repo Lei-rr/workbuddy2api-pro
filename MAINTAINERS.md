@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.3.1-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.4.0-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -58,6 +58,7 @@ node --check internal/panel/mobile.js
 8. **v2.2.0 工程与可靠性**（2026-10-24）：优雅停机 + `server.shutdown_timeout`；state.json 滚动 .bak/损坏回退/启动自检；Go 1.24；CI vet + compose 日志轮转/stop_grace_period；配置保存 .bak + `POST /panel/api/config/rollback`；`/panel/api/readyz`、`/panel/api/metrics`；操作审计 `data/panel-audit.jsonl`、任务历史 `data/task-runs.jsonl`。**新增数据文件会随运行增长（当前未做自动 rotate/prune，见已知注意点）**。
 9. **v2.3.0 运维效能**（2026-10-24）：`internal/jobs` Job Runner（异步/进度/取消/data/jobs.json/单飞/Job 级并发闸门）；`internal/notify` Webhook 通知（job_done/account_disabled/checkin_failed）；备注/标签服务端化 `data/account-meta.json` + 前端迁移；旧批量端点新增 job_id 兼容。**Job Runner 的并发闸门是「同时执行的 Job 数」，账号级并行度仍由各任务控制**。
 10. **v2.3.1 调度器完整优化**（2026-10-24）：签到 worker pool 并发（`schedule.checkin_concurrency` 默认 3）+ 跳过当日已签（进程内，重启重打）+ 429 重试分层 + 按族解耦（慢签到不阻塞其它族）；定时/补跑批次进入 Job 历史（trigger=schedule/catch_up，可取消）；标签服务端筛选（accounts tag + meta/tags 索引）；通知渠道 wecom/telegram/bark；`scripts/panel_frontend_check.mjs` 入 CI。**改调度语义时先看 checkin11_test.go 的分层/跳过/并发断言**。
+11. **v2.4.0 安全与实时**（2026-10-24）：SSE `/panel/api/events`（snapshot/jobs/accounts + 心跳；前端 fetch+ReadableStream，断线回落轮询）；多用户/RBAC（panel.users + 登录会话 + 集中式角色门禁，api_key 始终 admin）；凭证静态加密（AES-256-GCM + WB2A_MASTER_KEY + authcrypt 迁移）。**默认关闭/不启用：不配 users 不启用登录，encrypt_auths=false 维持明文；改 RBAC/加密相关代码先看 rbac_test/crypto_test**。
 
 ## 部署链路
 
@@ -137,6 +138,10 @@ services:
 - v2.3.1 重试分层：429 由 scheduler 重试 1 次；5xx/网络由 upstream 客户端既有重试；4xx 不重试。**不要在两处同时加重试**（会 3×2 放大）。
 - v2.3.1 标签筛选匹配大小写不敏感；`GET meta/tags` 展示拼写=uid 序首个出现的原始拼写（稳定但非最近编辑值）；暂不支持「无标签」筛选（`tag=`=不筛选）。
 - v2.3.1 CI 前端门禁脚本 `scripts/panel_frontend_check.mjs`：改 app.js/index.html 后本地先跑，失败会指出缺失 id/超预算/非法路径。
+- v2.4.0 凭证加密：`WB2A_MASTER_KEY` 丢失 = 加密凭证不可恢复；authcrypt 的 `.plain.bak`/`.enc.bak` 含明文/旧密文，验证后必须立即安全删除；`scripts/*.py` 直接读明文 JSON，加密后需先解密。
+- v2.4.0 会话仅内存（重启重登）；Cookie 会话无 CSRF token（SameSite=Lax + JSON API，取舍已文档化）；多实例部署各自维护会话。
+- v2.4.0 SSE 为进程内推送（单实例语义）：多实例/反代需注意 `X-Accel-Buffering: no` 与空闲超时；慢客户端断开会由重连 snapshot 自愈。
+- v2.4.0 角色门禁两处加严：`GET /panel/api/config` 与 `POST accounts/rescan` 仅 admin（前者回显密钥/口令哈希，后者等价危险操作）；新增写端点记得同步 `roleAllowed` 矩阵与 rbac_test。
 - v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。
 - v2.3.1 `meta/tags` 展示拼写取 uid 升序首个出现的写法（如 VIP），匹配本身大小写不敏感；如需统一小写展示可后续归一。
 - v2.3.1 `schedule.checkin_concurrency` 热更新只影响**下一轮**签到（在途 worker 不打断）；`notify.channel` 未知值仅 WARN 关闭通知，而 telegram 缺 chat_id 是启动 fail-fast（口径差异，见 config.normalize）。

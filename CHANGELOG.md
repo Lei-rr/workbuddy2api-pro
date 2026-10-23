@@ -8,6 +8,51 @@
 
 ---
 
+## v2.4.0-pro（2026-10-24）
+
+安全与实时批次（UPGRADE_PROPOSALS #3 / #6 / #7 / #20 收尾）。
+
+### #3 SSE 事件推送（替代轮询）
+
+- 新增 `GET /panel/api/events`（withAuth）：`event: snapshot`（首帧立即 + 每 2s：now/now_unix/version/poll_interval_sec/counts/credits_sum/credits_total_sum/jobs 最近 10 条/events_enabled）、`event: jobs`/`event: accounts`（变化时推送）、15s 心跳 `: ping`
+- Hub：包级懒创建、单实例最多 64 客户端、每客户端缓冲 16、慢客户端断开由重连 snapshot 自愈；无客户端时 hub 自动停止并摘除；`panel.events_enabled=false` → 404
+- ServeHTTP 对 /panel/api/events 绕过 gzip 缓冲（事件立即 flush）
+- 前端：fetch + ReadableStream 带 Bearer 解析 SSE（EventSource 不支持 header）；连接期间暂停 jobs/accounts 轮询、断线指数退避 1→30s、404/501 永久回落轮询；顶栏「实时/轮询」徽标
+
+### #6 多用户 / RBAC（阶段一）
+
+- 配置 `panel.users`（`{name,password|password_hash,role}`）+ `panel.session_ttl`（默认 12h）；空 users = 单密钥模式零变化
+- 新增 `POST /panel/api/auth/login`（成功下发 32B token + HttpOnly `wb2_session` Cookie；失败统一 401 并沿用 20 次/分钟/IP 限速）、`POST auth/logout`、`GET auth/info`（mode/user/role/events_enabled）
+- 集中式角色门禁：viewer=只读 GET（+logout）；operator=任务/账号运维写（checkin/balance/revive/disable/pause/resume、tasks、jobs、meta、usage）；admin=全部（config 读写、删号、重扫、导入、添加账号仅 admin）；`api_key` Bearer 始终 admin（脚本兼容）
+- 安全加严：`GET /panel/api/config` 与 `POST accounts/rescan` 限 admin（前者回显含密钥/口令哈希，后者等价删号危险操作）
+- 前端：启动读 auth/info 自动切换「密钥/账号密码」登录；顶栏显示用户名+角色与退出；按角色禁用/隐藏写操作与配置导航（渲染期 + 命令式双保险）
+
+### #7 凭证静态加密（可选）
+
+- `security.encrypt_auths` + `WB2A_MASTER_KEY`（32 字节 base64/hex）：AES-256-GCM 整文件包装（随机 nonce、0600 原子写）
+- 存量明文兼容、混合目录可读；开启后所有写回（登录/刷新/realm 回填/导入）自动加密；密钥不可用时拒绝写回（不降级明文）；启动缺/非法密钥 fail-fast 并提示迁移
+- 新增 `cmd/authcrypt`：`-encrypt|-decrypt [-config] [-dir] [-dry-run]`，保留 `.plain.bak`/`.enc.bak`，输出 summary、退出码 0/1
+- LoadDir：密文解密失败逐文件 WARN（点名文件）；开启加密但仍有明文时汇总 WARN 提示迁移
+- 启动日志输出主密钥指纹（sha256 前 8 字节）便于核对同一把密钥；docker-compose 增加 `WB2A_MASTER_KEY` 注释示例
+
+### #20 移动端收尾
+
+- 320px/375px 回归：多用户登录表单、实时徽标、用户名、标签筛选行、Job 进度条、审计/任务历史表格均无横向溢出
+
+### 兼容性
+
+- 默认全部关闭/不启用：不配 `panel.users` 不启用登录；`security.encrypt_auths=false` 维持明文；`panel.events_enabled=true` 仅新增 SSE（旧客户端不受影响）
+- 旧配置零影响：新字段均有默认值；`api_key` 单密钥模式行为与 v2.3.1 一致
+- 取舍（文档已注明）：Cookie 会话暂无 CSRF token；用户管理仍改配置重启；会话仅内存；SSE 单实例进程内推送；`scripts/*.py` 在加密后需先解密
+
+### 测试与验证
+
+- 新增/扩展测试：SSE 12 + RBAC 13 测试函数 + auth 加密 16 + authcrypt + 前端 4 组；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
+- Lead E2E 冒烟 29/29：加密启动/缺密钥 fail-fast/authcrypt 往返、多用户 login 三角色矩阵/403/logout/限速、SSE snapshot、单密钥兼容、version/frontend 标记
+- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v240.md`）
+
+---
+
 ## v2.3.1-pro（2026-10-24）
 
 调度与体验批次（UPGRADE_PROPOSALS #11 完整优化、#18 阶段一、#12/#19 扩展）。
