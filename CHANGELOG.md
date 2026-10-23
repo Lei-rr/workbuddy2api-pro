@@ -8,6 +8,48 @@
 
 ---
 
+## v2.3.1-pro（2026-10-24）
+
+调度与体验批次（UPGRADE_PROPOSALS #11 完整优化、#18 阶段一、#12/#19 扩展）。
+
+### #11 调度器完整优化
+
+- **签到并发**：`schedule.checkin_concurrency`（默认 3，clamp 1–16，热生效）——签到批次改为账号级 worker pool，进度/取消线程安全；1146 号池串行约 1 小时 → 并发 3 后约 15–20 分钟
+- **跳过当日已签**：进程内 uid→本地日期记录（成功或上游「已签到」幂等即标记）；同日手动/定时/补跑再跑跳过 checkin RPC（仍刷新余额/解冻）并计 skip；重启后内存清零（上游幂等，文档注明）
+- **失败重试分层**：429 软限流由 scheduler 重试 1 次（防重试风暴，5xx/网络由 upstream 客户端既有有界重试，不叠加）；4xx 鉴权/凭证/业务直接 fail
+- **按族解耦**：到点批次每族先抢单飞 gate 再独立 goroutine 执行，慢签到不再阻塞旅行/活跃/保活；补跑窗口/lastRun/单飞 409 语义保持
+- **定时/补跑批次进入 Job 历史**：`trigger=schedule/catch_up` 的 Job 出现在 `GET /panel/api/jobs`、可取消（ctx 取消早停）、job_done Webhook 正常；失败不阻断调度
+
+### #18 前端工程化（阶段一）
+
+- 新增 `scripts/panel_frontend_check.mjs`（零依赖）：JS 语法解析、DOM id 双向契约、API 路径白名单（禁硬编码/绝对 URL/疑似 key）、体积预算（app.js<350KB、mobile.js<25KB、index.html<130KB）
+- CI `go-binaries` test job 增加 `node scripts/panel_frontend_check.mjs` 门禁
+
+### #12 扩展：标签服务端筛选
+
+- `GET /panel/api/accounts?...&tag=<标签>`：按 account-meta 的 tags 大小写不敏感筛选，与 q/state/realm/enterprise AND；`tag` 已纳入 ETag（304 语义不变）
+- `GET /panel/api/meta/tags`：`{tag,count}` 按 count 降序、同 count 字典序；内存索引（加载后 O(1) 查表），meta 变更热更新
+- 账号池筛选栏新增「标签」下拉（最多 50 个、count 降序、无匹配空态提示），与分页/其它筛选组合
+
+### #19 扩展：通知渠道
+
+- `notify.channel`：`webhook`（默认，payload 不变）/ `wecom`（企业微信群机器人 markdown）/ `telegram`（Bot sendMessage，需 `notify.telegram_chat_id`）/ `bark`（iOS Bark）
+- 纯文本概要（如 `[job_done] checkin 完成 100/120 失败 3 跳过 5`，≤2KB）；成功判定 webhook 2xx / wecom errcode==0 / telegram ok:true / bark 2xx；日志按渠道脱敏
+
+### 兼容性
+
+- 旧配置零影响：`schedule.checkin_concurrency` 默认 3、`notify.channel` 默认 webhook；telegram 渠道缺 chat_id 会启动报错（提示配置）
+- Job API/旧批量端点/备注接口/ETag 语义只增不改
+- 跳过当日已签仅进程内（重启后重打，上游幂等）；定时 Job 的 trigger 字段可选展示
+
+### 测试与验证
+
+- 新增测试：scheduler 11 + cmd/server 1 + panel tag 5 + notify 12 + 前端 4/扩展 3；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
+- 前端工程化检查：`panel frontend check: OK (app.js=269.4KB, mobile.js=12.6KB, index.html=94.8KB)`
+- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v231.md`）
+
+---
+
 ## v2.3.0-pro（2026-10-24）
 
 运维效能批次（UPGRADE_PROPOSALS #10 / #12 / #19，Wave 2A）。

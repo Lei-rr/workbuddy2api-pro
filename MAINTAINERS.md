@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.3.0-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.3.1-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -56,7 +56,8 @@ node --check internal/panel/mobile.js
 6. **v2.0.1 P0 优化**（2026-10-24）：面板 gzip/ETag/轮询治理；`panel.api_key` 与网关 key 分离 + 空密钥非回环阻断 + 鉴权失败限速；余额刷新有界并发（默认 8）+ 启动首刷保护（>200 号默认跳过）；5 个 `*_all` 单飞（409）且 `balance_all` 异步；调度补跑窗口 `schedule.catch_up_minutes`（默认 120）。
 7. **v2.1.0 账号池服务端分页**（2026-10-24）：新增 `GET /panel/api/accounts`（筛选/排序/分页/light 投影 + ETag/304）与 `overview?lite=1`；前端账号池轮询改为 lite + 当前页，完整 overview 仅页面加载/到期 tab 懒加载；默认 overview 与 `/status` 保持兼容。**后续改前端分页逻辑必须走服务端参数，不要再恢复全量 overview 轮询**。
 8. **v2.2.0 工程与可靠性**（2026-10-24）：优雅停机 + `server.shutdown_timeout`；state.json 滚动 .bak/损坏回退/启动自检；Go 1.24；CI vet + compose 日志轮转/stop_grace_period；配置保存 .bak + `POST /panel/api/config/rollback`；`/panel/api/readyz`、`/panel/api/metrics`；操作审计 `data/panel-audit.jsonl`、任务历史 `data/task-runs.jsonl`。**新增数据文件会随运行增长（当前未做自动 rotate/prune，见已知注意点）**。
-9. **v2.3.0 运维效能**（2026-10-24）：`internal/jobs` Job Runner（异步/进度/取消/data/jobs.json/单飞/Job 级并发闸门）；`internal/notify` Webhook 通知（job_done/account_disabled/checkin_failed）；备注/标签服务端化 `data/account-meta.json` + 前端迁移；旧批量端点新增 job_id 兼容。**Job Runner 的并发闸门是「同时执行的 Job 数」，账号级并行度仍由各任务控制；定时批次暂不入 jobs.json（见 v2.3.1 计划）**。
+9. **v2.3.0 运维效能**（2026-10-24）：`internal/jobs` Job Runner（异步/进度/取消/data/jobs.json/单飞/Job 级并发闸门）；`internal/notify` Webhook 通知（job_done/account_disabled/checkin_failed）；备注/标签服务端化 `data/account-meta.json` + 前端迁移；旧批量端点新增 job_id 兼容。**Job Runner 的并发闸门是「同时执行的 Job 数」，账号级并行度仍由各任务控制**。
+10. **v2.3.1 调度器完整优化**（2026-10-24）：签到 worker pool 并发（`schedule.checkin_concurrency` 默认 3）+ 跳过当日已签（进程内，重启重打）+ 429 重试分层 + 按族解耦（慢签到不阻塞其它族）；定时/补跑批次进入 Job 历史（trigger=schedule/catch_up，可取消）；标签服务端筛选（accounts tag + meta/tags 索引）；通知渠道 wecom/telegram/bark；`scripts/panel_frontend_check.mjs` 入 CI。**改调度语义时先看 checkin11_test.go 的分层/跳过/并发断言**。
 
 ## 部署链路
 
@@ -67,6 +68,7 @@ node --check internal/panel/mobile.js
 - **v2.0.1 升级注意**：① 若 `listen` 为非回环（如 `:7863`）且 `api_key` / `panel.api_key` 均为空，新版本会**拒绝启动**——先配置 key（或 `security.allow_anonymous: true`，或改回环监听）；② 建议设置 `panel.api_key` 把面板密钥与网关 API key 分开；③ `balance_all` 已异步化、批量端点会返回 409，外部脚本/监控需适配；④ 新增 7 个配置键（见 `config.example.json` 与 README「字段速查」）。
 - **v2.2.0 升级注意**：① 停机流程改为 SIGTERM 优雅收尾（compose `stop_grace_period: 35s`，`server.shutdown_timeout` 默认 30s）——`docker restart`/`compose up -d` 会先等在途请求；② 配置保存会生成 `config.json.bak`，可用 `POST /panel/api/config/rollback` 回滚；③ 新增 `data/panel-audit.jsonl` / `data/task-runs.jsonl`（0600）与 `state.json.bak`/`state.json.corrupt-*`，备份时把整个 `data/` 一起打包即可；④ Go 工具链升至 1.24（二进制/镜像重新构建）。
 - **v2.3.0 升级注意**：① 批量按钮/脚本响应新增 `job_id`（旧字段保留），UI 顶部出现 Job 进度条；② 备注/标签迁到服务端 `data/account-meta.json`（本机旧 localStorage 备注首次打开自动迁移，失败保留本地）；③ 新增 `data/jobs.json`；④ 如配置 `notify.webhook_url`，会收到 job_done/account_disabled/checkin_failed 事件（空=关闭）。
+- **v2.3.1 升级注意**：① 签到默认并发 3（可配 1–16），大池单轮显著变快；同日重复跑会跳过已签（重启后重打，上游幂等）；② `notify.channel=telegram` 必须配 `notify.telegram_chat_id`（否则启动报错）；③ 定时/补跑批次现在也会出现在任务进度/历史里（trigger=schedule/catch_up），面板可取消；④ CI 新增前端检查脚本，本地可跑 `node scripts/panel_frontend_check.mjs`。
 
 参考 `docker-compose.yml`（仓库内已改名）：
 
@@ -131,6 +133,10 @@ services:
 - v2.3.0 Job Runner 进度语义：`done`=已处理账号数（含失败、不含跳过），前端展示进度 = `done+skip`；取消只停后续账号、当前账号会跑完。
 - v2.3.0 定时/补跑批次**不会**出现在 `/panel/api/jobs`（仅手动批量/单号任务）；定时批次记录仍在 task-runs.jsonl（批量统计随后续 scheduler 观察者增强）。
 - v2.3.0 备注/标签是完整 uid 权威存储；旧 localStorage 的 uid8 键只有能解析到唯一完整 uid 时才迁移，解析不到只留本地（标记 legacy）。
+- v2.3.1 「跳过当日已签」是**进程内**记录：重启/滚动升级后当天会重新打一轮 checkin（上游幂等，无副作用）；没有持久化到 state.json 是有意取舍。
+- v2.3.1 重试分层：429 由 scheduler 重试 1 次；5xx/网络由 upstream 客户端既有重试；4xx 不重试。**不要在两处同时加重试**（会 3×2 放大）。
+- v2.3.1 标签筛选匹配大小写不敏感；`GET meta/tags` 展示拼写=uid 序首个出现的原始拼写（稳定但非最近编辑值）；暂不支持「无标签」筛选（`tag=`=不筛选）。
+- v2.3.1 CI 前端门禁脚本 `scripts/panel_frontend_check.mjs`：改 app.js/index.html 后本地先跑，失败会指出缺失 id/超预算/非法路径。
 - v2.3.0 Job 触发/取消**暂未进入面板操作审计**（依赖 jobs.json 与 task_runs 追溯）；如需审计可后续加 `jobs_run/job_cancel` action。
 - v2.3.0 备注迁移逐条 PUT：旧本机备注很多时首次打开会产生 N 个请求（当前规模可接受；后续可加批量导入接口）。
 - v2.3.0 Webhook 失败只重试 1 次后 WARN（不落盘待发）；data 允许 ≥7 字段（含 log_tail 摘要时更大），接收端应容忍额外字段。

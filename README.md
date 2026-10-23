@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.3.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.3.1-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -30,6 +30,7 @@
 > 6. **v2.1.0 面板数据面重构**：账号池改为**服务端分页/筛选/排序**（`GET /panel/api/accounts`，light 投影 + ETag/304），轮询拆为 `overview?lite=1` + 当前页（客服端不再每 5s 拉全量）；到期 tab 懒加载完整 overview；
 > 7. **v2.2.0 工程与可靠性批次**：优雅停机（SIGTERM 收尾 + state flush）、state.json 滚动备份/损坏回退/启动自检、Go 1.24、CI vet + 容器日志轮转/stop_grace_period、配置保存 .bak + 一键回滚、`/panel/api/readyz` + `/metrics`（Prometheus）、操作审计（JSONL）、任务执行历史（JSONL）。
 > 8. **v2.3.0 运维效能批次**：全池批量任务 **Job Runner**（异步/进度/取消/持久化/单飞）、**Webhook 事件通知**（job_done/account_disabled/checkin_failed）、**账号备注/标签服务端化**（data/account-meta.json，替代 localStorage）、面板 Job 进度条与备注迁移。
+> 9. **v2.3.1 调度与体验批次**：签到并发（`schedule.checkin_concurrency` 默认 3）+ **跳过当日已签** + 429 瞬态重试分层；**按族解耦调度**（慢签到不再阻塞旅行/活跃）；定时/补跑批次进入 Job 历史；账号池**标签筛选**（`tag=` + `GET meta/tags`）；通知渠道扩展 **企业微信 / Telegram / Bark**；`scripts/panel_frontend_check.mjs` 前端工程化检查接入 CI。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -395,6 +396,10 @@ curl -s http://localhost:7863/v1/search/messages \
 | `notify.webhook_url` | 空 | **事件通知 Webhook**（v2.3.0）：空=关闭；非空时异步 POST `{"event","ts","data"}` |
 | `notify.timeout` | `10s` | Webhook 单次请求超时（Go duration，clamp 1–60s） |
 | `notify.events` | 默认三件套 | 订阅事件：`job_done` / `account_disabled` / `checkin_failed`；空=默认集合 |
+| `schedule.checkin_concurrency` | `3` | **签到并发**（v2.3.1）：签到批次账号级 worker 数（clamp 1–16，热生效）；1146 号池建议 3–5，过高易触发上游风控 |
+| `notify.channel` | `webhook` | 通知渠道（v2.3.1）：`webhook`（通用 JSON）/ `wecom`（企业微信群机器人）/ `telegram`（Bot sendMessage）/ `bark`（iOS Bark） |
+| `notify.telegram_chat_id` | 空 | telegram 渠道必填的目标 chat_id（数字 id 或 @channel） |
+| `notify.title` | `WorkBuddy2API Pro` | 渠道消息标题（wecom/bark 使用） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `panel.api_key` | 空 | **面板专用密钥**（v2.0.1）：空 = 回落 `api_key`（面板与网关共用）；设置后仅面板使用此 key，`/v1/*` 仍只认 `api_key`。改动需重启 |
 | `panel.poll_interval_sec` | `5` | 面板轮询间隔（秒，2–60，热生效）；前端按约 ±20% 抖动，页面隐藏时暂停 |
@@ -463,7 +468,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_JOBS_MAX_CONCURRENCY` · `WB2A_JOBS_RETAIN` · `WB2A_NOTIFY_WEBHOOK` · `WB2A_NOTIFY_TIMEOUT`(duration) · `WB2A_NOTIFY_EVENTS`(逗号分隔) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool)
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_JOBS_MAX_CONCURRENCY` · `WB2A_JOBS_RETAIN` · `WB2A_NOTIFY_WEBHOOK` · `WB2A_NOTIFY_TIMEOUT`(duration) · `WB2A_NOTIFY_EVENTS`(逗号分隔) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool) · `WB2A_CHECKIN_CONCURRENCY` · `WB2A_NOTIFY_CHANNEL` · `WB2A_NOTIFY_TELEGRAM_CHAT_ID` · `WB2A_NOTIFY_TITLE`
 
 ## 核心行为语义
 
@@ -781,7 +786,7 @@ http://127.0.0.1:7863/panel/
 
 | 列表 | 筛选 | 分页 |
 |---|---|---|
-| 账号池 | **服务端**：关键词（昵称 / UID）、状态（可用 / 冷却 / 暂停 / 禁用）、版本（国内 / 国际 / 企业）、排序（uid / credits / last_success / cool_remaining） | **服务端** 50 / 100 / 200 / 全部（上限 2000 行；响应带 ETag，无变化 304） |
+| 账号池 | **服务端**：关键词（昵称 / UID）、状态（可用 / 冷却 / 暂停 / 禁用）、版本（国内 / 国际 / 企业）、**标签**（v2.3.1，`tag=` 大小写不敏感）、排序（uid / credits / last_success / cool_remaining） | **服务端** 50 / 100 / 200 / 全部（上限 2000 行；响应带 ETag，无变化 304） |
 | 积分到期 | — | 50 / 100 / 200 / 全部（独立分页，不影响账号池） |
 | 运行日志 | 频道（任务 / 对话 / 系统）+ 关键词 | 50 / 100 / 200 / 全部 |
 | 请求日志 | 关键词（IP / UA / 模型 / 账号 / 请求 ID，空格分词 AND）、结果、时间范围 | 50 / 100 / 200 / 全部（先筛选后分页） |
@@ -811,8 +816,8 @@ http://127.0.0.1:7863/panel/
 |---|---|
 | 只读 | `GET overview`（默认全量；`?lite=1` 无 accounts、约 1–2 KB）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 可观测（v2.2.0） | `GET readyz`（就绪探测：config/auth_dir/state_dir 可写 + pool_loaded，失败 503）· `GET metrics`（Prometheus text v0.0.4：池计数/在途/积分合计/模型锁/面板请求计数）· `GET audit?limit=200`（面板操作审计 JSONL，新的在前）· `GET task_runs?limit=100`（任务执行历史 JSONL） |
-| 任务调度（v2.3.0） | `GET jobs?limit=20`（Job 列表，新→旧）· `GET jobs/{id}` · `POST jobs/{kind}/run`（kind=checkin/travel/activity/keepalive/balance；同类在跑 409）· `POST jobs/{id}/cancel`（只停后续账号）；旧批量端点保留 `ok/started` 并新增 `job_id` |
-| 备注/标签（v2.3.0） | `GET meta`（全部账号备注/标签）· `GET accounts/{uid}/meta` · `PUT accounts/{uid}/meta`（body `{note,tags}`；note≤500 字符、tags≤10×32 字符）· `DELETE accounts/{uid}/meta` |
+| 任务调度（v2.3.0/v2.3.1） | `GET jobs?limit=20`（Job 列表，新→旧；**v2.3.1 起含定时/补跑批次 trigger=schedule/catch_up**）· `GET jobs/{id}` · `POST jobs/{kind}/run`（kind=checkin/travel/activity/keepalive/balance；同类在跑 409）· `POST jobs/{id}/cancel`（只停后续账号）；旧批量端点保留 `ok/started` 并新增 `job_id` |
+| 备注/标签（v2.3.0/v2.3.1） | `GET meta`（全部账号备注/标签）· **`GET meta/tags`（标签及计数，count 降序）** · `GET accounts/{uid}/meta` · `PUT accounts/{uid}/meta`（body `{note,tags}`；note≤500 字符、tags≤10×32 字符）· `DELETE accounts/{uid}/meta`；`GET accounts?tag=<标签>` 服务端筛选 |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 
@@ -1100,6 +1105,21 @@ readinessProbe:
 ```
 
 事件以 `POST application/json` 发送，payload 固定 `{"event":"job_done","ts":<unix秒>,"data":{...}}`；异步发送（不阻塞面板/任务），失败重试 1 次后仅 WARN；队列满丢弃并计数。data 超 64KB 时降级为摘要，日志中 Webhook URL 脱敏、不发送任何凭证。
+
+**多渠道（v2.3.1）**：把 `channel` 设为 `wecom` / `telegram` / `bark`，`webhook_url` 填对应机器人地址即可（telegram 还需 `telegram_chat_id`，消息标题用 `title`）：
+
+```json
+{
+  "notify": {
+    "channel": "wecom",
+    "webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...",
+    "title": "WorkBuddy2API Pro",
+    "events": ["job_done", "account_disabled", "checkin_failed"]
+  }
+}
+```
+
+各渠道均为文本概要（如 `[job_done] checkin 完成 100/120 失败 3 跳过 5`），日志按渠道脱敏；成功判定分别为 2xx / `errcode==0`（wecom）/ `ok:true`（telegram）/ 2xx（bark）。
 
 ### 账号被 Disable 后如何恢复？
 
