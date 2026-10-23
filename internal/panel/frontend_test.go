@@ -1635,28 +1635,37 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
-// TestAppJSAccountFilterAndPager 账号池筛选（搜索/状态/版本）与计数、分页按钮禁用态。
-// 筛选后计数文案与页码信息是用户判断「筛没筛对」的唯一依据，写错不会报错只会误导。
+// TestAppJSAccountFilterAndPager 账号池本地筛选（兼容路径）与冷却判定。
+//
+// v2.1 #1 后账号池主路径改为服务端筛选/分页，但 renderAccounts(array) 的本地
+// 筛选分支仍被 node harness / 旧调用使用；这里钉住它的行为不回退。
+// 同时钉住 v2.1 的倒计时改造：light 投影没有 cool_remaining_sec，冷却必须能由
+// 绝对时间 until/breaker_until/degrade_until 本地算出来（否则 304 缓存下倒计时冻结）。
 func TestAppJSAccountFilterAndPager(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function accIsCool');
+const start = src.indexOf('function secUntil');
 const end = src.indexOf('function renderAccounts');
 if (start < 0 || end < 0 || end < start) throw new Error('account filter helpers not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '', disabled: false });
 const ctx = {
-  Date, Number, String, Array, Object, Math,
+  Date, Number, String, Array, Object, Math, isNaN,
   $: id => (sinks[id] || mk(id)),
   accAll: [], accFilters: { q: '', state: '', ver: '' }, accPage: 1,
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) +
-  '\nthis.accMatch = accMatch; this.updateAccPager = updateAccPager;', ctx);
+  '\nthis.accMatch = accMatch; this.updateAccPager = updateAccPager;' +
+  ' this.accCoolRemaining = accCoolRemaining; this.accCoolKind = accCoolKind;' +
+  ' this.updateAccPagerMeta = updateAccPagerMeta;', ctx);
+const now = Date.now();
+const iso = ms => new Date(ms).toISOString();
 const rows = [
   { uid: 'uid-ok', nickname: 'Alpha', realm: 'cn' },
   { uid: 'uid-cool', nickname: 'Beta', realm: 'global', cool_remaining_sec: 120 },
+  { uid: 'uid-until', nickname: 'Zeta', realm: 'cn', until: iso(now + 90000) },
   { uid: 'uid-paused', nickname: 'Gamma', enterprise: true, paused: true },
   { uid: 'uid-dis', nickname: 'Delta', disabled: true },
   { uid: 'uid-ent', nickname: 'Eps', enterprise: true },
@@ -1685,17 +1694,38 @@ out.pager = [sinks.accCount.textContent, sinks.accPageInfo.textContent, sinks.ac
 ctx.accPage = 3;
 ctx.updateAccPager(5, 3);
 out.pagerLast = [sinks.accCount.textContent, sinks.accPageInfo.textContent, sinks.accPrev.disabled, sinks.accNext.disabled];
+// 服务端分页计数：total/filtered 用响应值，不再数当前页。
+ctx.updateAccPagerMeta({ total: 1146, filtered: 23, page: 2, pages: 12 });
+out.serverPager = [sinks.accCount.textContent, sinks.accPageInfo.textContent, sinks.accPrev.disabled, sinks.accNext.disabled];
+// 绝对时间倒计时（无 cool_remaining_sec）：服务端 now 作为基准。
+out.coolUntil = {
+  until: Math.round(ctx.accCoolRemaining(rows[2], now)),
+  legacy: Math.round(ctx.accCoolRemaining(rows[1], now)),
+  expired: Math.round(ctx.accCoolRemaining({ until: iso(now - 60000) }, now)),
+  breaker: Math.round(ctx.accCoolRemaining({ breaker_until: iso(now + 30000) }, now)),
+  degrade: Math.round(ctx.accCoolRemaining({ degrade_until: iso(now + 45000) }, now)),
+  none: Math.round(ctx.accCoolRemaining({}, now)),
+};
+out.kinds = [
+  ctx.accCoolKind({ breaker_until: iso(now + 30000) }, now),
+  ctx.accCoolKind({ degrade_until: iso(now + 45000) }, now),
+  ctx.accCoolKind({ until: iso(now + 10000), cool_kind: 'hard_credit' }, now),
+  ctx.accCoolKind({ until: iso(now + 10000) }, now),
+];
 process.stdout.write(JSON.stringify(out));`
-	want := `{"all":["uid-ok","uid-cool","uid-paused","uid-dis","uid-ent"],` +
+	want := `{"all":["uid-ok","uid-cool","uid-until","uid-paused","uid-dis","uid-ent"],` +
 		`"qNick":["uid-ok"],"qUid":["uid-cool"],` +
-		`"stateOk":["uid-ok","uid-ent"],"stateCool":["uid-cool"],` +
+		`"stateOk":["uid-ok","uid-ent"],"stateCool":["uid-cool","uid-until"],` +
 		`"statePaused":["uid-paused"],"stateDisabled":["uid-dis"],` +
 		`"verEnterprise":["uid-paused","uid-ent"],"verGlobal":["uid-cool"],` +
-		`"verCn":["uid-ok","uid-dis"],"combo":["uid-ok"],` +
-		`"pager":["共 5 个 · 筛出 2","1 / 3",true,false],` +
-		`"pagerLast":["共 5 个","3 / 3",false,true]}`
+		`"verCn":["uid-ok","uid-until","uid-dis"],"combo":["uid-ok"],` +
+		`"pager":["共 6 个 · 筛出 2","1 / 3",true,false],` +
+		`"pagerLast":["共 6 个 · 筛出 5","3 / 3",false,true],` +
+		`"serverPager":["命中 23 / 共 1146 个","2 / 12",false,false],` +
+		`"coolUntil":{"until":90,"legacy":120,"expired":0,"breaker":30,"degrade":45,"none":0},` +
+		`"kinds":["熔断","连败降权","积分冷却","限流冷却"]}`
 	if got := feNode(t, script); got != want {
-		t.Fatalf("账号池筛选/分页=%s\nwant %s", got, want)
+		t.Fatalf("账号池筛选/分页/倒计时=%s\nwant %s", got, want)
 	}
 }
 
@@ -2091,7 +2121,8 @@ const ctx = {
   confirm: () => confirmAnswer,
   api: async (path, opts) => { apiCalls.push([path, opts && opts.method]); return apiImpl(path, opts); },
   toast: (msg, cls) => toasts.push([msg, cls || '']),
-  loadOverview: () => { overviewCalls++; },
+  // v2.1 #1：操作后的等价刷新入口（summary + 当前页），不再是全量 loadOverview。
+  refreshAccountPool: () => { overviewCalls++; },
   dotaskBusy: new Set(),   // 进行中标记：轮询重渲染后按钮仍 disabled，完成/失败必须清空
   encodeURIComponent, Number, String, Object, Array,
 };
@@ -2218,7 +2249,10 @@ let loadCalls = 0, loadResult = true, logCalls = 0, reattachCalls = 0, openKeyCa
 const ctx = {
   document: doc,
   view: 'accounts',
-  loadOverview: async () => { loadCalls++; return loadResult; },
+  // v2.1 #1：accounts 视图的刷新入口是 refreshAccountsView（lite + 当前页），
+  // start() 还会后台补一次完整 overview（ensureFullOverview）。
+  refreshAccountsView: async () => { loadCalls++; return loadResult; },
+  ensureFullOverview: async () => true,
   loadLogs: async () => { logCalls++; return true; },
   reattachQueueView: () => { reattachCalls++; },
   openKey: () => { openKeyCalls++; },
@@ -2288,13 +2322,15 @@ const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve();
   s = P.state();
   out.manualResume = { authStop: s.authStop, prompted: s.prompted, timer: s.timer !== null,
                        delayOk: inRange(lastDelay(), 4000, 6000) };
+  ctx.view = 'accounts'; loadCalls = 0;
+  const accRet = await P.refreshVisible();
   ctx.view = 'logs'; logCalls = 0;
   const logsRet = await P.refreshVisible();
   ctx.view = 'taskscenter'; reattachCalls = 0;
   const tcRet = await P.refreshVisible();
   ctx.view = 'usage'; const usRet = await P.refreshVisible();
-  out.dispatch = { logs: logsRet === true && logCalls === 1, taskscenter: tcRet === true && reattachCalls === 1,
-                   other: usRet === true };
+  out.dispatch = { accounts: accRet === true && loadCalls === 1, logs: logsRet === true && logCalls === 1,
+                   taskscenter: tcRet === true && reattachCalls === 1, other: usRet === true };
   process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });`
 	want := `{"start":{"armed":true,"timer":true,"loads":1,"listener":true,"delayOk":true},` +
@@ -2305,7 +2341,7 @@ const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve();
 		`"recovered":{"delayOk":true,"failures":0},` +
 		`"auth401":{"authStop":true,"prompted":true,"openKey":1,"timerGone":true,"noRetryTimer":true,"noRequest":true},` +
 		`"manualResume":{"authStop":false,"prompted":false,"timer":true,"delayOk":true},` +
-		`"dispatch":{"logs":true,"taskscenter":true,"other":true}}`
+		`"dispatch":{"accounts":true,"logs":true,"taskscenter":true,"other":true}}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("轮询状态机=%s\nwant %s", got, want)
 	}
@@ -2469,7 +2505,8 @@ const ctx = {
     return { ok: true, started: true };
   },
   toast: (m, c) => toasts.push([m, c || '']),
-  loadOverview: () => { overviewCalls++; },
+  // v2.1 #1：定时补拉走 refreshAccountPool（summary + 当前页），不再全量 overview。
+  refreshAccountPool: () => { overviewCalls++; },
   loadLogs: () => { logCalls++; },
   view: 'accounts',
   setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
@@ -2659,7 +2696,7 @@ const sandbox = new Proxy({
   setInterval, clearInterval, setTimeout, clearTimeout,
   console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set,
   RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent,
-  decodeURIComponent, URL, Symbol, Proxy, Reflect,
+  decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -2729,7 +2766,7 @@ const ctx = {
   DURATION_FIELDS: [],
   pollAuthStopped: true, keyPrompted: true, refFailures: 3, refTimer: null, refInFlight: false,
   scheduleNextPoll: () => { schedCalls++; },
-  loadConfig: () => {}, loadOverview: () => {},
+  loadConfig: () => {}, refreshAccountPool: () => {},
   JSON,
 };
 vm.createContext(ctx);
@@ -2774,5 +2811,490 @@ const run = async (prevPanel, panelVal, gatewayVal, err) => {
 		`"label":"保存配置","disabled":false}}}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("配置保存凭据同步=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSAccountsQueryParams v2.1 #1 的服务端筛选/分页参数映射。
+//
+// 账号池的筛选条件必须翻译成后端约定的 query（改名/改值都会让筛选静默失效：
+// 界面还是那个界面，但返回的是未筛选的数据）。这里逐项钉住：
+//
+//	state: ok→healthy、cool→cooling、paused、disabled
+//	ver:   enterprise→enterprise=1、global→realm=global&enterprise=0、
+//	       cn→realm=cn&enterprise=0（旧 UI 三分法互斥：国内/海外都排除企业号，
+//	       而服务端 realm 与 enterprise 是两个正交维度）
+//	page_size=0（全部）原样下发；页码取整、非法值回落 1。
+func TestAppJSAccountsQueryParams(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function accStateParam');
+const end = src.indexOf('function secUntil');
+if (start < 0 || end < 0 || end < start) throw new Error('accounts query helpers not found');
+const ctx = { URLSearchParams };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.accStateParam = accStateParam; this.accQueryString = accQueryString;', ctx);
+const out = {
+  state: ['ok', 'cool', 'paused', 'disabled', '', 'bogus'].map(v => ctx.accStateParam(v)),
+  query: [
+    ctx.accQueryString({ q: '', state: '', ver: '' }, 1, 100),
+    ctx.accQueryString({ q: '', state: 'ok', ver: '' }, 2, 0),
+    ctx.accQueryString({ q: '', state: 'cool', ver: 'enterprise' }, 1, 50),
+    ctx.accQueryString({ q: 'nick&x', state: '', ver: 'global' }, 1, 100),
+    ctx.accQueryString({ q: '', state: '', ver: 'cn' }, 1, 200),
+    ctx.accQueryString({ q: '', state: '', ver: '' }, 0, -5),
+  ],
+};
+process.stdout.write(JSON.stringify(out));`
+	want := `{"state":["healthy","cooling","paused","disabled","",""],` +
+		`"query":["page=1&page_size=100","page=2&page_size=0&state=healthy",` +
+		`"page=1&page_size=50&state=cooling&enterprise=1",` +
+		`"page=1&page_size=100&q=nick%26x&realm=global&enterprise=0",` +
+		`"page=1&page_size=200&realm=cn&enterprise=0","page=1&page_size=0"]}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("账号池服务端参数=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSApiCached304 apiCached 的 ETag/304 缓存与服务端分页查询。
+//
+// 304 没有 body（parse 会得到空对象），必须回落到按查询串缓存的上一份 rows；缓存
+// 键隔离（不同筛选/页码不能串数据）、无 ETag 不缓存、401 走统一停表逻辑、LRU 有界。
+// 这些分支只在真实 HTTP 条件下出现，浏览器里很难手工复现。
+func TestAppJSApiCached304(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function accStateParam');
+const end = src.indexOf('function secUntil');
+if (start < 0 || end < 0 || end < start) throw new Error('apiCached helpers not found');
+const calls = [];
+let resp = null;
+const ctx = {
+  URLSearchParams,
+  LS_KEY: 'wb2api.key',
+  localStorage: { getItem: () => 'sk-test' },
+  keyPrompted: true,
+  authCalls: 0,
+  onAuthRequired: () => { ctx.authCalls++; },
+  fetch: async (url, opts) => {
+    calls.push({ url: String(url), headers: (opts && opts.headers) || {} });
+    const r = resp();
+    return {
+      status: r.status,
+      ok: r.status >= 200 && r.status < 300,
+      headers: { get: k => (k === 'ETag' ? (r.etag || null) : null) },
+      json: async () => r.body,
+    };
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.apiCached = apiCached; this.etagCachePut = etagCachePut;', ctx);
+(async () => {
+  const out = {};
+  const cache = {};
+  resp = () => ({ status: 200, etag: 'W/"acct-1"', body: { rows: [{ uid: 'a' }], total: 1 } });
+  const r1 = await ctx.apiCached('accounts?page=1&page_size=100', cache);
+  resp = () => ({ status: 304 });
+  const r2 = await ctx.apiCached('accounts?page=1&page_size=100', cache);
+  out.cache304 = {
+    firstNotCached: r1.cached === false,
+    secondCached: r2.cached === true,
+    sameRows: JSON.stringify(r2.data) === JSON.stringify(r1.data),
+    conditional: calls[1].headers['If-None-Match'] || '',
+    noConditionalFirst: calls[0].headers['If-None-Match'] === undefined,
+    authHeader: calls[0].headers['Authorization'] || '',
+  };
+  resp = () => ({ status: 200, etag: 'W/"acct-2"', body: { rows: [] } });
+  await ctx.apiCached('accounts?page=2&page_size=100', cache);
+  out.keyIsolation = calls[2].headers['If-None-Match'] === undefined;
+  const cache2 = {};
+  resp = () => ({ status: 200, body: { rows: [] } });
+  await ctx.apiCached('accounts?page=3&page_size=10', cache2);
+  await ctx.apiCached('accounts?page=3&page_size=10', cache2);
+  out.noEtag = calls[4].headers['If-None-Match'] === undefined;
+  resp = () => ({ status: 401 });
+  let authErr = '';
+  try { await ctx.apiCached('accounts?page=1&page_size=100', {}); } catch (e) { authErr = e.message; }
+  out.unauthorized = { calls: ctx.authCalls, msg: authErr };
+  resp = () => ({ status: 500, body: { error: 'boom' } });
+  let srvErr = '';
+  try { await ctx.apiCached('accounts?page=1&page_size=100', {}); } catch (e) { srvErr = e.message; }
+  out.serverError = srvErr;
+  const cache3 = {};
+  for (let i = 0; i < 40; i++) ctx.etagCachePut(cache3, 'k' + i, { etag: 'e' + i, data: {} });
+  out.lru = { kept: Object.keys(cache3).filter(k => k !== '__keys').length,
+              newest: !!cache3.k39, oldestGone: !cache3.k0 };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"cache304":{"firstNotCached":true,"secondCached":true,"sameRows":true,` +
+		`"conditional":"W/\"acct-1\"","noConditionalFirst":true,"authHeader":"Bearer sk-test"},` +
+		`"keyIsolation":true,"noEtag":true,"unauthorized":{"calls":1,"msg":"密钥无效或未填写"},` +
+		`"serverError":"boom","lru":{"kept":32,"newest":true,"oldestGone":true}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("apiCached/304=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSAccountsServerPaging v2.1 #1 的端到端数据流（整份 app.js 在惰性 DOM
+// 沙箱里求值，fetch 按 URL 路由返回 lite/full/accounts 三种响应）：
+//  1. 首屏 = lite overview + 当前页 accounts（query 带 page/page_size）+ 后台一次性
+//     完整 overview（积分合计/到期快照/备注需要全量；不是每 5s 全量）；
+//  2. 完整 overview 的 60s 新鲜窗口：窗口内 ensureFullOverview 不再请求，作废后重拉；
+//  3. 列表 tab 轮询不拉全量；「积分到期」tab 激活才按窗口补全量（懒加载）；
+//  4. renderAccounts(rows, meta) 直接渲染服务端 rows（不再本地 filter），计数/页码
+//     用服务端 total/filtered/page/pages；冷却倒计时由 until 本地算（light 无
+//     cool_remaining_sec）；无 meta 时退回旧的数组调用行为。
+func TestAppJSAccountsServerPaging(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const now = Math.floor(Date.now() / 1000);
+const lite = { version: '2.1.0-pro', uptime_sec: 60, redis_mode: 'memory', sticky_sessions: 0,
+  total: 2, healthy: 1, cooling: 1, disabled: 0, paused: 0, in_flight_full: 0,
+  model_locks: [], balance_refresh_sec: 300, poll_interval_sec: 5,
+  credits_sum: 15, credits_total_sum: 30 };
+const full = Object.assign({}, lite, { accounts: [
+  { uid: 'a', nickname: 'A', credits: 10, credits_total: 20 },
+  { uid: 'b', nickname: 'B', credits: 5, credits_total: 10, disabled: true },
+] });
+const page = { ok: true, now: now, total: 2, filtered: 2, page: 1, page_size: 100, pages: 1,
+  rows: [{ uid: 'a', nickname: 'A', credits: 10, credits_total: 20, token_usage: {} },
+         { uid: 'b', nickname: 'B', credits: 5, credits_total: 10, disabled: true, token_usage: {} }] };
+const calls = [];
+const sinks = {};
+const sinkIds = ['accBody', 'accCount', 'accPageInfo', 'accPrev', 'accNext', 'sTotal', 'sHealthy',
+  'sCooling', 'sDisabled', 'sPaused', 'sCredits', 'sSticky', 'navSub', 'navVer', 'navRedis',
+  'navState', 'navPulse', 'accNote', 'subMeta', 'expBox', 'expList', 'expNote', 'expPad', 'cfgForm'];
+for (const id of sinkIds) sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false,
+  className: '', value: '', dataset: {}, children: [], addEventListener() {}, style: {} };
+const fetchStub = url => {
+  const u = String(url);
+  calls.push(u);
+  let body = {};
+  if (u.indexOf('overview?lite=1') >= 0) body = lite;
+  else if (u.indexOf('/panel/api/overview') >= 0) body = full;
+  else if (u.indexOf('/panel/api/accounts?') >= 0) body = page;
+  return Promise.resolve({ status: 200, ok: true, headers: { get: () => null }, json: async () => body });
+};
+const sandbox = new Proxy({
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert,
+              getElementById: id => (sinks[id] || inert),
+              addEventListener() {}, documentElement: inert, head: inert, body: inert,
+              createElement: () => inert, cookie: '' },
+  fetch: fetchStub,
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set,
+  RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent,
+  decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__r = {' +
+  ' loadSummary, loadOverview, ensureFullOverview, invalidateFullOverview, refreshAccountsView,' +
+  ' switchAccTab, renderAccounts,' +
+  ' setFilters: f => { accFilters = f; },' +
+  ' setTab: t => { accTab = t; },' +
+  ' state: () => ({ overviewAccounts: ((overviewData && overviewData.accounts) || []).length,' +
+  '                 overviewAt: overviewAt, credits: creditsSum, base: pollBaseSec,' +
+  '                 rows: accAll.length, meta: accPageMeta,' +
+  '                 tpl: document.getElementById(\'accBody\').innerHTML }),' +
+  '};', sandbox, { filename: 'app.js' });
+const R = sandbox.__r;
+const wait = async (fn, ms) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (ms || 3000)) {
+    if (fn()) return true;
+    await new Promise(r => setTimeout(r, 10));
+  }
+  return false;
+};
+const fullCount = () => calls.filter(u => u.indexOf('/panel/api/overview') >= 0 && u.indexOf('lite=1') < 0).length;
+const liteCount = () => calls.filter(u => u.indexOf('overview?lite=1') >= 0).length;
+const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0).length;
+(async () => {
+  // 首屏三路请求都回来后（rows/credits 已就位）再断言，避免异步竞态。
+  await wait(() => R.state().overviewAccounts > 0 && R.state().rows >= 2 && R.state().credits && R.state().tpl.length > 0);
+  const out = {};
+  out.initial = { lite: liteCount(), full: fullCount(), accounts: accCount(),
+                  pageUrl: calls.find(u => u.indexOf('/panel/api/accounts?') >= 0) || '',
+                  credits: R.state().credits, templateRows: R.state().tpl.split('<tr').length - 1 };
+  const f0 = fullCount();
+  await R.ensureFullOverview(true);
+  out.freshTtlReused = fullCount() === f0;
+  R.invalidateFullOverview();
+  await R.ensureFullOverview(true);
+  out.staleRefetched = fullCount() === f0 + 1;
+  const f1 = fullCount(), a1 = accCount();
+  await R.loadSummary(true);
+  out.summaryOnly = fullCount() === f1 && accCount() === a1 && R.state().overviewAccounts === 2;
+  // 积分合计：lite overview 的 credits_sum / credits_total_sum 优先（5s 轮询即可刷新
+  // 统计条，不必等全量 overview）；缺这两个字段时保持上一次的值（旧后端/mock 兼容）。
+  lite.credits_sum = 99; lite.credits_total_sum = 200;
+  await R.loadSummary(true);
+  out.creditsFromLite = { credits: R.state().credits, text: sinks.sCredits.textContent };
+  delete lite.credits_sum; delete lite.credits_total_sum;
+  await R.loadSummary(true);
+  out.creditsFallbackKeep = { credits: R.state().credits, text: sinks.sCredits.textContent };
+  R.setTab('list');
+  const f2 = fullCount();
+  await R.refreshAccountsView(true);
+  out.listTabNoFull = fullCount() === f2;
+  R.setTab('expiry');
+  R.invalidateFullOverview();
+  const f3 = fullCount();
+  await R.refreshAccountsView(true);
+  out.expiryTabFull = fullCount() === f3 + 1;
+  // 服务端分页渲染：本地筛选条件故意设成「全不匹配」，rows 仍应原样渲染（证明不再本地 filter）；
+  // 冷却时间来自 until（light 投影无 cool_remaining_sec）。
+  const nowMs = Date.now();
+  const rows = [
+    { uid: 'u1', nickname: '甲', credits: 5, until: new Date(nowMs + 90000).toISOString() },
+    { uid: 'u2', nickname: '乙', credits: 3, disabled: true, disabled_reason: '凭证失效' },
+  ];
+  R.setFilters({ q: '不匹配', state: 'ok', ver: 'enterprise' });
+  R.renderAccounts(rows, { total: 3, filtered: 2, page: 1, pages: 2, now: Math.floor(nowMs / 1000) });
+  const html = sinks.accBody.innerHTML;
+  out.serverRender = {
+    rendersServerRows: html.indexOf('甲') >= 0 && html.indexOf('乙') >= 0,
+    coolTag: html.indexOf('限流冷却') >= 0 && html.indexOf('class="cool"') >= 0,
+    disabledTag: html.indexOf('已禁用') >= 0,
+    count: sinks.accCount.textContent, info: sinks.accPageInfo.textContent,
+    prev: sinks.accPrev.disabled, next: sinks.accNext.disabled,
+    rows: R.state().rows,
+  };
+  // 无 meta = 兼容旧调用：退回本地筛选/分页（渲染器冒烟与切片 harness 依赖）。
+  R.setFilters({ q: '', state: '', ver: '' });
+  R.renderAccounts(rows);
+  out.legacyRender = { count: sinks.accCount.textContent, info: sinks.accPageInfo.textContent,
+                       next: sinks.accNext.disabled, rows: R.state().rows, meta: R.state().meta };
+  // 服务端空页要区分「筛选无命中」与「池为空」。
+  R.renderAccounts([], { total: 5, filtered: 0, page: 1, pages: 1, now: now });
+  out.emptyFiltered = { html: sinks.accBody.innerHTML, count: sinks.accCount.textContent };
+  R.renderAccounts([], { total: 0, filtered: 0, page: 1, pages: 1, now: now });
+  out.emptyPool = { html: sinks.accBody.innerHTML };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"initial":{"lite":2,"full":1,"accounts":1,` +
+		`"pageUrl":"/panel/api/accounts?page=1&page_size=100",` +
+		`"credits":{"rem":15,"tot":30},"templateRows":2},` +
+		`"freshTtlReused":true,"staleRefetched":true,"summaryOnly":true,` +
+		`"creditsFromLite":{"credits":{"rem":99,"tot":200},"text":"99 / 200"},` +
+		`"creditsFallbackKeep":{"credits":{"rem":99,"tot":200},"text":"99 / 200"},` +
+		`"listTabNoFull":true,"expiryTabFull":true,` +
+		`"serverRender":{"rendersServerRows":true,"coolTag":true,"disabledTag":true,` +
+		`"count":"命中 2 / 共 3 个","info":"1 / 2","prev":true,"next":false,"rows":2},` +
+		`"legacyRender":{"count":"共 2 个","info":"1 / 1","next":true,"rows":2,"meta":null},` +
+		`"emptyFiltered":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">没有符合筛选条件的账号</div></td></tr>",` +
+		`"count":"命中 0 / 共 5 个"},` +
+		`"emptyPool":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">账号池是空的</div></td></tr>"}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("账号池服务端分页/懒加载=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelAccountsServerPagingWiring 服务端分页/懒加载的源码接线（防「函数写了但
+// 主链路没接上」）：账号视图轮询必须走 refreshAccountsView、全量 overview 只能从
+// ensureFullOverview/loadOverview 进、列表 tab 不拉全量、旧的全量渲染断言已移除。
+func TestPanelAccountsServerPagingWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		"function accStateParam(",
+		"function accQueryString(",
+		"async function apiCached(",
+		"async function loadSummary(",
+		"async function loadOverview(",
+		"async function ensureFullOverview(",
+		"async function loadAccountPage(",
+		"async function refreshAccountsView(",
+		"async function refreshAccountPool(",
+		"apiCached('accounts?' + qs, ACCOUNTS_CACHE)",
+		"if (view === 'accounts') return refreshAccountsView(true)",
+		"if (accTab === 'expiry' && view === 'accounts')",
+		"const ACCOUNTS_CACHE = {}",
+		"let accPageMeta = null;",
+		// 版本筛选保持旧 UI 三分法（国内/海外排除企业号）；服务端 realm/enterprise 正交。
+		"p.set('realm', 'global'); p.set('enterprise', '0')",
+		"p.set('realm', 'cn'); p.set('enterprise', '0')",
+		// 积分合计优先用后端下发的 credits_sum / credits_total_sum（lite 也带）。
+		"d.credits_sum != null || d.credits_total_sum != null",
+		// 304 倒计时：200 校准 skew，渲染用 Date.now()-skew。
+		"accClockSkew = Date.now() - Number(d.now) * 1000",
+		"skew: accClockSkew",
+		"const nowMs = server ? accNowMs(meta) : Date.now();",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 服务端分页接线缺少 %q", want)
+		}
+	}
+	// lite overview：loadSummary 与鉴权探测各一处；完整 overview 只允许一处（loadOverview）。
+	if n := strings.Count(j, "'overview?lite=1'"); n < 2 {
+		t.Errorf("app.js 只有 %d 处 lite overview（loadSummary/checkAuthGate 应各一处）", n)
+	}
+	if n := strings.Count(j, "api('overview')"); n != 1 {
+		t.Errorf("app.js 有 %d 处完整 overview 请求（应只在 loadOverview 内 1 处）", n)
+	}
+	// 旧实现必须移除：账号视图直接拉全量、全量 overview 直接渲染账号表。
+	for _, forbidden := range []string{
+		"if (view === 'accounts') return loadOverview(true)",
+		"renderAccounts(d.accounts || [])",
+	} {
+		if strings.Contains(j, forbidden) {
+			t.Errorf("app.js 仍残留旧的全量账号路径 %q", forbidden)
+		}
+	}
+	// 筛选项/分页控件保持原 id（mobile.css 与既有 harness 依赖），全部选项注明服务端上限。
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{`id="accQ"`, `id="accState"`, `id="accVer"`, `id="accPageSize"`,
+		`id="accCount"`, `id="accPrev"`, `id="accNext"`, `全部（上限 2000）`} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 账号池控件缺少 %q", want)
+		}
+	}
+}
+
+// TestAppJSAccountsCountdownAcross304 P1：304 命中时冷却倒计时不能冻结。
+//
+// 空闲期账号页 ETag 稳定 → 每轮都是 304，复用缓存的 rows/meta。若直接用响应里的
+// now*1000 当「当前时间」，倒计时会停走。实现：200 时校准 skew = Date.now()-now*1000，
+// 渲染用 Date.now()-skew（304 时 meta 不刷新，但 Date.now() 继续前进）。
+// 本用例用可控时钟模拟「200 一次 → 连续两次 304」，断言倒计时文本按秒减少。
+func TestAppJSAccountsCountdownAcross304(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+// 可控时钟：FakeDate 的 now()/无参构造都读 clock.now，用来模拟 5s 间隔的轮询。
+const clock = { now: 1761200000000 };
+class FakeDate extends Date {
+  constructor(...args) { if (args.length === 0) super(clock.now); else super(...args); }
+  static now() { return clock.now; }
+  static parse(...a) { return Date.parse(...a); }
+  static UTC(...a) { return Date.UTC(...a); }
+}
+const lite = { version: '2.1.0-pro', uptime_sec: 60, redis_mode: 'memory', sticky_sessions: 0,
+  total: 1, healthy: 1, cooling: 0, disabled: 0, paused: 0, in_flight_full: 0,
+  model_locks: [], balance_refresh_sec: 300, poll_interval_sec: 5, credits_sum: 1, credits_total_sum: 2 };
+const full = Object.assign({}, lite, { accounts: [{ uid: 'u1', nickname: 'X', credits: 1, credits_total: 2 }] });
+let accountsCalls = 0;
+const calls = [];
+const sinks = {};
+const sinkIds = ['accBody', 'accCount', 'accPageInfo', 'accPrev', 'accNext', 'sTotal', 'sHealthy',
+  'sCooling', 'sDisabled', 'sPaused', 'sCredits', 'sSticky', 'navSub', 'navVer', 'navRedis',
+  'navState', 'navPulse', 'accNote', 'subMeta', 'expBox', 'expList', 'expNote', 'expPad', 'cfgForm'];
+for (const id of sinkIds) sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false,
+  className: '', value: '', dataset: {}, children: [], addEventListener() {}, style: {} };
+const resp = (status, body, etag) => Promise.resolve({
+  status, ok: status >= 200 && status < 300,
+  headers: { get: k => (k === 'ETag' ? etag : null) },
+  json: async () => body,
+});
+const fetchStub = (url, opts) => {
+  const u = String(url);
+  calls.push({ url: u, headers: (opts && opts.headers) || {} });
+  if (u.indexOf('overview?lite=1') >= 0) return resp(200, lite, null);
+  if (u.indexOf('/panel/api/overview') >= 0) return resp(200, full, null);
+  if (u.indexOf('/panel/api/accounts?') >= 0) {
+    accountsCalls++;
+    if (accountsCalls === 1) {
+      const row = { uid: 'u1', nickname: 'X', credits: 1, credits_total: 2,
+        until: new Date(clock.now + 95000).toISOString(), token_usage: {} };
+      return resp(200, { ok: true, now: Math.floor(clock.now / 1000), total: 1, filtered: 1,
+        page: 1, page_size: 100, pages: 1, rows: [row] }, 'W/"acct-cd"');
+    }
+    return resp(304, {}, null);
+  }
+  return resp(200, {}, null);
+};
+const sandbox = new Proxy({
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert,
+              getElementById: id => (sinks[id] || inert),
+              addEventListener() {}, documentElement: inert, head: inert, body: inert,
+              createElement: () => inert, cookie: '' },
+  fetch: fetchStub,
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date: FakeDate, Number, String, Boolean, Object, Array, Promise, Map, Set,
+  RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent,
+  decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__r = { loadAccountPage,' +
+  ' tpl: () => document.getElementById(\'accBody\').innerHTML };', sandbox, { filename: 'app.js' });
+const R = sandbox.__r;
+const wait = async (fn, ms) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (ms || 3000)) { if (fn()) return true; await new Promise(r => setTimeout(r, 10)); }
+  return false;
+};
+const parseSec = html => {
+  const m = html.match(/(\d+)分(\d+)秒/);
+  if (m) return Number(m[1]) * 60 + Number(m[2]);
+  const s = html.match(/(\d+)秒/);
+  return s ? Number(s[1]) : -1;
+};
+(async () => {
+  // 首屏 200 渲染出冷却倒计时（until = 现在 + 95s）
+  await wait(() => sinks.accBody.innerHTML.indexOf('分') >= 0 && sinks.accBody.innerHTML.indexOf('限流冷却') >= 0);
+  const out = {};
+  out.first = parseSec(sinks.accBody.innerHTML);
+  const callIdx = calls.length;
+  clock.now += 5000;                       // 模拟 5s 后的下一次轮询
+  await R.loadAccountPage(true);           // 304：复用缓存 rows/meta
+  out.second = parseSec(sinks.accBody.innerHTML);
+  clock.now += 5000;
+  await R.loadAccountPage(true);           // 再来一次 304
+  out.third = parseSec(sinks.accBody.innerHTML);
+  const accCalls = calls.slice(callIdx).filter(c => c.url.indexOf('/panel/api/accounts?') >= 0);
+  out.conditional = accCalls.map(c => c.headers['If-None-Match'] || '');
+  out.accountsCalls = accountsCalls;
+  out.decreased5 = out.second === out.first - 5;
+  out.decreased10 = out.third === out.first - 10;
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"first":95,"second":90,"third":85,` +
+		`"conditional":["W/\"acct-cd\"","W/\"acct-cd\""],` +
+		`"accountsCalls":3,"decreased5":true,"decreased10":true}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("304 倒计时=%s\nwant %s", got, want)
 	}
 }

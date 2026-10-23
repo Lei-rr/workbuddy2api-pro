@@ -14,11 +14,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"container/list"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,6 +174,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
 	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	// v2.1 #1：账号池列表服务端分页/筛选/排序/字段裁剪/ETag（与 /overview 旧接口并存，
+	// 旧接口语义零变化）。放在 /accounts/{uid}/... 之前只是可读性，ServeMux 按路径匹配。
+	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.accounts))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
@@ -310,6 +316,10 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+//
+// v2.1 #1：?lite=1 只回汇总（计数/元信息/model_locks/积分合计，约 1-2 KB），供前端
+// 5s 轮询；不带 lite（默认）时除新增 credits_sum/credits_total_sum 两个汇总字段外
+// 与旧版逐字段等价（含 accounts 全量）——旧脚本零破坏。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
@@ -318,7 +328,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// 积分合计（「积分剩余 / 总额」统计条）：v2.1 #1 前端改 lite 轮询后不再拿到
+	// accounts 数组，无法本地求和；后端直接透出，lite 与全量都带。用 pool 的只读
+	// 求和（O(n)、零分配）而不是 List() 遍历——lite 分支因此仍不构造全量快照。
+	creditsSum, creditsTotalSum := p.cfg.Pool.CreditsSums()
+	resp := map[string]any{
 		"version":       p.cfg.Version,
 		"uptime_sec":    int(time.Since(p.started).Seconds()),
 		"auth_required": p.apiKey() != "",
@@ -333,7 +347,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":          disabled,
 		"paused":            paused,
 		"in_flight_full":    inFlightFull,
-		"accounts":          p.cfg.Pool.List(),
+		// credits_sum = 全池 credits 之和；credits_total_sum = 全池总额度之和（未知
+		// 0/企业无限量 -1 按 0 计）。与旧前端「从 accounts 数组求和」口径一致，
+		// 全量 overview 下也恒有该字段（向后兼容，只增不减）。
+		"credits_sum":       creditsSum,
+		"credits_total_sum": creditsTotalSum,
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -341,7 +359,22 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
-	})
+	}
+	if !overviewLite(r) {
+		resp["accounts"] = p.cfg.Pool.List()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// overviewLite 解析 ?lite=1（兼容 1/true 等布尔写法，大小写不敏感）。
+// 空值/非法值一律按默认全量处理：旧调用方（不带该参数）零破坏。
+func overviewLite(r *http.Request) bool {
+	v := strings.TrimSpace(r.URL.Query().Get("lite"))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	return err == nil && b
 }
 
 // balanceRefreshSec 余额后台刷新间隔（秒）；无调度器/未开启时为 0。
@@ -358,6 +391,396 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 		return time.Time{}
 	}
 	return p.cfg.Scheduler.BalanceRefreshedAt()
+}
+
+// ---------------------------------------------------------------------------
+// v2.1 #1：账号池列表服务端分页 / 筛选 / 排序 / 字段裁剪 / ETag
+// ---------------------------------------------------------------------------
+
+const (
+	// accountsDefaultPageSize 默认页大小（1146 账号全量约 689 KB；100 行 light 约
+	// 数十 KB，配合 gzip 后 8-15 KB 量级）。
+	accountsDefaultPageSize = 100
+	// accountsMaxPageSize 服务端页大小上限：page_size=0（「全部」）与 >上限 的请求
+	// 都按它截断，防止单个响应无限大。
+	accountsMaxPageSize = 2000
+	// accountsFieldsLight / accountsFieldsFull 字段投影档位（默认 light）。
+	accountsFieldsLight = "light"
+	accountsFieldsFull  = "full"
+	// accountsCacheControl 账号列表缓存策略：must-revalidate（每次带 ETag 回源校验，
+	// 命中 304 零 body）；private 因为响应依赖面板密钥鉴权，禁止共享缓存跨用户复用。
+	accountsCacheControl = "private, no-cache"
+)
+
+// accountsQuery 是 /panel/api/accounts 的归一化查询参数。
+// 归一化后同时用于筛选/排序/分页与 ETag 输入：语义相同的原始写法（大小写、
+// 默认值/显式值、越界值）映射到同一份参数，从而共享缓存条目。
+type accountsQuery struct {
+	Page       int    `json:"page"`       // >=1；默认 1
+	PageSize   int    `json:"page_size"`  // 默认 100；0 = 全部（受 accountsMaxPageSize 截断）
+	Q          string `json:"q"`          // 已 TrimSpace + ToLower：匹配 uid/nickname 包含
+	State      string `json:"state"`      // "" | healthy | cooling | paused | disabled
+	Realm      string `json:"realm"`      // "" | cn | global
+	Enterprise string `json:"enterprise"` // "" | "1" | "0"
+	Sort       string `json:"sort"`       // uid（默认）| credits | last_success | cool_remaining
+	Fields     string `json:"fields"`     // light（默认）| full
+}
+
+// parseAccountsQuery 解析并归一化查询参数。非法值一律回落默认（不 400）：
+// 列表是只读观测接口，容忍前端/脚本传脏参数比回错更容易排障。
+func parseAccountsQuery(r *http.Request) accountsQuery {
+	qv := r.URL.Query()
+	q := accountsQuery{
+		Page:       1,
+		PageSize:   accountsDefaultPageSize,
+		Q:          strings.ToLower(strings.TrimSpace(qv.Get("q"))),
+		State:      normalizeAccountsState(qv.Get("state")),
+		Realm:      normalizeAccountsRealm(qv.Get("realm")),
+		Enterprise: normalizeAccountsEnterprise(qv.Get("enterprise")),
+		Sort:       normalizeAccountsSort(qv.Get("sort")),
+		Fields:     normalizeAccountsFields(qv.Get("fields")),
+	}
+	if raw := strings.TrimSpace(qv.Get("page")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			q.Page = n
+		}
+	}
+	if vals, ok := qv["page_size"]; ok && len(vals) > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(vals[0])); err == nil && n >= 0 {
+			switch {
+			case n == 0:
+				q.PageSize = 0 // 全部（服务端再按 accountsMaxPageSize 截断）
+			case n > accountsMaxPageSize:
+				q.PageSize = accountsMaxPageSize
+			default:
+				q.PageSize = n
+			}
+		}
+	}
+	return q
+}
+
+// normalizeAccountsState 归一化状态筛选；未知值 = 不筛选（全部）。
+func normalizeAccountsState(v string) string {
+	switch s := strings.ToLower(strings.TrimSpace(v)); s {
+	case "healthy", "cooling", "paused", "disabled":
+		return s
+	}
+	return ""
+}
+
+// normalizeAccountsRealm 归一化域筛选；未知值 = 不筛选。
+func normalizeAccountsRealm(v string) string {
+	switch s := strings.ToLower(strings.TrimSpace(v)); s {
+	case "cn", "global":
+		return s
+	}
+	return ""
+}
+
+// normalizeAccountsEnterprise 归一化企业版筛选（1/0，兼容 true/false 写法）；
+// 空/未知值 = 不筛选。
+func normalizeAccountsEnterprise(v string) string {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return ""
+	}
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return ""
+	}
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// normalizeAccountsSort 归一化排序键；未知值回落默认 uid 升序。
+func normalizeAccountsSort(v string) string {
+	switch s := strings.ToLower(strings.TrimSpace(v)); s {
+	case "credits", "last_success", "cool_remaining":
+		return s
+	}
+	return "uid"
+}
+
+// normalizeAccountsFields 归一化字段投影；只有显式 full 才返回全量，其余一律 light。
+func normalizeAccountsFields(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), accountsFieldsFull) {
+		return accountsFieldsFull
+	}
+	return accountsFieldsLight
+}
+
+// accountsMatch 报告账号是否满足筛选条件。
+func accountsMatch(st pool.Status, q accountsQuery, now time.Time) bool {
+	if q.Q != "" &&
+		!strings.Contains(strings.ToLower(st.UID), q.Q) &&
+		!strings.Contains(strings.ToLower(st.Nickname), q.Q) {
+		return false
+	}
+	if q.Realm != "" && st.Realm != q.Realm {
+		return false
+	}
+	if q.Enterprise != "" && (q.Enterprise == "1") != st.Enterprise {
+		return false
+	}
+	if q.State != "" && accountsState(st, now) != q.State {
+		return false
+	}
+	return true
+}
+
+// accountsState 单值状态归类，优先级 disabled > paused > cooling > healthy，
+// 与 pool.CountsDetailedWithPaused 的四个计数桶口径一致：
+//   - cooling = 未禁用未暂停且不可选：账号级冷却（until）/熔断期（breaker_until）/
+//     连败降权期（degrade_until），即 pool.healthy 判 false 的全部原因；
+//   - healthy = pool.healthy 判 true（注意 in_flight 维度不算，与 CountsDetailed 一致）。
+func accountsState(st pool.Status, now time.Time) string {
+	switch {
+	case st.Disabled:
+		return "disabled"
+	case st.Paused:
+		return "paused"
+	case st.Cooling || (!st.DegradeUntil.IsZero() && now.Before(st.DegradeUntil)):
+		// Status.Cooling 只覆盖 until/breakerUntil；pool.healthy 还看 degradeUntil，
+		// 这里补上降权期，保证 state=healthy 不会把降权号算进来。
+		return "cooling"
+	default:
+		return "healthy"
+	}
+}
+
+// sortAccounts 按归一化排序键就地排序（SliceStable + uid 兜底，保证同值输出确定，
+// ETag 才能稳定）：
+//   - uid：升序（默认，与 pool.List() 的自然顺序一致）；
+//   - credits：降序（余额多的在前），同额按 uid 升序；
+//   - last_success：降序（最近成功在前），从未成功的零值恒排最后，同刻按 uid 升序；
+//   - cool_remaining：升序（剩余冷却秒数少的在前；未冷却为 0 排最前），同值按 uid 升序。
+func sortAccounts(rows []pool.Status, sortBy string) {
+	switch sortBy {
+	case "credits":
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].Credits != rows[j].Credits {
+				return rows[i].Credits > rows[j].Credits
+			}
+			return rows[i].UID < rows[j].UID
+		})
+	case "last_success":
+		sort.SliceStable(rows, func(i, j int) bool {
+			a, b := rows[i].LastSuccessTime, rows[j].LastSuccessTime
+			if !a.Equal(b) {
+				if a.IsZero() {
+					return false
+				}
+				if b.IsZero() {
+					return true
+				}
+				return a.After(b)
+			}
+			return rows[i].UID < rows[j].UID
+		})
+	case "cool_remaining":
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].CoolRemaining != rows[j].CoolRemaining {
+				return rows[i].CoolRemaining < rows[j].CoolRemaining
+			}
+			return rows[i].UID < rows[j].UID
+		})
+	default: // uid
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].UID < rows[j].UID })
+	}
+}
+
+// pageAccounts 按 page/page_size 切页，返回当前页、生效页码与总页数。
+//
+// page_size<=0 表示「全部」模式：返回前 min(len, accountsMaxPageSize) 行，
+// page_size 语义保持 0（响应回显 0，前端据此知道不是普通分页），page 规范化为 1，
+// pages 为 0（空结果）/1。
+//
+// 普通模式下超界 page 自动钳到最后一页（响应 page 为钳后值，前端以响应为准）：
+// 数据随状态变化减少页数时，轮询不会停在一个永远空白的页码上；空结果 pages=0、
+// page=1。空切片保持非 nil，JSON 输出 [] 而不是 null。
+func pageAccounts(rows []pool.Status, page, pageSize int) (pageRows []pool.Status, effPage, pages int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		if len(rows) == 0 {
+			return rows[:0], 1, 0
+		}
+		if len(rows) > accountsMaxPageSize {
+			return rows[:accountsMaxPageSize], 1, 1
+		}
+		return rows, 1, 1
+	}
+	pages = (len(rows) + pageSize - 1) / pageSize
+	if pages == 0 {
+		return rows[:0], 1, 0
+	}
+	if page > pages {
+		// 钳到最后一页：此后 (page-1)*pageSize < len(rows)，无溢出风险
+		// （page 可能来自任意大的整数，先钳再乘）。
+		page = pages
+	}
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[start:end], page, pages
+}
+
+// lightStatus 返回 light 字段投影：把两个「重/易变、列表页用不到」的字段置零
+// （两者都是 omitempty，置零即从 JSON 省略）：
+//   - credits_expiry_buckets：按日到期批次，可变长数组，只属「积分到期」快照；
+//   - cool_remaining_sec：秒级倒计时，前端改用 until / breaker_until / degrade_until
+//     绝对时间 + 响应里的 now 在本地倒计时（否则 304 会让倒计时冻结）。
+//
+// 其余字段与 /overview 的 accounts 逐字段同构（含 token_usage / model_costs /
+// rate_limited_models），前端渲染列表无需字段回退。
+func lightStatus(st pool.Status) pool.Status {
+	st.CreditsExpiryBuckets = nil
+	st.CoolRemaining = 0
+	return st
+}
+
+// stableStatusForETag 返回 ETag 输入用的稳定副本：把「随秒/随请求瞬变，但不足以
+// 让列表内容发生有意义变化」的字段规范化为零值，避免 5s 轮询在无运维状态变化时
+// ETag 抖动（这些字段变化时若换 ETag，缓存永远命不中）：
+//   - cool_remaining_sec：按 now 计算的秒级倒计时；
+//   - in_flight：在途并发瞬时值；
+//   - breaker_fails：熔断器运行期失败计数（每次请求都可能 +1/清零）；
+//   - token_usage.last_used_at：最近一次请求时刻。
+//
+// 其它字段（credits/until/token 计数/model_costs/...）是有意义的内容变化，照常
+// 参与 hash。代价：命中 304 时浏览器复用旧 body，其中倒计时/在途可能是旧值——
+// 倒计时本就应由 until 本地重算，在途是瞬时观测，口径可接受（契约见任务 #1）。
+func stableStatusForETag(st pool.Status) pool.Status {
+	st.CoolRemaining = 0
+	st.InFlight = 0
+	st.BreakerFails = 0
+	st.TokenUsage.LastUsedAt = time.Time{}
+	return st
+}
+
+// accountsProjection 返回响应体行（light 省略两个字段；full 完整 Status）。
+// 始终返回非 nil 切片：空页 JSON 输出 [] 而不是 null。
+func accountsProjection(pageRows []pool.Status, fields string) []pool.Status {
+	rows := make([]pool.Status, len(pageRows))
+	if fields == accountsFieldsFull {
+		copy(rows, pageRows)
+		return rows
+	}
+	for i, st := range pageRows {
+		rows[i] = lightStatus(st)
+	}
+	return rows
+}
+
+// accountsStableProjection 返回 ETag hash 输入行：在响应投影基础上再把易变字段
+// 归零（见 stableStatusForETag）。
+func accountsStableProjection(pageRows []pool.Status, fields string) []pool.Status {
+	rows := make([]pool.Status, len(pageRows))
+	for i, st := range pageRows {
+		if fields != accountsFieldsFull {
+			st = lightStatus(st)
+		}
+		rows[i] = stableStatusForETag(st)
+	}
+	return rows
+}
+
+// accountsETagInput 是 ETag 的完整 hash 输入：归一化查询参数 + 计数/分页元信息 +
+// 稳定投影行。rows 参与 hash 保证「内容变了 ETag 必变」；查询参数参与保证不同
+// 页/筛选/排序/投影各有独立缓存条目。
+type accountsETagInput struct {
+	Query    accountsQuery `json:"query"`
+	Total    int           `json:"total"`
+	Filtered int           `json:"filtered"`
+	Page     int           `json:"page"`
+	PageSize int           `json:"page_size"`
+	Pages    int           `json:"pages"`
+	Rows     []pool.Status `json:"rows"`
+}
+
+// accountsETag 计算弱 ETag `W/"acct-<sha256 hex>"`。
+// 弱校验适合「语义等价即可复用」的列表响应；hex 输入是无 key 的 JSON
+// （encoding/json 对结构体字段顺序确定，无 map 乱序问题）。
+//
+// ok=false 表示稳定投影无法 JSON 序列化（例如极端脏数据里的 NaN/Inf 浮点）：
+// 此时调用方必须跳过 ETag/304——绝不能返回一个恒定 ETag，否则后续所有轮询都会
+// 命中 304 拿到过期数据，比没有缓存更糟。
+func accountsETag(in accountsETagInput) (etag string, ok bool) {
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(raw)
+	return `W/"acct-` + hex.EncodeToString(sum[:]) + `"`, true
+}
+
+// accounts 账号池列表（v2.1 #1）：服务端筛选/排序/分页/字段裁剪 + ETag/304。
+//
+// 数据源与 /overview 的 accounts 相同（pool.List() 快照，锁外筛选/排序/序列化），
+// 但只序列化当前页——旧接口默认行为完全不变，本接口供账号页按需拉取：
+//
+//	GET /panel/api/accounts?page=1&page_size=100&q=&state=&realm=&enterprise=&sort=&fields=
+//
+// 响应：{"ok":true,"now":<unix秒>,"total":N,"filtered":M,"page":1,"page_size":100,
+// "pages":P,"rows":[Status...]}。now 供前端校正时钟后在本地按 until 倒计时。
+// 超界 page 钳到最后一页、page_size=0 时 page 规范化 1（均以响应 page 为准）。
+// 带 If-None-Match 且命中稳定投影 ETag 时返回 304 空 body（保留 ETag/
+// Cache-Control/Vary），5s 轮询在无状态变化时零 body。
+func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	q := parseAccountsQuery(r)
+
+	var snapshot []pool.Status
+	if p.cfg.Pool != nil {
+		snapshot = p.cfg.Pool.List()
+	}
+	total := len(snapshot)
+	filtered := make([]pool.Status, 0, len(snapshot))
+	for _, st := range snapshot {
+		if accountsMatch(st, q, now) {
+			filtered = append(filtered, st)
+		}
+	}
+	sortAccounts(filtered, q.Sort)
+	pageRows, effPage, pages := pageAccounts(filtered, q.Page, q.PageSize)
+	q.Page = effPage // 生效页码（越界钳到末页 / 全部模式规范化 1）
+
+	// 先算 ETag（只序列化稳定投影）：304 命中时连响应 body 都省掉，是 5s 轮询常态。
+	// q.Page 已替换为生效页码，语义等价的越界请求（如 page=99 钳到末页）共享 ETag。
+	h := w.Header()
+	h.Set("Cache-Control", accountsCacheControl)
+	if etag, ok := accountsETag(accountsETagInput{
+		Query:    q,
+		Total:    total,
+		Filtered: len(filtered),
+		Page:     q.Page,
+		PageSize: q.PageSize,
+		Pages:    pages,
+		Rows:     accountsStableProjection(pageRows, q.Fields),
+	}); ok {
+		h.Set("ETag", etag)
+		if ifNoneMatch(r, etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"now":       now.Unix(),
+		"total":     total,
+		"filtered":  len(filtered),
+		"page":      q.Page,
+		"page_size": q.PageSize,
+		"pages":     pages,
+		"rows":      accountsProjection(pageRows, q.Fields),
+	})
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。

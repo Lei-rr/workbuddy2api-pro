@@ -501,6 +501,27 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 	return t, h, c, d + pz, f
 }
 
+// CreditsSums 返回全池积分合计（creditsSum）与总额度合计（creditsTotalSum），
+// 供面板 overview（含 5s 轮询的 lite 轻量分支）展示「积分剩余 / 总额」汇总，
+// 无需为求和构造全量 Status 快照（List() 会为每账号分配状态与可变长切片）。
+//
+// creditsTotal 语义：0 = 未知（旧 state/查询失败），企业版无限量以上游 -1 透出；
+// 非正值一律按 0 计（不加负值），避免「未知/不限」把总额拉低甚至求和为负。
+// credits 原值累加（与面板旧前端 sum(s.credits) 口径逐值一致）。
+//
+// 复杂度 O(n)、单次 RLock、除返回值外零分配；lite overview 每轮轮询的常驻路径。
+func (p *Pool) CreditsSums() (creditsSum, creditsTotalSum int64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		creditsSum += e.credits
+		if e.creditsTotal > 0 {
+			creditsTotalSum += e.creditsTotal
+		}
+	}
+	return creditsSum, creditsTotalSum
+}
+
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
 // countsDetailedForRealm 是共用遍历实现；realm=="" 不加谓词。
 //

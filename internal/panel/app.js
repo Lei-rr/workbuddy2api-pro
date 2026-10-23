@@ -358,7 +358,7 @@ $('btnKey').onclick = async () => {
   if (!v) return;
   localStorage.setItem(LS_KEY, v);
   try {
-    await api('overview');
+    await api('overview?lite=1');   // 只验鉴权：用 lite（1-2 KB）即可，不拉全量账号
     $('keyErr').hidden = true;
     $('keyVeil').classList.remove('on');
     start();   // 手动保存密钥成功 → 重置 401 停表状态并重启轮询
@@ -414,8 +414,14 @@ function switchAccTab(tab) {
   accTab = (tab === 'expiry' || tab === 'models') ? tab : 'list';
   document.querySelectorAll('#accTabs .subtab').forEach(b => b.classList.toggle('on', b.dataset.tab === accTab));
   expBoxShow();
-  // 切到「积分到期」时若还没有任何内容（快照未渲染过），先用 overview 快照补上。
-  if (accTab === 'expiry' && $('expList') && !$('expList').children.length && overviewData) renderExpirySnapshot(overviewData);
+  // v2.1 #1：切到「积分到期」时按需拉完整 overview（60s 新鲜窗口内复用缓存）。
+  // 已有快照先渲染，避免等请求的空白期；拉回后再渲染一次。
+  if (accTab === 'expiry') {
+    if (overviewData) renderExpirySnapshot(overviewData);
+    ensureFullOverview(true).then(ok => {
+      if (ok && accTab === 'expiry' && overviewData) renderExpirySnapshot(overviewData);
+    });
+  }
 }
 
 // 三个面板容器（账号池 / 积分到期 / 模型锁池）的可见性统一由当前 tab 决定。
@@ -430,8 +436,10 @@ function expBoxShow() {
 // 求值即接管初始可见性。
 expBoxShow();
 
-/* ── 账号池筛选 + 客户端分页 ───────────────────────────────────────────
-   /overview 仍返回全量，前端只渲染当前页；5s 轮询重渲染时保持筛选条件与页码。 */
+/* ── 账号池筛选 + 服务端分页（v2.1 #1）────────────────────────────────
+   accFilters/accPage/accPageSize 是「请求参数」而非本地过滤条件：任何变化都重新
+   请求 /panel/api/accounts（服务端 filter+分页），前端只持有当前页 rows。
+   兼容：renderAccounts(array) 仍走本地筛选+分页（node harness/旧调用）。 */
 let expAll = [];                              // 到期快照（按最近到期升序，含无到期账号）
 let expPage = 1;
 let expPageSize = 100;                        // 0 = 全部
@@ -478,6 +486,94 @@ function hitCountLabel(shown, total, unit) {
   return shown === total ? total + ' ' + unit : '命中 ' + shown + ' / ' + total + ' ' + unit;
 }
 
+/* ── 账号池服务端分页/筛选参数（v2.1 #1）──────────────────────────────
+   账号池的筛选与分页全部下推给 /panel/api/accounts，前端不再对全量数组做
+   filter/slice。参数口径与后端契约一一对应（字段名不可改）：
+     state: ok→healthy、cool→cooling、paused、disabled（空 = 全部）
+     ver:   enterprise→enterprise=1；global→realm=global&enterprise=0；
+            cn→realm=cn&enterprise=0（保持旧 UI 三分法互斥语义）
+     page_size: 0 表示全部（服务端上限 2000）。 */
+function accStateParam(state) {
+  const map = { ok: 'healthy', cool: 'cooling', paused: 'paused', disabled: 'disabled' };
+  return map[state] || '';
+}
+
+/* accQueryString 由筛选状态 + 页码/页长拼服务端查询串；同一查询串同时是 ETag
+   缓存的键。参数写入顺序固定，避免等价查询产生两个缓存键。
+   版本筛选保持旧 UI 的三分法「企业版 / 国际版 / 国内版」互斥语义：服务端
+   realm 与 enterprise 是两个正交维度，所以国内/国际都要再带 enterprise=0
+   把企业版排除掉（否则国际版筛选会把海外企业号也带出来）。 */
+function accQueryString(filters, page, pageSize) {
+  filters = filters || { q: '', state: '', ver: '' };
+  const p = new URLSearchParams();
+  p.set('page', String(Math.max(1, Math.floor(Number(page) || 1))));
+  p.set('page_size', String(Math.max(0, Math.floor(Number(pageSize) || 0))));
+  const st = accStateParam(filters.state);
+  if (st) p.set('state', st);
+  if (filters.q) p.set('q', filters.q);
+  if (filters.ver === 'enterprise') p.set('enterprise', '1');
+  else if (filters.ver === 'global') { p.set('realm', 'global'); p.set('enterprise', '0'); }
+  else if (filters.ver === 'cn') { p.set('realm', 'cn'); p.set('enterprise', '0'); }
+  return p.toString();
+}
+
+/* etagCachePut 把 {etag,data} 放进按查询串索引的小 LRU（只保留最近 32 个查询，
+   避免用户狂敲搜索时缓存无限膨胀）。cache.__keys 记录插入顺序。 */
+const ETAG_CACHE_MAX = 32;
+function etagCachePut(cache, key, entry) {
+  if (!cache || !key) return;
+  let keys = cache.__keys;
+  if (!Array.isArray(keys)) keys = cache.__keys = [];
+  if (keys.indexOf(key) < 0) {
+    keys.push(key);
+    while (keys.length > ETAG_CACHE_MAX) {
+      const old = keys.shift();
+      if (old !== key) delete cache[old];
+    }
+  }
+  cache[key] = entry;
+}
+
+/* apiCached 带 If-None-Match 的 GET（v2.1 #1）：200 时缓存 {etag,data}；304 时
+   直接返回缓存 data 并标记 cached=true（body 为空，不能 parse）。调用方要按
+   「200 时校准的 skew + 当前 Date.now()」本地重算倒计时（light 投影没有
+   cool_remaining_sec；304 不刷新 now，直接用 now 会冻结倒计时）。
+   cache 由调用方持有（账号页用 ACCOUNTS_CACHE），缓存键 = 完整查询串。 */
+async function apiCached(path, cache) {
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  const prev = cache && cache[path];
+  if (prev && prev.etag) h['If-None-Match'] = prev.etag;
+  // no-store：禁止浏览器 HTTP 缓存介入，确保条件请求真的到后端、304 能落到这里。
+  const r = await fetch('/panel/api/' + path, { headers: h, cache: 'no-store' });
+  if (r.status === 401) { onAuthRequired(); throw new Error('密钥无效或未填写'); }
+  if (r.status === 304) {
+    keyPrompted = false;
+    if (!prev) throw new Error('304 但本地缓存缺失');
+    return { data: prev.data, etag: prev.etag, cached: true };
+  }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  keyPrompted = false;
+  const etag = (r.headers && typeof r.headers.get === 'function' && r.headers.get('ETag')) || '';
+  if (etag) etagCachePut(cache, path, { etag: etag, data: d, at: Date.now() });
+  return { data: d, etag: etag, cached: false };
+}
+
+/* ── 账号池分页状态（v2.1 #1）──────────────────────────────────────────
+   accPageMeta 保存服务端分页响应（total/filtered/page/pages/now），用于计数、
+   翻页按钮禁用态与本地倒计时基准；ACCOUNTS_CACHE 按查询串缓存 ETag 响应。
+   accReqSeq 用于丢弃过期响应：快速改筛选/翻页时先发的请求可能后到，不能让它
+   把新条件的结果覆盖掉（proposal 里「按 epoch 丢弃过期页」的等价做法）。 */
+let accPageMeta = null;
+let accReqSeq = 0;
+/* accClockSkew = 本地 Date.now() - 服务端 now*1000（最近一次 200 响应校准）。
+   304 命中时响应没有新 now，但渲染用 Date.now()-skew 得到继续前进的本地时间，
+   冷却倒计时因此不会冻结（详见 accNowMs）。 */
+let accClockSkew = 0;
+const ACCOUNTS_CACHE = {};
+
 /* dotaskBusy 正在执行「做任务」的 uid 集合。
    5s 轮询会把 #accBody 整块 innerHTML 重建，只改被点击的那个按钮节点会丢状态，
    按钮看起来又能点（服务端 per-account 锁会回 409，但交互上像卡住/可重复触发）。
@@ -497,14 +593,56 @@ function accDoTaskBtn(s) {
     (busy ? '做任务中…' : '做任务') + '</button>';
 }
 
-// 账号是否处于冷却（限流 / 熔断 / 连败降权），与行内状态判定一致。
-function accIsCool(s) {
-  const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-  const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
-  return Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0) > 0;
+/* secUntil 绝对时间 → 剩余秒数（已过期/非法值 = 0）。nowMs 由调用方给：账号页
+   响应的 now（服务端 unix 秒）可校正浏览器时钟偏差。 */
+function secUntil(v, nowMs) {
+  if (!v) return 0;
+  const t = new Date(v).getTime();
+  if (isNaN(t)) return 0;
+  return Math.max(0, (t - nowMs) / 1000);
 }
 
-function accMatch(s) {
+/* accCoolRemaining 账号剩余冷却秒数（v2.1 #1）：light 投影不再返回
+   cool_remaining_sec（秒级易变字段会破坏 ETag 稳定性），改由绝对时间本地算——
+   取 until / breaker_until / degrade_until 中最晚的未到期时刻，再与旧字段
+   cool_remaining_sec 取大（full 投影 / 旧后端仍会带它，保持兼容）。 */
+function accCoolRemaining(s, nowMs) {
+  if (!s) return 0;
+  const now = nowMs == null ? Date.now() : Number(nowMs);
+  return Math.max(
+    Number(s.cool_remaining_sec) || 0,
+    secUntil(s.until, now),
+    secUntil(s.breaker_until, now),
+    secUntil(s.degrade_until, now));
+}
+
+/* accCoolKind 冷却原因标签：熔断 / 连败降权优先于普通冷却；cool_kind 区分
+   硬积分冷却（hard_credit）与普通限流冷却。 */
+function accCoolKind(s, nowMs) {
+  if (!s) return '限流冷却';
+  const now = nowMs == null ? Date.now() : Number(nowMs);
+  const gen = Math.max(Number(s.cool_remaining_sec) || 0, secUntil(s.until, now));
+  const bl = secUntil(s.breaker_until, now);
+  const dg = secUntil(s.degrade_until, now);
+  if (bl > Math.max(gen, dg)) return '熔断';
+  if (dg > gen) return '连败降权';
+  return s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却';
+}
+
+/* accNowMs 渲染倒计时用的「当前时间」：本地时钟 - 与服务端的偏差（skew）。
+   skew 由最近一次 200 响应的 now 校准；304 命中时 meta 不更新，但这里每次都重新
+   取 Date.now()，所以倒计时继续走——ETag 稳定（一直 304）不会把冷却倒计时冻结。
+   meta 无 skew/now 时直接用本地时钟（兼容旧调用与切片 harness）。 */
+function accNowMs(meta) {
+  if (meta && Number.isFinite(Number(meta.skew))) return Date.now() - Number(meta.skew);
+  if (meta && Number(meta.now) > 0) return Number(meta.now) * 1000;
+  return Date.now();
+}
+
+// 账号是否处于冷却（限流 / 熔断 / 连败降权），与行内状态判定一致。
+function accIsCool(s, nowMs) { return accCoolRemaining(s, nowMs) > 0; }
+
+function accMatch(s, nowMs) {
   const f = accFilters;
   if (f.q) {
     const hay = ((s.nickname || '') + ' ' + (s.uid || '')).toLowerCase();
@@ -515,8 +653,8 @@ function accMatch(s) {
   if (f.ver === 'global' && (s.enterprise || s.realm !== 'global')) return false;
   if (f.ver === 'cn' && (s.enterprise || s.realm === 'global')) return false;
   switch (f.state) {
-    case 'ok': return !s.disabled && !s.paused && !accIsCool(s);
-    case 'cool': return !s.disabled && !s.paused && accIsCool(s);
+    case 'ok': return !s.disabled && !s.paused && !accIsCool(s, nowMs);
+    case 'cool': return !s.disabled && !s.paused && accIsCool(s, nowMs);
     case 'paused': return !!s.paused;
     case 'disabled': return !!s.disabled;
   }
@@ -530,42 +668,94 @@ function updateAccPager(shown, pages) {
   if ($('accNext')) $('accNext').disabled = !pages || accPage >= pages;
 }
 
-function renderAccounts(list) {
+/* updateAccPagerMeta 服务端分页模式的计数/页码：total = 池总数，
+   filtered = 筛选后总数（服务端已算好，前端不再数当前页）。 */
+function updateAccPagerMeta(meta) {
+  if (!meta) return;
+  const total = Number(meta.total) || 0;
+  const filtered = Number(meta.filtered);
+  const shown = isNaN(filtered) ? total : filtered;
+  const page = Number(meta.page) || 1;
+  const pages = Number(meta.pages) || 1;
+  if ($('accCount')) {
+    $('accCount').textContent = !total ? ''
+      : (shown === total ? '共 ' + total + ' 个' : '命中 ' + shown + ' / 共 ' + total + ' 个');
+  }
+  if ($('accPageInfo')) $('accPageInfo').textContent = page + ' / ' + pages;
+  if ($('accPrev')) $('accPrev').disabled = page <= 1;
+  if ($('accNext')) $('accNext').disabled = pages <= 1 || page >= pages;
+}
+
+/* accCreditsMax 积分进度条的池内基准。分页模式下当前页只有 100 行，逐页取 max
+   会让同一账号的条长随翻页跳动；优先用完整 overview 的全量账号做基准（页面加载
+   时后台拉一次），没有全量快照时退回当前页 max。 */
+function accCreditsMax(rows) {
+  const full = (overviewData && overviewData.accounts) || [];
+  let m = 0;
+  for (const s of full) m = Math.max(m, Number(s.credits) || 0);
+  if (!m) for (const s of (rows || [])) m = Math.max(m, Number(s.credits) || 0);
+  return Math.max(1, m);
+}
+
+/* renderAccounts 渲染账号表。两种调用方式：
+   ① 服务端分页模式 renderAccounts(rows, meta)：rows 已是当前页且已按筛选/排序
+      处理（/panel/api/accounts），meta = {total,filtered,page,pages,now}；
+      本地只渲染，不再 filter/slice（这是 v2.1 #1 的核心：大池子不整包下发）。
+   ② 兼容调用 renderAccounts(array)：无 meta 时退回 v2.0 的客户端筛选+分页
+      （node harness 与按数组直接调用的切片测试依赖它，行为保持不变）。 */
+function renderAccounts(list, meta) {
   accAll = list || [];
+  const server = !!(meta && typeof meta === 'object');
+  accPageMeta = server ? meta : null;
   const tb = $('accBody');
-  if (!accAll.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
-    updateAccPager(0, 1);
+  if (!tb) return;
+  let pageRows = accAll;
+  let filteredCount = accAll.length;
+  let pages = 1;
+  if (!server) {
+    if (!accAll.length) {
+      tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+      updateAccPager(0, 1);
+      return;
+    }
+    const filtered = accAll.filter(accMatch);
+    if (!filtered.length) {
+      accPage = 1;
+      tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合筛选条件的账号</div></td></tr>';
+      updateAccPager(0, 1);
+      return;
+    }
+    const pr = pageSlice(filtered, accPageSize, accPage);
+    accPage = pr.page;
+    pageRows = pr.rows;
+    filteredCount = filtered.length;
+    pages = pr.pages;
+  } else if (!accAll.length) {
+    // 服务端模式空页：可能是池为空，也可能是筛选无命中——用 meta.total 区分。
+    const total = Number(meta.total) || 0;
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">' +
+      (total > 0 ? '没有符合筛选条件的账号' : '账号池是空的') + '</div></td></tr>';
+    updateAccPagerMeta(meta);
     return;
   }
-  const filtered = accAll.filter(accMatch);
-  if (!filtered.length) {
-    accPage = 1;
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty">没有符合筛选条件的账号</div></td></tr>';
-    updateAccPager(0, 1);
-    return;
-  }
-  const pr = pageSlice(filtered, accPageSize, accPage);
-  accPage = pr.page;
-  const pageRows = pr.rows;
+  // 倒计时基准：本地时钟 - 与服务端 now 的偏差（见 accNowMs）。light 投影没有
+  // cool_remaining_sec，冷却时长全部由 until/breaker_until/degrade_until 本地算；
+  // 304 命中时仍用 Date.now() 重取，所以倒计时不会因 ETag 稳定而冻结。
+  const nowMs = server ? accNowMs(meta) : Date.now();
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  // 基准取全量（accAll）而非当前页，翻页与筛选时条长稳定不跳。
-  const maxCred = Math.max(1, ...accAll.map(s => s.credits || 0));
+  // 基准取全量（完整 overview 快照）而非当前页，翻页与筛选时条长稳定不跳。
+  const maxCred = accCreditsMax(pageRows);
   tb.innerHTML = pageRows.map(s => {
-    const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
+    const cool = accCoolRemaining(s, nowMs);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
-      tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
+      tag = '<span class="tag warn">' + accCoolKind(s, nowMs) + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, nowMs);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -631,7 +821,8 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
-  updateAccPager(filtered.length, pr.pages);
+  if (server) updateAccPagerMeta(meta);
+  else updateAccPager(filteredCount, pages);
 }
 
 if ($('accTabs')) document.querySelectorAll('#accTabs .subtab').forEach(b => b.onclick = () => switchAccTab(b.dataset.tab));
@@ -644,31 +835,41 @@ if ($('expPageSize')) $('expPageSize').addEventListener('change', () => {
 if ($('expPrev')) $('expPrev').onclick = () => { if (expPage > 1) { expPage--; renderExpirySnapshot(overviewData); } };
 if ($('expNext')) $('expNext').onclick = () => { expPage++; renderExpirySnapshot(overviewData); };
 
-/* 筛选栏 / 分页控件接线（元素常驻，事件只注册一次；重渲染只换 tbody）。 */
+/* 筛选栏 / 分页控件接线（元素常驻，事件只注册一次；重渲染只换 tbody）。
+   v2.1 #1：筛选与分页全部走服务端参数 /panel/api/accounts——
+   搜索输入防抖 250ms，任何筛选条件变化都回到第 1 页重新请求；翻页按钮按服务端
+   返回的 pages 判断边界。 */
+let accQTimer = null;
+function reloadAccountPage() { loadAccountPage(false); }
 if ($('accQ')) $('accQ').addEventListener('input', () => {
-  accFilters.q = $('accQ').value.trim();
-  accPage = 1;
-  renderAccounts(accAll);
+  clearTimeout(accQTimer);
+  accQTimer = setTimeout(() => {
+    const v = $('accQ').value.trim();
+    if (v === accFilters.q) return;      // 值没变（比如只多敲了空格）不发请求
+    accFilters.q = v;
+    accPage = 1;
+    reloadAccountPage();
+  }, 250);
 });
 if ($('accState')) $('accState').addEventListener('change', () => {
   accFilters.state = $('accState').value;
   accPage = 1;
-  renderAccounts(accAll);
+  reloadAccountPage();
 });
 if ($('accVer')) $('accVer').addEventListener('change', () => {
   accFilters.ver = $('accVer').value;
   accPage = 1;
-  renderAccounts(accAll);
+  reloadAccountPage();
 });
 if ($('accPageSize')) $('accPageSize').addEventListener('change', () => {
   accPageSize = parseInt($('accPageSize').value, 10) || 0;
   accPage = 1;
-  renderAccounts(accAll);
+  reloadAccountPage();
 });
-if ($('accPrev')) $('accPrev').onclick = () => { if (accPage > 1) { accPage--; renderAccounts(accAll); } };
+if ($('accPrev')) $('accPrev').onclick = () => { if (accPage > 1) { accPage--; reloadAccountPage(); } };
 if ($('accNext')) $('accNext').onclick = () => {
-  const pages = pageSlice(accAll.filter(accMatch), accPageSize, accPage).pages;
-  if (accPage < pages) { accPage++; renderAccounts(accAll); }
+  const pages = (accPageMeta && Number(accPageMeta.pages)) || 1;
+  if (accPage < pages) { accPage++; reloadAccountPage(); }
 };
 
 /* ── 模型锁池：搜索 + 状态/地区筛选 + 客户端分页 ─────────────────────────
@@ -762,42 +963,158 @@ if ($('mlNext')) $('mlNext').onclick = () => {
   if (mlPage < pages) { mlPage++; renderModelLocksView(); }
 };
 
+/* ── 总览数据（v2.1 #1：lite 轮询 + 按需全量）──────────────────────────
+   /panel/api/overview?lite=1 只含计数/元信息/模型锁池（约 1-2 KB），5s 轮询用它
+   更新统计条、导航与模型锁池；账号行改由服务端分页接口 /panel/api/accounts 提供。
+   完整 overview（带 accounts）只在「积分到期」tab、页面加载（一次性，供积分合计
+   与备注弹窗）时按需拉取，并受 60s 新鲜窗口约束——账号池列表不再每 5s 拉全量。 */
+let creditsSum = null;            // 积分合计：优先用 overview 的 credits_sum/credits_total_sum
+let overviewAt = 0;               // 完整 overview 的拉取时刻（判断 60s 新鲜窗口）
+let overviewFetching = false;     // 完整 overview 请求在途（避免重复拉全量）
+const OVERVIEW_FULL_TTL_MS = 60 * 1000;
+
+function renderCreditsStat() {
+  const el = $('sCredits');
+  if (!el) return;
+  if (!creditsSum) { el.textContent = '—'; return; }
+  el.textContent = creditsSum.tot > 0 ? creditsSum.rem + ' / ' + creditsSum.tot : String(creditsSum.rem);
+}
+
+/* applyOverviewMeta 把 overview / overview?lite=1 共有的计数与元信息写进界面。
+   两者字段一致（lite 只是没有 accounts），所以同一段逻辑服务两条数据源。 */
+function applyOverviewMeta(d) {
+  if (!d) return;
+  // 轮询间隔随 overview 下发（后端 panel.poll_interval_sec，默认 5，clamp 2-60）：
+  // 非法值回落 5。每次成功都刷新一次，面板里改完配置后下一轮 polls 自动跟上。
+  pollBaseSec = pollIntervalSec(d.poll_interval_sec);
+  $('sTotal').textContent = d.total;
+  $('sHealthy').textContent = d.healthy;
+  $('sCooling').textContent = d.cooling;
+  $('sDisabled').textContent = d.disabled;
+  // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
+  if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
+  // 积分合计：v2.1 的 lite overview 也带 credits_sum / credits_total_sum（全量 overview
+  // 同样有），5s 轮询即可刷新统计条；缺这两个字段时（旧后端/mock）回落完整
+  // overview 的 accounts 求和，再没有就保持上一次的值（显示「—」直到拿到数据）。
+  if (d.credits_sum != null || d.credits_total_sum != null) {
+    creditsSum = { rem: Number(d.credits_sum) || 0, tot: Number(d.credits_total_sum) || 0 };
+  } else if (Array.isArray(d.accounts)) {
+    let rem = 0, tot = 0;
+    for (const s of d.accounts) { rem += Number(s.credits) || 0; tot += Number(s.credits_total) || 0; }
+    creditsSum = { rem: rem, tot: tot };
+  }
+  renderCreditsStat();
+  $('sSticky').textContent = d.sticky_sessions;
+  $('navSub').textContent = 'v' + d.version;
+  $('navVer').textContent = 'v' + d.version;
+  $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
+  $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+  const p = $('navPulse');
+  p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+  $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
+  const up = Math.floor(d.uptime_sec);
+  $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+  renderModelLocks(d.model_locks);
+}
+
+/* loadSummary 只拉 lite overview：5s 轮询的常驻请求，~1-2 KB。 */
+async function loadSummary(quiet) {
+  try {
+    const d = await api('overview?lite=1');
+    applyOverviewMeta(d);
+    return true;
+  } catch (e) { if (!quiet) toast(e.message, 'err'); return false; }
+}
+
+/* loadOverview 完整 overview（带 accounts）：到期卡片/备注弹窗用（积分合计优先用
+   同响应的 credits_sum，见 applyOverviewMeta）。
+   注意：它不再渲染账号表——账号行唯一数据源是服务端分页接口。 */
 async function loadOverview(quiet) {
+  if (overviewFetching) return false;
+  overviewFetching = true;
   try {
     const d = await api('overview');
     overviewData = d;
-    // 轮询间隔随 overview 下发（后端 panel.poll_interval_sec，默认 5，clamp 2-60）：
-    // 非法值回落 5。每次成功都刷新一次，面板里改完配置后下一轮 polls 自动跟上。
-    pollBaseSec = pollIntervalSec(d.poll_interval_sec);
-    $('sTotal').textContent = d.total;
-    $('sHealthy').textContent = d.healthy;
-    $('sCooling').textContent = d.cooling;
-    $('sDisabled').textContent = d.disabled;
-    // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
-    if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
-    $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
-    $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
-    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
-    const p = $('navPulse');
-    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
-    $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
-    const up = Math.floor(d.uptime_sec);
-    $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
-    renderModelLocks(d.model_locks);
-    // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
-    // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
-    // 「检查」之后卡片永远停在那一刻的旧数据。
+    overviewAt = Date.now();
+    applyOverviewMeta(d);
+    // 到期卡片用同一次响应里的按日批次刷新。2 分钟内的实时明细（逐包查询）最新且
+    // 更全，保留；过期后由这份快照接管，避免点过一次「检查」后卡片永远停在旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
-    return true;   // 轮询据此判断本轮成功/失败（失败才退避）
+    return true;
   } catch (e) { if (!quiet) toast(e.message, 'err'); return false; }
+  finally { overviewFetching = false; }
 }
+
+/* ensureFullOverview 完整 overview 的 60s 新鲜窗口：切「积分到期」tab / 到期 tab
+   轮询时先看缓存，过期才真正请求（避免频繁拉 689KB 全量）。force=true 强制刷新。 */
+async function ensureFullOverview(quiet, force) {
+  if (!force && overviewData && (Date.now() - overviewAt) < OVERVIEW_FULL_TTL_MS) return true;
+  return loadOverview(quiet);
+}
+
+/* invalidateFullOverview 账号集合/积分可能已变（增删号、签到、刷新余额）后作废
+   完整 overview 的新鲜窗口：下次需要全量时再拉，避免操作后继续用旧合计。 */
+function invalidateFullOverview() { overviewAt = 0; }
+
+/* loadAccountsPage 当前页账号（服务端筛选/分页 + ETag/304）。
+   304 时 apiCached 直接复用缓存 rows；200 时用响应 now 校准 accClockSkew，
+   渲染倒计时用 Date.now()-skew 本地重算（light 投影没有 cool_remaining_sec），
+   所以「一直 304」时倒计时也继续走、不会冻结。 */
+async function loadAccountPage(quiet) {
+  const qs = accQueryString(accFilters, accPage, accPageSize);
+  const seq = ++accReqSeq;
+  try {
+    const res = await apiCached('accounts?' + qs, ACCOUNTS_CACHE);
+    // 过期响应（先发后到）：用户已经改了筛选/翻页，不能覆盖新结果。
+    if (seq !== accReqSeq) return true;
+    const d = res.data || {};
+    // 只有 200 才带新的服务端 now：用它校准本地时钟偏差；304 沿用上次 skew。
+    if (!res.cached && Number(d.now) > 0) {
+      accClockSkew = Date.now() - Number(d.now) * 1000;
+    }
+    const meta = {
+      now: Number(d.now) || 0,
+      skew: accClockSkew,
+      total: Number(d.total) || 0,
+      filtered: d.filtered == null ? null : Number(d.filtered),
+      page: Number(d.page) || 1,
+      pages: Number(d.pages) || 1,
+    };
+    // 服务端可能把 page 钳到有效范围（筛选后页数变少），以响应为准。
+    accPage = meta.page;
+    accPageMeta = meta;
+    renderAccounts(d.rows || [], meta);
+    return true;
+  } catch (e) {
+    if (seq !== accReqSeq) return true;
+    if (!quiet) toast('账号列表加载失败：' + e.message, 'err');
+    return false;
+  }
+}
+
+/* refreshAccountsView 账号池视图的一轮刷新（5s 轮询与操作后刷新共用）：
+   ① lite overview（统计条/导航/模型锁池）；
+   ② 当前页 accounts（服务端筛选+分页，ETag 命中 304 时复用缓存）；
+   ③ 仅当「积分到期」tab 激活时才按 60s 窗口补完整 overview（低频）。
+   列表 tab 下不拉全量——这是「账号池不再每 5s 拉 689KB」的落点。 */
+async function refreshAccountsView(quiet) {
+  const [summaryOK, pageOK] = await Promise.all([loadSummary(quiet), loadAccountPage(quiet)]);
+  if (accTab === 'expiry' && view === 'accounts') {
+    const ok = await ensureFullOverview(quiet);
+    if (ok && overviewData) renderExpirySnapshot(overviewData);
+  }
+  return !!(summaryOK && pageOK);
+}
+
+/* refreshAccountPool 操作后的等价刷新入口（替代旧的 loadOverview(true)）：
+   summary + 当前页 accounts，都是小响应；同时作废完整 overview 的新鲜窗口，
+   避免操作后继续用旧积分合计/旧到期快照。 */
+async function refreshAccountPool(quiet) {
+  invalidateFullOverview();
+  return refreshAccountsView(quiet);
+}
+
 
 /* runAccountDotask 账号行「做任务」：单账号执行全部可自动任务。
    与「任务」弹窗（看进度、单项执行）并行保留：这个按钮是「没空逐项点」时的
@@ -832,7 +1149,7 @@ async function runAccountDotask(btn, uid) {
     dotaskBusy.delete(uid);
     btn.disabled = false;
     btn.textContent = label;
-    loadOverview(true);   // 任务可能写了积分/进度，刷新首页统计
+    refreshAccountPool(true);   // 任务可能写了积分/进度，刷新 summary + 当前页
   }
 }
 
@@ -873,7 +1190,7 @@ $('accBody').addEventListener('click', async ev => {
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; loadOverview(true); }
+  finally { b.disabled = false; refreshAccountPool(true); }
 });
 
 $('btnCheckinAll').onclick = async () => {
@@ -890,7 +1207,7 @@ if ($('btnRescan')) $('btnRescan').onclick = async () => {
   try {
     const r = await api('accounts/rescan', { method: 'POST' });
     toast('扫描 ' + r.scanned + ' 个文件：新增 ' + r.added + '，剔除 ' + r.removed, 'ok');
-    loadOverview(true);
+    refreshAccountPool(true);
   } catch (e) { toast(e.message, 'err'); }
 };
 $('btnTravelAll').onclick = async () => {
@@ -1401,17 +1718,26 @@ async function loadCreditHistory() {
   renderCreditHistory(d);
 }
 
-/* syncCreditAccounts 积分历史账号下拉：候选来自账号池（accAll，/overview 已返回）。
+/* poolAccountList 账号全集（积分历史下拉 / 备注弹窗等需要「全部账号」的场景）：
+   v2.1 #1 之后账号表只有当前页 rows（accAll），全量列表优先取完整 overview 快照
+   （页面加载时后台拉一次；积分到期 tab 会按 60s 窗口刷新），没有快照才退当前页。 */
+function poolAccountList() {
+  if (overviewData && Array.isArray(overviewData.accounts) && overviewData.accounts.length) return overviewData.accounts;
+  return accAll;
+}
+
+/* syncCreditAccounts 积分历史账号下拉：候选来自账号池全集（见 poolAccountList）。
    只在账号集合变化时重建 options——日志页 5s 轮询会反复调到这里，每次换
    innerHTML 会把用户正在展开的下拉框关掉。选中的账号被移除后回落「全部账号」。 */
 function syncCreditAccounts() {
   const sel = $('creditAccount');
   if (!sel) return;
-  const sig = accAll.map(s => s.uid + ':' + (s.nickname || '')).join('|');
+  const list = poolAccountList();
+  const sig = list.map(s => s.uid + ':' + (s.nickname || '')).join('|');
   if (sel.dataset && sel.dataset.sig === sig) return;
   if (sel.dataset) sel.dataset.sig = sig;
   const opts = ['<option value="">全部账号</option>'];
-  for (const s of accAll) {
+  for (const s of list) {
     opts.push('<option value="' + esc(s.uid) + '">' + esc(s.nickname || String(s.uid).slice(0, 8)) + '</option>');
   }
   sel.innerHTML = opts.join('');
@@ -1774,7 +2100,7 @@ $('cfgForm').onsubmit = async ev => {
     refFailures = 0;
     if (!refTimer && !refInFlight) scheduleNextPoll();
     loadConfig();
-    loadOverview(true);
+    refreshAccountPool(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
@@ -1829,7 +2155,7 @@ async function pollLogin() {
       $('addReady').hidden = true;
       $('addDone').hidden = false;
       $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
-      setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+      setTimeout(() => { closeAdd(); refreshAccountPool(true); }, 1600);
     }
   } catch (e) {
     stopPoll();
@@ -1862,7 +2188,7 @@ $('importFile').onchange = async () => {
     if (d.errors && d.errors.length) {
       console.warn('import errors:', d.errors);
     }
-    loadOverview(true);
+    refreshAccountPool(true);
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
@@ -1885,7 +2211,7 @@ $('btnRefresh').onclick = async () => {
     const r = await api('balance_all', { method: 'POST' });
     if (r && r.ok === false) { toast(r.error || r.message || '刷新提交失败', 'err'); return; }
     toast('已开始刷新余额（后台执行，完成后自动刷新）', 'ok');
-    setTimeout(() => loadOverview(true), 2500);
+    setTimeout(() => refreshAccountPool(true), 2500);
   } catch (e) { toast('刷新失败：' + e.message, 'err'); }
   finally { b.disabled = false; b.textContent = label; }
   if (view === 'logs') loadLogs();
@@ -2010,7 +2336,7 @@ if (document && document.addEventListener) document.addEventListener('visibility
 /* refreshVisible 保留原有视图分派语义（accounts / logs / taskscenter）；
    返回值只服务轮询失败退避：false = 本轮失败。 */
 async function refreshVisible() {
-  if (view === 'accounts') return loadOverview(true);
+  if (view === 'accounts') return refreshAccountsView(true);
   if (view === 'logs') return loadLogs();
   if (view === 'taskscenter') { reattachQueueView(); return true; }
   return true;
@@ -2021,16 +2347,21 @@ function start() {
   keyPrompted = false;
   refFailures = 0;
   stopPollTimer();
-  // 首查：概览数据 + poll_interval_sec（loadOverview 内解析并更新 pollBaseSec）。
-  // 首次成功后按该值建立定时器；首查失败也要排一次重试，否则永远停在空白页。
-  loadOverview(true).then(ok => {
+  // 首查 = lite overview + 当前页 accounts（v2.1 #1）：统计条/导航/账号表各自就位，
+  // poll_interval_sec 由 lite overview 更新。首次成功后按该值建立定时器；
+  // 首查失败也要排一次重试，否则永远停在空白页。
+  refreshAccountsView(true).then(ok => {
     if (ok === false) refFailures += 1;
     scheduleNextPoll();
   });
+  // 完整 overview 只在页面加载时后台补一次（积分合计/到期快照/备注弹窗需要全量
+  // accounts）；之后只有「积分到期」tab 会按 60s 新鲜窗口再拉，不再每 5s 全量。
+  ensureFullOverview(true);
   checkAuthGate();
 }
 async function checkAuthGate() {
-  try { await api('overview'); }
+  // 只探鉴权：用 lite overview（1-2 KB），不拉全量账号。
+  try { await api('overview?lite=1'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
 }
 start();
@@ -2190,13 +2521,13 @@ $('taskBody').addEventListener('click', async ev => {
         else if (r.attempt && !advanced) msg += '；进度未动，该任务可能需要官方客户端';
         toast(msg, (r.claimed || advanced) ? 'ok' : 'err');
       }
-      loadOverview(true);
+      refreshAccountPool(true);
     } else {
       const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
       const body = kind === 'claim' ? { task_code: code } : { task_codes: [code] };
       await api(path, { method: 'POST', body: JSON.stringify(body) });
       toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
-      if (kind === 'claim') loadOverview(true);
+      if (kind === 'claim') refreshAccountPool(true);
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { loadTasks(); }
@@ -4131,10 +4462,10 @@ function storeRemarks(map) {
   try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
 }
 
-/* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
-   没有」的键，避免账号被移除后备注看起来凭空消失。 */
+/* 编辑器的行来自账号全集（poolAccountList：完整 overview 快照优先，退当前页），
+   另外补上「已有备注但当前列表里没有」的键，避免账号被移除后备注看起来凭空消失。 */
 function remarkFormRows() {
-  const rows = ((overviewData && overviewData.accounts) || [])
+  const rows = poolAccountList()
     .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
     .filter(r => r.uid);
   for (const k of Object.keys(remarksAll())) {
@@ -4164,8 +4495,8 @@ function saveRemarkForm() {
   });
   storeRemarks(map);
   closeRemarks();
-  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
-  if (view === 'accounts') loadOverview(true);
+  // 备注只影响本机展示：用现有 rows 重渲染当前视图即可，无需后端参与（也不发请求）。
+  if (view === 'accounts') renderAccounts(accAll, accPageMeta);
   else if (view === 'usage' && usageData) renderUsage(usageData);
   toast('备注已保存（仅本机浏览器）');
 }

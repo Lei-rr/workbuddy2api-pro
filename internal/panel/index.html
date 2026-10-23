@@ -673,7 +673,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+        <div class="stat" title="全量积分合计：页面加载 / 打开「积分到期」时刷新（账号行按服务端分页加载）"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
@@ -742,7 +742,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="50">50 / 页</option>
             <option value="100" selected>100 / 页</option>
             <option value="200">200 / 页</option>
-            <option value="0">全部</option>
+            <option value="0">全部（上限 2000）</option>
           </select>
           <button class="xs ghost" id="accPrev" aria-label="上一页">‹</button>
           <span class="flab" id="accPageInfo">1 / 1</span>
