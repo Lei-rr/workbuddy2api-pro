@@ -131,6 +131,9 @@ services:
 - v2.3.0 Job Runner 进度语义：`done`=已处理账号数（含失败、不含跳过），前端展示进度 = `done+skip`；取消只停后续账号、当前账号会跑完。
 - v2.3.0 定时/补跑批次**不会**出现在 `/panel/api/jobs`（仅手动批量/单号任务）；定时批次记录仍在 task-runs.jsonl（批量统计随后续 scheduler 观察者增强）。
 - v2.3.0 备注/标签是完整 uid 权威存储；旧 localStorage 的 uid8 键只有能解析到唯一完整 uid 时才迁移，解析不到只留本地（标记 legacy）。
+- v2.3.0 Job 触发/取消**暂未进入面板操作审计**（依赖 jobs.json 与 task_runs 追溯）；如需审计可后续加 `jobs_run/job_cancel` action。
+- v2.3.0 备注迁移逐条 PUT：旧本机备注很多时首次打开会产生 N 个请求（当前规模可接受；后续可加批量导入接口）。
+- v2.3.0 Webhook 失败只重试 1 次后 WARN（不落盘待发）；data 允许 ≥7 字段（含 log_tail 摘要时更大），接收端应容忍额外字段。
 - `panel.api_key` 改动**需重启**（已列入 `restart_required`）；`panel.poll_interval_sec`/`catch_up_minutes`/`balance_refresh_concurrency` 热生效。
 
 ## 跟随上游（如果上游/fork 恢复更新）

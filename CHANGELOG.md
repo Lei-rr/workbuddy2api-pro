@@ -44,7 +44,7 @@
 ### 测试与验证
 
 - 新增测试：jobs 12 + scheduler 6 + panel jobapi/accountmeta 20 + notify 17 + cmd/server 1；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
-- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v23.md`）
+- QA 独立验证（HEAD `1e88282`）：**218 项检查全 PASS，P0=0 / P1=0**——verify-pro 28/28、v2.0.1 回归 28/28、v2.1 回归 42/42、v2.2 回归 25/25、新增 verify-v23 24/24（jobs API/409/404/cancel 语义/RFC3339/旧端点 job_id/jobs.json 落盘/重启 running→interrupted/meta CRUD 与校验/Webhook 收到 job_done 且无凭证/空 URL 关闭）、独立前端 harness 48/48（0 warning）、真实浏览器 11/11、320px/375px 各 12/12；详见 `D:\dsh\tmp\verify-final-v23.md`
 
 ---
 
