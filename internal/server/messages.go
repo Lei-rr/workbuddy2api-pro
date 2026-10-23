@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/lei-rr/workbuddy2api-pro/internal/upstream"
 )
 
 // messagesBodyLimit Messages 请求体上限：只含 query 与工具声明，1MB 富余。

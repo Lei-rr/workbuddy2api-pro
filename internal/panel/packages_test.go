@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
 )
 
 // packages?uid= 单号模式：未知账号必须 404，且不得退化成全量整池查询。

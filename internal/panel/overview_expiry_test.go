@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
+	"github.com/lei-rr/workbuddy2api-pro/internal/scheduler"
 )
 
 // TestOverviewIncludesExpiryBuckets 钉住面板接线：池内写入的按日到期批次必须原样

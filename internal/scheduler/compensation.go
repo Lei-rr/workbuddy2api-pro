@@ -15,9 +15,9 @@ import (
 	"log"
 	"sync"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/logfmt"
+	"github.com/lei-rr/workbuddy2api-pro/internal/upstream"
 )
 
 // 补偿任务的跳过原因（面板据此渲染，勿随意改字面量）。

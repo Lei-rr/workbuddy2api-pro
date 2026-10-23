@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 )
 
 // compensationServer 起一个只回固定 body 的 billing 桩，返回指向它的 Client。

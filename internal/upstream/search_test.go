@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 )
 
 // searchTestClient 构造指向 httptest 假上游的 Client（CN 域，零值 GlobalEnabled）。

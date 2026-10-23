@@ -16,16 +16,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/httpauth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/livecfg"
+	"github.com/lei-rr/workbuddy2api-pro/internal/logfmt"
+	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
+	"github.com/lei-rr/workbuddy2api-pro/internal/prompt"
+	"github.com/lei-rr/workbuddy2api-pro/internal/reqlog"
+	"github.com/lei-rr/workbuddy2api-pro/internal/session"
+	"github.com/lei-rr/workbuddy2api-pro/internal/upstream"
+	"github.com/lei-rr/workbuddy2api-pro/internal/usage"
 )
 
 // Config handler 依赖。
@@ -113,7 +113,7 @@ const notFoundCooldown = 60 * time.Second
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
-const ServiceName = "workbuddy2api"
+const ServiceName = "workbuddy2api-pro"
 
 // Handler 主路由。
 type Handler struct {

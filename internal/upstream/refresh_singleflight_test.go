@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 )
 
 // TestRefreshTokenSingleFlightPerAccount 验证同一账号并发 refresh 只打一次上游：

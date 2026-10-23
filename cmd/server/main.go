@@ -1,4 +1,4 @@
-// main.go workbuddy2api 入口：加载配置、构建 pool、起调度器与 HTTP 服务。
+// main.go workbuddy2api-pro 入口：加载配置、构建 pool、起调度器与 HTTP 服务。
 package main
 
 import (
@@ -17,22 +17,22 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/credithist"
+	"github.com/lei-rr/workbuddy2api-pro/internal/livecfg"
+	"github.com/lei-rr/workbuddy2api-pro/internal/panel"
+	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
+	"github.com/lei-rr/workbuddy2api-pro/internal/redisstore"
+	"github.com/lei-rr/workbuddy2api-pro/internal/reqlog"
+	"github.com/lei-rr/workbuddy2api-pro/internal/scheduler"
+	"github.com/lei-rr/workbuddy2api-pro/internal/server"
+	"github.com/lei-rr/workbuddy2api-pro/internal/session"
+	"github.com/lei-rr/workbuddy2api-pro/internal/upstream"
+	"github.com/lei-rr/workbuddy2api-pro/internal/usage"
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+const appVersion = "2.0.0-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -388,7 +388,7 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	log.Printf("workbuddy2api-pro listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

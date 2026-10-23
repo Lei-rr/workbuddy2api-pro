@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/pool"
 )
 
 // 重新扫描的安全阀：扫到 0 个文件而池非空（挂载丢失/路径配错）必须拒绝。

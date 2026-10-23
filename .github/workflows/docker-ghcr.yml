@@ -31,8 +31,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # github.repository 自动小写化：上游为 ghcr.io/linguo2625469/workbuddy2api-panel，
-  # fork 下为 ghcr.io/lei-rr/workbuddy2api-panel
+  # github.repository 自动小写化为 ghcr.io/lei-rr/workbuddy2api-pro
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:

@@ -3,7 +3,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 	"path/filepath"
 	"sync"
 	"testing"
