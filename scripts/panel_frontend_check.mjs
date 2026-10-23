@@ -71,15 +71,19 @@ const HTML_ONLY_ID_PREFIX_ALLOW = ['view-'];
 const APP_ONLY_ID_ALLOW = new Map([]);
 
 /* api()/apiCached() 允许的相对路径前缀（后端面板 API 契约；只增不改名）。
-   这里的每一项都对应 internal/panel 的既有路由或其动态子路径。 */
+   这里的每一项都对应 internal/panel 的既有路由或其动态子路径。
+   v2.4.0（Lead 授权）：新增 events（SSE）与 auth/（login/logout/info）前缀。 */
 const API_PATH_PREFIXES = [
   'accounts/',
   'accounts?',
+  'activity_all',
   'audit?',
+  'auth/',
   'balance_all',
   'checkin_all',
   'config',
   'credit_history',
+  'events',
   'import/cockpit',
   'jobs/',
   'jobs?',
@@ -105,8 +109,9 @@ const API_PATH_PREFIXES = [
 ];
 
 /* 允许在 fetch 里直接写完整面板路径的白名单（必须写明原因）：
-   - /panel/api/import/cockpit：multipart/form-data 上传，api() 的 JSON 封装不适用。 */
-const ALLOWED_PANEL_PATH_LITERALS = new Set(['/panel/api/import/cockpit']);
+   - /panel/api/import/cockpit：multipart/form-data 上传，api() 的 JSON 封装不适用。
+   - /panel/api/events：SSE 流式响应 + AbortController，需要 fetch 原始 Response.body。 */
+const ALLOWED_PANEL_PATH_LITERALS = new Set(['/panel/api/import/cockpit', '/panel/api/events']);
 
 const errors = [];
 function fail(msg) { errors.push(msg); }

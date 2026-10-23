@@ -11,10 +11,14 @@
   "panel": {
     "api_key": "",
     "poll_interval_sec": 5,
-    "package_detail_limit": 5
+    "package_detail_limit": 5,
+    "session_ttl": "12h",
+    "events_enabled": true,
+    "users": []
   },
   "security": {
-    "allow_anonymous": false
+    "allow_anonymous": false,
+    "encrypt_auths": false
   },
   "logging": {
     "request_archive_enabled": true,

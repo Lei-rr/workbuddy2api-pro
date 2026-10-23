@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,7 +31,6 @@ import (
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 	"github.com/lei-rr/workbuddy2api-pro/internal/credithist"
-	"github.com/lei-rr/workbuddy2api-pro/internal/httpauth"
 	"github.com/lei-rr/workbuddy2api-pro/internal/jobs"
 	"github.com/lei-rr/workbuddy2api-pro/internal/livecfg"
 	"github.com/lei-rr/workbuddy2api-pro/internal/notify"
@@ -104,6 +104,15 @@ type Config struct {
 	// accountDisable 成功后 Emit account_disabled；Job 完成通知由 main 的
 	// jobs.Config.OnFinish 接线（本包不感知 registry 回调）。
 	Notify *notify.Notifier
+
+	// Users 面板多用户（v2.4.0 #6 RBAC）：空 = 单密钥模式（api_key/panel.api_key
+	// 行为与旧版完全一致）。非空 = 多用户模式：api_key 仍是 root/脚本通道（admin），
+	// 其余请求需 /panel/api/auth/login 换会话令牌（Bearer 或 wb2_session Cookie）。
+	// 由 main 从 cmd/server 的 panel.users 转换注入（见 panelUsersFromCfg 补丁）。
+	Users []PanelUser
+	// SessionTTL 面板登录会话有效期（v2.4.0 #6）：<=0 回落 12h；cmd/server normalize
+	// 已 clamp 5m..7d，装配期直接传 cfg.PanelSessionTTLDur。
+	SessionTTL time.Duration
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -117,6 +126,9 @@ type Panel struct {
 	// authFailures 面板鉴权失败限速（v2.0.1 #4-3）：按来源 IP 的 token bucket，
 	// 20 次/分钟，成功后清桶，内存 LRU 上限 1 万 IP。
 	authFailures *authFailLimiter
+
+	// sessions 面板登录会话（v2.4.0 #6；仅多用户模式使用，单密钥模式恒为空）。
+	sessions *sessionStore
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -196,6 +208,7 @@ func New(cfg Config) *Panel {
 		logs:         NewRing(500),
 		logins:       map[string]loginSession{},
 		authFailures: newAuthFailLimiter(authFailLimiterMaxIPs),
+		sessions:     newSessionStore(cfg.SessionTTL),
 		dataDir:      dataDir,
 		auditLog:     newJSONLLog(joinDataFile(dataDir, auditFileName)),
 		taskRunsLog:  newJSONLLog(joinDataFile(dataDir, taskRunsFileName)),
@@ -215,6 +228,13 @@ func (p *Panel) routes() {
 
 	// ---- 只读接口 ----
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	// v2.4.0 #6：面板多用户/RBAC 登录入口（单密钥模式仍可用 api_key bearer，零破坏兼容）。
+	// login 不套 withAuth（凭据在 body）；logout/info 需要有效会话或 api_key。
+	p.mux.HandleFunc("POST /panel/api/auth/login", p.authLogin)
+	p.mux.HandleFunc("POST /panel/api/auth/logout", p.withAuth(p.authLogout))
+	p.mux.HandleFunc("GET /panel/api/auth/info", p.withAuth(p.authInfo))
+	// v2.4.0 #3：SSE 事件推送（Job/账号/日志增量；断流或不支持时前端自动回落轮询）。
+	p.mux.HandleFunc("GET /panel/api/events", p.withAuth(p.events))
 	// v2.1 #1：账号池列表服务端分页/筛选/排序/字段裁剪/ETag（与 /overview 旧接口并存，
 	// 旧接口语义零变化）。放在 /accounts/{uid}/... 之前只是可读性，ServeMux 按路径匹配。
 	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.accounts))
@@ -324,6 +344,13 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// SSE（v2.4.0 #3 /panel/api/events）必须绕过 gzip 缓冲：事件流需要立即 flush，
+	// 不能等 close 时统一压缩（缓冲会让客户端收不到增量事件）。
+	if r.URL.Path == "/panel/api/events" {
+		p.mux.ServeHTTP(w, r)
+		return
+	}
+
 	// 缓冲后统一决定是否压缩：面板无流式接口，缓冲让 Content-Length/1KB 阈值判断
 	// 都能如实进行；HEAD/204/304/已编码响应在 close 里跳过压缩。
 	gw := &gzipResponseWriter{ResponseWriter: w, req: r}
@@ -331,14 +358,20 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(gw, r)
 }
 
-// withAuth 面板 Bearer 鉴权（经 httpauth 常量时间比较）：
-//   - 密钥取 apiKey()（PanelAPIKey 优先，空则回落到网关 api_key / Live 快照）；
-//   - 成功一次清空该 IP 的失败计数（v2.0.1 #4-3：正常用户不会因为隔壁暴力尝试被拖累）；
-//   - 失败一次计入限速桶（容量 20/分钟，超限由 ServeHTTP 前置返回 429+Retry-After）。
+// withAuth 面板鉴权 + 角色门禁（v2.4.0 #6）：
+//   - 单密钥模式（未配置 users）：api_key/panel.api_key Bearer 通过 → admin，行为与
+//     旧版完全一致（api_key 为空 = 不鉴权逃生口径；其它一律 401）；脚本零破坏。
+//   - 多用户模式：api_key Bearer 仍是 root（admin）；否则 Bearer 会话令牌或
+//     wb2_session Cookie 有效 → 对应角色；否则 401。
+//   - 认证成功后按集中权限表做角色门禁（viewer 只读 / operator 业务写 / admin 全部），
+//     不通过 → 403 {ok:false,error}；身份写入 request context 供 authInfo 等读取。
+//   - 失败一次计入既有 20/min/IP 失败限速（ServeHTTP 前置超限后 429+Retry-After），
+//     成功一次清空该 IP 计数。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := rateLimitIP(r)
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		ident, ok := p.authenticatePanelRequest(r)
+		if !ok {
 			if p.authFailures != nil {
 				p.authFailures.fail(ip)
 			}
@@ -348,6 +381,11 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if p.authFailures != nil {
 			p.authFailures.success(ip)
 		}
+		if !panelRoleAllows(ident.Role, r.Method, r.URL.Path) {
+			writeErr(w, http.StatusForbidden, "权限不足：当前角色 "+ident.Role+" 无权执行该操作")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), panelIdentityCtxKey{}, ident))
 		next(w, r)
 	}
 }

@@ -1894,7 +1894,7 @@ const start = src.indexOf('const dotaskBusy = new Set();');
 const end = src.indexOf('// 账号是否处于冷却');
 if ([escStart, escEnd, start, end].some(v => v < 0) || escEnd < escStart || end < start)
   throw new Error('dotask helper not found');
-const ctx = { String };
+const ctx = { String, roleCan: () => true, roleDenyText: () => '只读账号' };
 vm.createContext(ctx);
 vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) +
   '\nthis.accDoTaskBtn = accDoTaskBtn; this.markBusy = u => dotaskBusy.add(u); this.clearBusy = u => dotaskBusy.delete(u);', ctx);
@@ -2243,7 +2243,9 @@ func TestAppJSPollingStateMachine(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('let refTimer = null;');
-const stop = src.indexOf('\nstart();', start);
+// v2.4.0：启动编排改成 bootPanel()（前面多了 SSE/登录模块），轮询段止于
+// start() 定义之后、checkAuthGate 之前；checkAuthGate 由 ctx 注入桩。
+const stop = src.indexOf('\nasync function checkAuthGate()', start);
 if (start < 0 || stop < 0 || stop < start) throw new Error('polling section not found');
 const timers = [];
 const cleared = [];
@@ -2263,6 +2265,8 @@ const ctx = {
   loadLogs: async () => { logCalls++; return true; },
   reattachQueueView: () => { reattachCalls++; },
   openKey: () => { openKeyCalls++; },
+  abortEvents: () => {},               // v2.4.0：401 时同时断开 SSE
+  checkAuthGate: async () => {},
   api: async () => ({}),
   setTimeout: (fn, ms) => { timers.push(ms); return ++timerSeq; },
   clearTimeout: id => { cleared.push(id); },
@@ -2772,6 +2776,7 @@ const ctx = {
   markDurationFields: () => {},
   durationBad: () => false,
   DURATION_FIELDS: [],
+  roleGuard: () => true,   // v2.4.0：配置保存前置角色守卫（切片不含 RBAC 模块）
   pollAuthStopped: true, keyPrompted: true, refFailures: 3, refTimer: null, refInFlight: false,
   scheduleNextPoll: () => { schedCalls++; },
   loadConfig: () => {}, refreshAccountPool: () => {},
@@ -3614,10 +3619,12 @@ let apiImpl = async () => ({});
 let confirmAnswer = false;
 const ctx = {
   fmtRunTime: v => (v ? 'T:' + v : '—'),
+  eventsLive: () => false,   // v2.4.0 切片不含 SSE 模块：jobs 轮询走原路径
   $: id => (sinks[id] || mk(id)),
   api: async (p, o) => { apiCalls.push([p, o && o.method]); return apiImpl(p, o); },
   toast: (m, c) => toasts.push([m, c || '']),
   confirm: () => confirmAnswer,
+  roleGuard: () => true,     // v2.4.0 切片不含 RBAC 模块：角色守卫放行
   Date, Number, String, Object, Array, Math, JSON,
 };
 vm.createContext(ctx);
@@ -4280,5 +4287,467 @@ func TestPanelFrontendCheckScriptFailsClosed(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("失败输出缺少 %q：%s", want, got)
 		}
+	}
+}
+
+// TestAppJSAuthRolesAndLogin v2.4.0 #6：/auth/info 归一化、角色能力矩阵、UI 收敛、
+// 多用户登录/单密钥登录/退出。控件可见性对 viewer/operator/admin 三档逐项断言，
+// 防止「按钮看着能点但后端 403」或「只读账号误开写入口」。
+func TestAppJSAuthRolesAndLogin(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const ROLE_LABELS = {');
+const end = src.indexOf('/* ── 实时事件 SSE（v2.4.0');
+if (start < 0 || end < 0 || end < start) throw new Error('auth section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { id, innerHTML: '', textContent: '', hidden: false, disabled: false,
+  className: '', value: '', title: '', dataset: {}, addEventListener() {},
+  classList: { on: 0, add() { this.on++; }, remove() { this.on--; }, contains() { return this.on > 0; } } });
+for (const id of ['curUser', 'btnLogout', 'navConfigLi', 'keyVeil', 'keySingle', 'keyMulti', 'btnKey',
+  'btnLogin', 'keyModeSwitch', 'loginTitle', 'loginHint', 'loginErr', 'keyErr', 'loginUser', 'loginPass',
+  'keyInput', 'btnAdd', 'btnRefresh', 'btnRescan', 'btnRemarks', 'btnCheckinAll', 'btnTravelAll',
+  'btnActivityAll', 'btnKeepaliveAll', 'btnJobCancel', 'btnRunQueue', 'btnTaskAcceptAll', 'btnTaskAutoAll',
+  'btnRemarkSave', 'btnRemarkClear', 'btnCfgSave', 'btnCfgReload', 'btnStartLogin', 'importFile']) mk(id);
+const toasts = [];
+const apiCalls = [];
+let apiImpl = async () => ({ ok: true });
+const state = { start: 0, connect: 0, goCalls: [], renders: 0, abort: 0 };
+const ctx = {
+  esc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+  $: id => sinks[id] || null,
+  document: { body: { dataset: {} }, addEventListener() {} },
+  localStorage: { store: {}, getItem(k) { return this.store[k] == null ? null : this.store[k]; },
+    setItem(k, v) { this.store[k] = String(v); }, removeItem(k) { delete this.store[k]; } },
+  LS_KEY: 'wb2api.key',
+  api: async (p, o) => { apiCalls.push([p, o && o.method, o && o.body]); return apiImpl(p, o); },
+  toast: (m, c) => toasts.push([m, c || '']),
+  start: () => { state.start++; },
+  connectEvents: () => { state.connect++; },
+  abortEvents: () => { state.abort++; },
+  pollArmed: true, pollAuthStopped: false, stopPollTimer: () => {},
+  go: v => state.goCalls.push(v),
+  renderAccounts: () => { state.renders++; },
+  view: 'accounts', accAll: [], accPageMeta: null,
+  setTimeout: (fn, ms) => 1, confirm: () => true,
+  String, Object, Array, Number, JSON, Date, Promise,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.__auth = {\n' +
+  '  normalizeAuthInfo, applyAuthInfo, currentRole, roleLabel, roleCan, roleDenyText, roleDenyAttr,\n' +
+  '  roleGuard, applyRoleGating, applyAuthUI, showLogin, submitLogin, submitKey, logout,\n' +
+  '  state: () => ({ mode: authMode, known: authKnown, user: authUser, role: currentRole() }),\n' +
+  '  setAuth: user => { authUser = user; authMode = user ? \'multi\' : \'single\'; authKnown = true; },\n' +
+  '};', ctx);
+const A = ctx.__auth;
+(async () => {
+  const out = {};
+  out.norm = {
+    multi: A.normalizeAuthInfo({ mode: 'multi', user: { name: '张三', role: 'operator' }, events_enabled: false }),
+    single: A.normalizeAuthInfo({ mode: 'single' }),
+    badRole: A.normalizeAuthInfo({ mode: 'multi', user: { name: 'x', role: 'root' } }).user.role,
+    legacy: A.normalizeAuthInfo(null),
+  };
+  const caps = ['read', 'write', 'task', 'danger', 'config', 'add', 'import'];
+  out.viewerCaps = {};
+  A.setAuth({ name: 'v', role: 'viewer' });
+  for (const c of caps) out.viewerCaps[c] = A.roleCan(c);
+  A.applyAuthUI();
+  out.viewerGating = {
+    curUser: sinks.curUser.textContent, curUserHidden: sinks.curUser.hidden,
+    logoutHidden: sinks.btnLogout.hidden, navConfigHidden: sinks.navConfigLi.hidden,
+    btnAdd: sinks.btnAdd.disabled, btnAddTitle: sinks.btnAdd.title,
+    remarks: sinks.btnRemarks.disabled, rescan: sinks.btnRescan.disabled, cfgSave: sinks.btnCfgSave.disabled,
+    taskBtn: sinks.btnRunQueue.disabled, refresh: sinks.btnRefresh.disabled,
+    denyAttr: A.roleDenyAttr('danger'), denyWrite: A.roleDenyAttr('write'), denyRead: A.roleDenyAttr('read'),
+  };
+  out.operatorCaps = {};
+  A.setAuth({ name: 'op', role: 'operator' });
+  for (const c of caps) out.operatorCaps[c] = A.roleCan(c);
+  out.operatorDeny = { danger: A.roleDenyAttr('danger'), config: A.roleDenyAttr('config'),
+    add: A.roleDenyAttr('add'), write: A.roleDenyAttr('write'), task: A.roleDenyAttr('task') };
+  A.applyAuthUI();
+  out.operatorGating = { navConfigHidden: sinks.navConfigLi.hidden, btnAdd: sinks.btnAdd.disabled,
+    btnRescan: sinks.btnRescan.disabled, btnCheckinAll: sinks.btnCheckinAll.disabled,
+    btnRemarks: sinks.btnRemarks.disabled, curUser: sinks.curUser.textContent };
+  A.setAuth({ name: 'ad', role: 'admin' });
+  A.applyAuthUI();
+  out.adminGating = { btnAdd: sinks.btnAdd.disabled, btnRescan: sinks.btnRescan.disabled,
+    navConfigHidden: sinks.navConfigLi.hidden, btnCheckinAll: sinks.btnCheckinAll.disabled,
+    btnAddTitle: sinks.btnAdd.title };
+  A.setAuth(null);
+  A.applyAuthUI();
+  out.singleUi = { curUserHidden: sinks.curUser.hidden, logoutHidden: sinks.btnLogout.hidden,
+    navConfigHidden: sinks.navConfigLi.hidden };
+  // 登录层两种模式：多用户=用户名/密码，单密钥=面板密钥；已确认模式时不显示切换入口
+  A.showLogin('multi');
+  out.multiLogin = { title: sinks.loginTitle.textContent, keySingle: sinks.keySingle.hidden,
+    keyMulti: sinks.keyMulti.hidden, btnKey: sinks.btnKey.hidden, btnLogin: sinks.btnLogin.hidden,
+    switchHidden: sinks.keyModeSwitch.hidden, veilOn: sinks.keyVeil.classList.on };
+  A.showLogin('single');
+  out.singleLogin = { title: sinks.loginTitle.textContent, keySingle: sinks.keySingle.hidden,
+    keyMulti: sinks.keyMulti.hidden, btnKey: sinks.btnKey.hidden, btnLogin: sinks.btnLogin.hidden };
+  // 登录成功 → 存 token 并启动轮询+SSE；401 → 用户名或密码错误；空输入不发请求
+  A.setAuth(null);
+  sinks.loginUser.value = 'alice'; sinks.loginPass.value = 'pw';
+  apiCalls.length = 0;
+  apiImpl = async () => ({ token: 'tok-1' });
+  await A.submitLogin();
+  out.loginOk = { call: apiCalls[0], token: ctx.localStorage.store['wb2api.key'],
+    starts: state.start, connects: state.connect, errHidden: sinks.loginErr.hidden };
+  apiImpl = async () => { const e = new Error('unauthorized'); e.status = 401; throw e; };
+  sinks.loginErr.hidden = true; sinks.loginUser.value = 'alice'; sinks.loginPass.value = 'wrong';
+  await A.submitLogin();
+  out.loginFail = { err: sinks.loginErr.textContent, hidden: sinks.loginErr.hidden };
+  apiCalls.length = 0; sinks.loginUser.value = ''; sinks.loginPass.value = '';
+  await A.submitLogin();
+  out.loginEmpty = { calls: apiCalls.length, err: sinks.loginErr.textContent };
+  // 角色守卫（命令式入口）
+  A.setAuth({ name: 'v', role: 'viewer' });
+  toasts.length = 0;
+  out.viewerGuard = { add: A.roleGuard('add'), toast: toasts.length ? toasts[0][0] : '' };
+  A.setAuth({ name: 'op', role: 'operator' });
+  out.operatorGuard = { add: A.roleGuard('add'), task: A.roleGuard('task') };
+  // 单密钥登录
+  sinks.keyInput.value = 'key-9';
+  apiCalls.length = 0; state.start = 0; state.connect = 0;
+  apiImpl = async () => ({ ok: true });
+  await A.submitKey();
+  out.keyOk = { calls: apiCalls.map(c => c[0]), token: ctx.localStorage.store['wb2api.key'],
+    starts: state.start, connects: state.connect };
+  // 退出：POST logout → 清 token → 断 SSE → 回登录层
+  apiCalls.length = 0; state.abort = 0; state.start = 0;
+  apiImpl = async () => ({ ok: true });
+  await A.logout();
+  out.logout = { calls: apiCalls.map(c => [c[0], c[1]]), token: ctx.localStorage.store['wb2api.key'] || null,
+    abort: state.abort, starts: state.start, veilOn: sinks.keyVeil.classList.on,
+    keyMulti: sinks.keyMulti.hidden };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"norm":{"multi":{"mode":"multi","user":{"name":"张三","role":"operator"},"auth":null,"events_enabled":false},` +
+		`"single":{"mode":"single","user":null,"auth":null,"events_enabled":true},"badRole":"admin",` +
+		`"legacy":{"mode":"single","user":null,"auth":null,"events_enabled":true}},` +
+		`"viewerCaps":{"read":true,"write":false,"task":false,"danger":false,"config":false,"add":false,"import":false},` +
+		`"viewerGating":{"curUser":"v（只读）","curUserHidden":false,"logoutHidden":false,"navConfigHidden":true,` +
+		`"btnAdd":true,"btnAddTitle":"只读账号","remarks":true,"rescan":true,"cfgSave":true,"taskBtn":true,` +
+		`"refresh":true,"denyAttr":" disabled title=\"只读账号\"","denyWrite":" disabled title=\"只读账号\"","denyRead":""},` +
+		`"operatorCaps":{"read":true,"write":true,"task":true,"danger":false,"config":false,"add":false,"import":false},` +
+		`"operatorDeny":{"danger":" disabled title=\"当前角色无此权限\"","config":" disabled title=\"当前角色无此权限\"",` +
+		`"add":" disabled title=\"当前角色无此权限\"","write":"","task":""},` +
+		`"operatorGating":{"navConfigHidden":true,"btnAdd":true,"btnRescan":true,"btnCheckinAll":false,` +
+		`"btnRemarks":false,"curUser":"op（运维）"},` +
+		`"adminGating":{"btnAdd":false,"btnRescan":false,"navConfigHidden":false,"btnCheckinAll":false,"btnAddTitle":""},` +
+		`"singleUi":{"curUserHidden":true,"logoutHidden":true,"navConfigHidden":false},` +
+		`"multiLogin":{"title":"登录面板","keySingle":true,"keyMulti":false,"btnKey":true,"btnLogin":false,` +
+		`"switchHidden":true,"veilOn":1},` +
+		`"singleLogin":{"title":"需要访问密钥","keySingle":false,"keyMulti":true,"btnKey":false,"btnLogin":true},` +
+		`"loginOk":{"call":["auth/login","POST","{\"username\":\"alice\",\"password\":\"pw\"}"],` +
+		`"token":"tok-1","starts":1,"connects":1,"errHidden":true},` +
+		`"loginFail":{"err":"用户名或密码错误","hidden":false},` +
+		`"loginEmpty":{"calls":0,"err":"请输入用户名和密码"},` +
+		`"viewerGuard":{"add":false,"toast":"只读账号"},"operatorGuard":{"add":false,"task":true},` +
+		`"keyOk":{"calls":["overview?lite=1","auth/info"],"token":"key-9","starts":1,"connects":1},` +
+		`"logout":{"calls":[["auth/logout","POST"]],"token":null,"abort":1,"starts":0,"veilOn":1,"keyMulti":false}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("登录/角色矩阵=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSBootPanel v2.4.0 #6：启动编排（token 复用 / 401 等登录 / 旧后端回落）。
+//
+//	200 → 应用角色 UI + 启动轮询 + 连 SSE（已有会话 token 时直接进，不弹登录层）；
+//	401 → 不启动轮询，等登录层；
+//	404/501/网络 → 保持单密钥 admin 行为直接启动（升级兼容，不白屏）。
+func TestAppJSBootPanel(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('async function bootPanel() {');
+const end = src.indexOf('\nbootPanel();');
+if (start < 0 || end < 0 || end < start) throw new Error('bootPanel not found');
+function boot(mode) {
+  const calls = { start: 0, connect: 0, ui: 0, login: 0, applied: null };
+  const veil = { classList: { on: mode.veilOn ? 1 : 0, contains() { return !!this.on; } } };
+  const ctx = {
+    $: id => (id === 'keyVeil' ? veil : null),
+    api: async path => {
+      if (path !== 'auth/info') throw new Error('unexpected ' + path);
+      if (mode.http === 200) return mode.info;
+      if (mode.veilOn) veil.classList.on = 1;   // 模拟 onAuthRequired 打开登录层
+      const e = new Error(mode.error || 'HTTP ' + mode.http);
+      e.status = mode.http;
+      throw e;
+    },
+    applyAuthInfo: d => { calls.applied = d; ctx.authKnown = true; },
+    applyAuthUI: () => { calls.ui++; },
+    start: () => { calls.start++; },
+    connectEvents: () => { calls.connect++; },
+    showLogin: m => { calls.login++; calls.loginMode = m; },
+    authKnown: false, authMode: 'single', authUser: null, authEventsEnabled: true,
+    String, Object, Promise,
+  };
+  vm.createContext(ctx);
+  vm.runInContext(src.slice(start, end) + '\nthis.__boot = bootPanel;', ctx);
+  return ctx.__boot().then(() => ({ calls: calls, authMode: ctx.authMode, authKnown: ctx.authKnown }));
+}
+(async () => {
+  const out = {};
+  const ok = await boot({ http: 200, info: { mode: 'multi', user: { name: 'bob', role: 'operator' }, events_enabled: true } });
+  out.ok = { start: ok.calls.start, connect: ok.calls.connect, ui: ok.calls.ui, login: ok.calls.login,
+             appliedMode: ok.calls.applied && ok.calls.applied.mode, known: ok.authKnown };
+  const unauth = await boot({ http: 401, veilOn: true });
+  out.unauth = { start: unauth.calls.start, login: unauth.calls.login, known: unauth.authKnown };
+  const unauthNoVeil = await boot({ http: 401, veilOn: false });
+  out.unauthNoVeil = { start: unauthNoVeil.calls.start, login: unauthNoVeil.calls.login, mode: unauthNoVeil.calls.loginMode };
+  const legacy = await boot({ http: 501, veilOn: false });
+  out.legacy = { start: legacy.calls.start, connect: legacy.calls.connect, login: legacy.calls.login,
+                 mode: legacy.authMode, known: legacy.authKnown };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"ok":{"start":1,"connect":1,"ui":1,"login":0,"appliedMode":"multi","known":true},` +
+		`"unauth":{"start":0,"login":0,"known":false},` +
+		`"unauthNoVeil":{"start":0,"login":1,"mode":"single"},` +
+		`"legacy":{"start":1,"connect":1,"login":0,"mode":"single","known":false}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("启动编排=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelV24Wiring v2.4.0 前端接线（SSE/登录/角色/移动端）+ 脚本白名单增量。
+func TestPanelV24Wiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		// #3 SSE
+		"fetch('/panel/api/events'",
+		"function createSSEParser(",
+		"function handleSSEEvent(",
+		"function connectEvents(",
+		"function scheduleEventsRetry(",
+		"EVENTS_MAX_BACKOFF_MS = 30000",
+		"function disableEvents(",
+		"event === 'snapshot'",
+		"eventsLive()",
+		// #6 认证/角色
+		"api('auth/info')",
+		"api('auth/login'",
+		"api('auth/logout'",
+		"function normalizeAuthInfo(",
+		"function roleCan(",
+		"function roleDenyAttr(",
+		"function applyAuthUI(",
+		"function bootPanel(",
+		"const ROLE_CAPS = {",
+		"operator: ['read', 'write', 'task']",
+		"viewer: ['read']",
+		// 轮询暂停：loadSummary / loadJobs / refreshAccountsView 都要让位 SSE
+		"const live = eventsLive();",
+		"live ? Promise.resolve(true) : loadSummary(quiet)",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 缺少 %q", want)
+		}
+	}
+	if n := strings.Count(j, "eventsLive()"); n < 4 {
+		t.Errorf("eventsLive 引用 %d 处（SSE 判定/loadSummary/loadJobs/refreshAccountsView 至少 4 处）", n)
+	}
+	if n := strings.Count(j, "\nbootPanel();"); n != 1 {
+		t.Errorf("bootPanel 启动调用 %d 处（应从 start() 换成唯一 bootPanel()）", n)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{
+		`id="rtBadge"`, `id="curUser"`, `id="btnLogout"`, `id="loginUser"`, `id="loginPass"`,
+		`id="btnLogin"`, `id="keyMulti"`, `id="keySingle"`, `id="navConfigLi"`, `id="keyModeSwitch"`,
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺少 %q", want)
+		}
+	}
+	css, err := os.ReadFile("mobile.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"#rtBadge", "#curUser", "#keyVeil .body input"} {
+		if !strings.Contains(string(css), want) {
+			t.Errorf("mobile.css 缺少 %q", want)
+		}
+	}
+	// Lead 授权的前端检查脚本白名单增量（events/auth），其余检查不放宽。
+	chk, err := os.ReadFile("../../scripts/panel_frontend_check.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"'events',", "'auth/',", "ALLOWED_PANEL_PATH_LITERALS"} {
+		if !strings.Contains(string(chk), want) {
+			t.Errorf("panel_frontend_check.mjs 缺少 %q", want)
+		}
+	}
+}
+
+// TestAppJSSSEEvents v2.4.0 #3：SSE 行解析 / snapshot-jobs-accounts 增量 /
+// 断线指数退避 / 404-501 永久回落 / 401 交登录层 / 隐藏暂停可见重连 / 徽标状态。
+func TestAppJSSSEEvents(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const EVENTS_MAX_BACKOFF_MS');
+const end = src.indexOf('/* ── 路由');
+if (start < 0 || end < 0 || end < start) throw new Error('sse section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { id, innerHTML: '', textContent: '', hidden: false, className: '', title: '',
+  classList: { add() {}, remove() {}, contains() { return false; } } });
+for (const id of ['rtBadge', 'sTotal', 'sHealthy', 'sCooling', 'sDisabled', 'sPaused', 'sSticky',
+  'navSub', 'navVer', 'navState', 'navPulse', 'sCredits']) mk(id);
+const handlers = {};
+const doc = { visibilityState: 'visible', addEventListener: (ev, fn) => { handlers[ev] = fn; } };
+const timers = [];
+let timerSeq = 0;
+const state = { fetchCalls: [], scheduleNextPoll: 0, onAuth: 0, jobs: [], creditsRenders: 0 };
+let fetchImpl = async () => { throw new Error('net down'); };
+const ctx = {
+  document: doc,
+  localStorage: { store: { 'wb2api.key': 'k' }, getItem(k) { return this.store[k] == null ? null : this.store[k]; } },
+  LS_KEY: 'wb2api.key',
+  fetch: async (url, opts) => { state.fetchCalls.push(String(url)); return fetchImpl(url, opts); },
+  setTimeout: (fn, ms) => { timers.push({ fn, ms }); return ++timerSeq; },
+  clearTimeout: () => {},
+  $: id => sinks[id] || null,
+  renderJobBar: jobs => { state.jobs.push(jobs); },
+  normalizeJobs: d => (d && d.jobs) || [],
+  renderCreditsStat: () => { state.creditsRenders++; },
+  creditsSum: null,
+  pollBaseSec: 5,
+  pollIntervalSec: v => { const n = Number(v); return Number.isFinite(n) ? Math.min(60, Math.max(2, Math.round(n))) : 5; },
+  scheduleNextPoll: () => { state.scheduleNextPoll++; },
+  onAuthRequired: () => { state.onAuth++; },
+  pollAuthStopped: false,
+  pageHidden: false,
+  AbortController, TextDecoder, TextEncoder,
+  String, Number, Object, Array, JSON, Date, Math, Promise,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.__sse = {\n' +
+  '  eventsLive, createSSEParser, parseSSEFrame, parseSSEData, applyLiveCounts, handleSSEEvent,\n' +
+  '  connectEvents, scheduleEventsRetry, abortEvents, disableEvents,\n' +
+  '  state: () => ({ supported: eventsSupported, connected: eventsConnected, snapshot: eventsHasSnapshot,\n' +
+  '                  any: eventsGotAny, retry: eventsRetryCount }),\n' +
+  '  setSupported: v => { eventsSupported = v; },\n' +
+  '};', ctx);
+const S = ctx.__sse;
+const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+(async () => {
+  const out = {};
+  const feed = S.createSSEParser();
+  out.parse = {
+    partial: feed('event: snap').length,
+    one: feed('shot\ndata: {"a":1}\n\n: ping\n\n'),
+    multi: S.parseSSEFrame('event: x\ndata: a\ndata: b'),
+    crlf: S.parseSSEFrame('data: q\r\nid: 7'),
+    commentOnly: S.parseSSEFrame(': ping'),
+    defEvent: S.parseSSEFrame('data: plain'),
+    badJson: S.parseSSEData({ event: 'x', data: 'not-json' }),
+  };
+  S.handleSSEEvent({ event: 'snapshot', data: JSON.stringify({
+    now: 1700000000, version: '2.4.0', poll_interval_sec: 7,
+    counts: { total: 9, healthy: 8, cooling: 1, disabled: 0, paused: 0, sticky_sessions: 2 },
+    credits_sum: 100, credits_total_sum: 200,
+    jobs: [{ id: 'j1', kind: 'checkin', trigger: 'manual', state: 'running', total: 10, done: 4, fail: 1, skip: 1 }],
+    events_enabled: true,
+  }) });
+  out.snapshot = {
+    live: S.eventsLive(), total: sinks.sTotal.textContent, healthy: sinks.sHealthy.textContent,
+    sticky: sinks.sSticky.textContent, navState: sinks.navState.textContent,
+    navVer: sinks.navVer.textContent, pollBase: ctx.pollBaseSec, credits: ctx.creditsSum,
+    creditsRenders: state.creditsRenders, jobs: state.jobs.length,
+    badge: sinks.rtBadge.textContent, badgeCls: sinks.rtBadge.className, badgeHidden: sinks.rtBadge.hidden,
+  };
+  state.jobs.length = 0;
+  S.handleSSEEvent({ event: 'jobs', data: JSON.stringify({ jobs: [{ id: 'j2' }] }) });
+  const jobsEvent = state.jobs.length;
+  state.jobs.length = 0;
+  S.handleSSEEvent({ event: 'accounts', data: JSON.stringify({ counts: { total: 11, healthy: 10 } }) });
+  out.incremental = { total: sinks.sTotal.textContent, healthy: sinks.sHealthy.textContent,
+                      jobsEvent: jobsEvent, jobsAfterAccounts: state.jobs.length };
+  S.handleSSEEvent({ event: 'job', data: '{}' });
+  S.handleSSEEvent({ event: 'snapshot', data: 'not-json' });
+  out.ignoreUnknown = S.eventsLive();
+  S.handleSSEEvent({ event: 'snapshot', data: JSON.stringify({ counts: { total: 1 }, events_enabled: false }) });
+  out.disabledSnapshot = { supported: S.state().supported, badge: sinks.rtBadge.textContent,
+                           nextPoll: state.scheduleNextPoll > 0, timers: timers.length,
+                           live: S.eventsLive() };
+  // 断线指数退避：1s/2s/4s/8s/16s/30s
+  S.setSupported(true);
+  state.fetchCalls.length = 0; timers.length = 0;
+  fetchImpl = async () => { throw new Error('net'); };
+  await S.connectEvents();
+  const delays = [];
+  for (let i = 0; i < 6; i++) {
+    const t = timers[timers.length - 1];
+    if (!t) break;
+    delays.push(t.ms);
+    await t.fn();
+    await flush();
+  }
+  out.backoff = { delays: delays, capped: delays.every(d => d <= 30000), launches: state.fetchCalls.length };
+  // 404 → 永久回落轮询
+  S.abortEvents(); timers.length = 0; state.scheduleNextPoll = 0;
+  fetchImpl = async () => ({ status: 404, ok: false });
+  await S.connectEvents();
+  out.notFound = { supported: S.state().supported, nextPoll: state.scheduleNextPoll > 0, timers: timers.length,
+                   badge: sinks.rtBadge.textContent, title: sinks.rtBadge.title };
+  // 401 → onAuthRequired（弹登录层），不永久 disable
+  S.setSupported(true); state.onAuth = 0;
+  fetchImpl = async () => ({ status: 401, ok: false });
+  await S.connectEvents();
+  out.unauthorized = { onAuth: state.onAuth, supported: S.state().supported };
+  // 正常建流（snapshot 首帧 + 保持打开）→ 实时徽标；隐藏断开、可见重连
+  S.setSupported(true);
+  const enc = new TextEncoder();
+  const chunks = [enc.encode('event: snapshot\ndata: ' + JSON.stringify({ counts: { total: 3, healthy: 3 }, version: '2.4.0' }) + '\n\n')];
+  fetchImpl = async () => ({ status: 200, ok: true, body: { getReader: () => ({ read: async () => {
+    if (chunks.length) return { value: chunks.shift(), done: false };
+    await new Promise(() => {});
+  } }) } });
+  await S.connectEvents();
+  await flush();
+  out.stream = { live: S.eventsLive(), badge: sinks.rtBadge.textContent, badgeCls: sinks.rtBadge.className,
+                 total: sinks.sTotal.textContent };
+  const fetchesBefore = state.fetchCalls.length;
+  doc.visibilityState = 'hidden';
+  handlers.visibilitychange();
+  out.hidden = { connected: S.state().connected };
+  doc.visibilityState = 'visible';
+  handlers.visibilitychange();
+  await flush();
+  out.visible = { fetchAgain: state.fetchCalls.length > fetchesBefore };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"parse":{"partial":0,"one":[{"event":"snapshot","data":"{\"a\":1}"}],` +
+		`"multi":{"event":"x","data":"a\nb"},"crlf":{"event":"message","data":"q"},` +
+		`"commentOnly":null,"defEvent":{"event":"message","data":"plain"},"badJson":null},` +
+		`"snapshot":{"live":true,"total":9,"healthy":8,"sticky":2,"navState":"服务正常","navVer":"v2.4.0",` +
+		`"pollBase":7,"credits":{"rem":100,"tot":200},"creditsRenders":1,"jobs":1,` +
+		`"badge":"实时","badgeCls":"rt-badge live","badgeHidden":false},` +
+		`"incremental":{"total":11,"healthy":10,"jobsEvent":1,"jobsAfterAccounts":0},` +
+		`"ignoreUnknown":true,` +
+		`"disabledSnapshot":{"supported":false,"badge":"轮询","nextPoll":true,"timers":0,"live":false},` +
+		`"backoff":{"delays":[1000,2000,4000,8000,16000,30000],"capped":true,"launches":7},` +
+		`"notFound":{"supported":false,"nextPoll":true,"timers":0,"badge":"轮询",` +
+		`"title":"实时事件不可用，已回落轮询刷新（HTTP 404）"},` +
+		`"unauthorized":{"onAuth":1,"supported":true},` +
+		`"stream":{"live":true,"badge":"实时","badgeCls":"rt-badge live","total":3},` +
+		`"hidden":{"connected":false},"visible":{"fetchAgain":true}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("SSE 事件=%s\nwant %s", got, want)
 	}
 }

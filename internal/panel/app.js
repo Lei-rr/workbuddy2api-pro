@@ -52,12 +52,23 @@ async function api(path, opts = {}) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  // 401 = 面板密钥（panel.api_key，未单配时回落网关 api_key）无效。统一交给
-  // onAuthRequired：停掉自动轮询（否则后台标签页每 5s 刷一次 401、反复抢焦点弹
-  // 密钥框），并保证一次失败周期里密钥框只自动弹一次。
-  if (r.status === 401) { onAuthRequired(); throw new Error('密钥无效或未填写'); }
+  // 401 = 面板密钥（panel.api_key，未单配时回落网关 api_key）无效，或会话过期。
+  // 统一交给 onAuthRequired：停掉自动轮询/SSE（否则后台标签页每 5s 刷一次 401、
+  // 反复抢焦点弹登录层），并保证一次失败周期里登录层只自动弹一次。
+  // 例外：auth/* 端点自身的 401 表示「用户名或密码错误 / 未登录」——由登录层自己
+  // 处理文案，不能反过来再弹一次登录层（否则多用户模式下输错密码会把表单切回密钥）。
+  if (r.status === 401) {
+    if (path.indexOf('auth/') !== 0) onAuthRequired();
+    const err = new Error('密钥无效或未填写');
+    err.status = 401;
+    throw err;
+  }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const err = new Error(d.error || ('HTTP ' + r.status));
+    err.status = r.status;
+    throw err;
+  }
   keyPrompted = false;   // 鉴权恢复正常：之后再失效（如换了 panel.api_key）可再自动提示一次
   return d;
 }
@@ -333,38 +344,483 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
-/* ── 密钥门 ───────────────────────────────────────────────────────── */
-/* 面板鉴权用的是「面板密钥」panel.api_key；未单配时后端回落到网关 api_key。
-   localStorage 键（wb2api.key）沿用不改：老浏览器里存的就是当时生效的那把密钥
-   （旧版本是网关 key，分离后可能是面板 key），继续用它发 Authorization 即可。
+/* ── 登录层 / 角色（v2.4.0 #6：单密钥 + 多用户）─────────────────────────
+   两种模式共用同一套 Bearer 凭据（localStorage: wb2api.key）：
+     - mode=single：沿用面板密钥（panel.api_key，未单配时回落网关 api_key）输入；
+     - mode=multi ：POST /auth/login {username,password} → token 存同一键；
+   GET /auth/info 给出 mode/user{name,role}/auth/events_enabled。它本身需要鉴权：
+   未登录时会 401，此时先按「模式未知」显示密钥表单并给一个「用账号密码登录」切换；
+   一旦登录成功（或后端允许匿名读取 info）就按真实模式切换 UI。 */
+let authInfo = null;        // /auth/info 归一化结果
+let authMode = 'single';    // single | multi（模式未知时先按 single 展示）
+let authKnown = false;      // 是否成功读到过 /auth/info（决定是否显示模式切换）
+let authUser = null;        // {name, role}
+let authEventsEnabled = true;
 
-   openKey 只在 401 时由 onAuthRequired 调用；本机已存过密钥说明「原本能进、后来
-   401」——多半是服务端换了 panel.api_key（升级后分离密钥的典型场景），提示文案
-   要明确指向它，而不是笼统的「密钥不正确」。 */
+const ROLE_LABELS = { admin: '管理员', operator: '运维', viewer: '只读' };
+/* 角色能力矩阵（前端只做 UI 收敛，服务端仍有最终鉴权）：
+   read 查看；write 任务/运维/备注等常规写；task 批量任务/做任务；
+   danger 移除账号/重新扫描；config 配置读写；add 添加账号（含扫码登录）；
+   import cockpit 批量导入。 */
+const ROLE_CAPS = {
+  admin: ['read', 'write', 'task', 'danger', 'config', 'add', 'import'],
+  operator: ['read', 'write', 'task'],
+  viewer: ['read'],
+};
+
+/* normalizeAuthInfo 归一化 /auth/info：字段缺失/旧后端按单密钥、admin 兜底。 */
+function normalizeAuthInfo(d) {
+  const info = d || {};
+  const mode = info.mode === 'multi' ? 'multi' : 'single';
+  const u = info.user || null;
+  return {
+    mode: mode,
+    user: u && u.name ? { name: String(u.name), role: (u.role === 'operator' || u.role === 'viewer') ? u.role : 'admin' } : null,
+    auth: info.auth || null,
+    events_enabled: info.events_enabled !== false,
+  };
+}
+function applyAuthInfo(d) {
+  authInfo = normalizeAuthInfo(d);
+  authMode = authInfo.mode;
+  authKnown = true;
+  authUser = authInfo.user;
+  authEventsEnabled = authInfo.events_enabled;
+  eventsEnabledCfg = authEventsEnabled;   // SSE 总开关：auth/info 的 events_enabled
+  applyAuthUI();
+  return authInfo;
+}
+/* loadAuthInfo 只在启动/登录后调用；失败不抛，返回 false 由调用方决定登录层。 */
+async function loadAuthInfo(quiet) {
+  try {
+    applyAuthInfo(await api('auth/info'));
+    return true;
+  } catch (e) {
+    if (!quiet) toast('读取登录信息失败：' + e.message, 'err');
+    return false;
+  }
+}
+function currentRole() {
+  return (authUser && ROLE_CAPS[authUser.role]) ? authUser.role : 'admin';
+}
+function roleLabel(role) { return ROLE_LABELS[role || currentRole()] || (role || ''); }
+/* roleCan 能力判定：单密钥模式/未登录阶段一律按 admin（等价旧 UI），登录后按角色收敛。 */
+function roleCan(cap) {
+  const caps = ROLE_CAPS[currentRole()] || ROLE_CAPS.admin;
+  return caps.indexOf(cap) >= 0;
+}
+function roleDenyText() {
+  return currentRole() === 'viewer' ? '只读账号' : '当前角色无此权限';
+}
+/* roleDenyAttr 渲染期用：无权限时给按钮补 disabled + 原因 title（内联事件选择器
+   依赖 disabled 阻断点击；服务端才是最终防线）。 */
+function roleDenyAttr(cap) {
+  return roleCan(cap) ? '' : ' disabled title="' + esc(roleDenyText()) + '"';
+}
+/* roleGuard 命令式守卫：写操作入口（弹窗打开/表单提交/导入/批量任务）再兜一层。 */
+function roleGuard(cap) {
+  if (roleCan(cap)) return true;
+  toast(roleDenyText(), 'err');
+  return false;
+}
+/* setControlDeny 给固定控件加/去禁用（保留原有 title 供恢复）。 */
+function setControlDeny(el, cap) {
+  if (!el) return;
+  if (roleCan(cap)) {
+    if (el.dataset && el.dataset.roleDeny === '1') {
+      el.disabled = false;
+      el.dataset.roleDeny = '';
+      if (el.dataset.roleTitle != null) { el.title = el.dataset.roleTitle; el.dataset.roleTitle = ''; }
+      else el.removeAttribute('title');
+    }
+    return;
+  }
+  if (el.dataset && el.dataset.roleDeny === '1') return;
+  if (el.dataset) { el.dataset.roleDeny = '1'; el.dataset.roleTitle = el.title || ''; }
+  el.disabled = true;
+  el.title = roleDenyText();
+}
+/* ROLE_CONTROLS 固定写控件 → 所需能力（渲染型行内按钮另用 roleDenyAttr）。 */
+const ROLE_CONTROLS = [
+  ['btnAdd', 'add'],
+  ['btnRefresh', 'write'],
+  ['btnRescan', 'danger'],
+  ['btnRemarks', 'write'],
+  ['btnCheckinAll', 'task'],
+  ['btnTravelAll', 'task'],
+  ['btnActivityAll', 'task'],
+  ['btnKeepaliveAll', 'task'],
+  ['btnJobCancel', 'task'],
+  ['btnRunQueue', 'task'],
+  ['btnTaskAcceptAll', 'task'],
+  ['btnTaskAutoAll', 'task'],
+  ['btnRemarkSave', 'write'],
+  ['btnRemarkClear', 'write'],
+  ['btnCfgSave', 'config'],
+  ['btnCfgReload', 'config'],
+  ['btnStartLogin', 'add'],
+  ['importFile', 'import'],
+];
+function applyRoleGating() {
+  for (const [id, cap] of ROLE_CONTROLS) setControlDeny($(id), cap);
+}
+/* applyAuthUI 登录态/角色 → 顶栏用户、退出按钮、配置导航与写控件收敛。 */
+function applyAuthUI() {
+  const role = currentRole();
+  if (document.body && document.body.dataset) document.body.dataset.role = role;
+  if ($('curUser')) {
+    if (authUser && authUser.name && authMode === 'multi') {
+      $('curUser').hidden = false;
+      $('curUser').textContent = authUser.name + '（' + roleLabel(role) + '）';
+      $('curUser').title = '当前用户：' + authUser.name + ' · 角色：' + roleLabel(role);
+    } else {
+      $('curUser').hidden = true;
+      $('curUser').textContent = '';
+    }
+  }
+  // 单密钥模式没有会话概念：不显示退出按钮（沿用旧 UI）。
+  if ($('btnLogout')) $('btnLogout').hidden = !(authMode === 'multi' && authUser);
+  if ($('navConfigLi')) $('navConfigLi').hidden = !roleCan('config');
+  applyRoleGating();
+  if (view === 'config' && !roleCan('config')) go('accounts');
+  // 账号行内按钮的禁用状态在渲染期决定：角色变化后重渲染当前页。
+  if (accAll.length) renderAccounts(accAll, accPageMeta);
+}
+/* showLogin 配置登录层：known=false 时保留模式切换入口（视图层按 single 布局）。 */
+function showLogin(knownMode) {
+  const mode = knownMode || authMode || 'single';
+  authKnown = !!knownMode;
+  authMode = mode;
+  const multi = mode === 'multi';
+  if ($('loginTitle')) $('loginTitle').textContent = multi ? '登录面板' : '需要访问密钥';
+  if ($('loginHint')) {
+    $('loginHint').innerHTML = multi
+      ? '请输入<b>用户名 / 密码</b>登录。登录态保存在本机浏览器；角色由管理员分配（viewer 只读 / operator 运维 / admin 管理员）。'
+      : '该面板已启用密钥鉴权。请输入<b>面板密钥</b>（config.json 的 <code>panel.api_key</code>）；未单独配置面板密钥时，回落到网关 <code>api_key</code>。';
+  }
+  if ($('keySingle')) $('keySingle').hidden = multi;
+  if ($('keyMulti')) $('keyMulti').hidden = !multi;
+  if ($('btnKey')) $('btnKey').hidden = multi;
+  if ($('btnLogin')) $('btnLogin').hidden = !multi;
+  if ($('keyModeSwitch')) {
+    $('keyModeSwitch').hidden = authKnown;
+    $('keyModeSwitch').textContent = multi ? '用面板密钥登录' : '用账号密码登录';
+  }
+  if ($('loginErr')) $('loginErr').hidden = true;
+  if ($('keyVeil')) $('keyVeil').classList.add('on');
+  setTimeout(() => {
+    const focusEl = multi ? $('loginUser') : $('keyInput');
+    if (focusEl && focusEl.focus) focusEl.focus();
+  }, 60);
+}
+function hideLogin() { if ($('keyVeil')) $('keyVeil').classList.remove('on'); }
+/* openKey 由 onAuthRequired（401）调用：已知模式按模式展开展示，未知按密钥兜底。 */
 function openKey() {
   const had = !!localStorage.getItem(LS_KEY);
-  const err = $('keyErr');
-  if (err) {
-    err.textContent = had
+  if ($('keyErr')) {
+    $('keyErr').textContent = had
       ? '面板密钥可能已变更（panel.api_key），请重新输入。'
       : '密钥不正确，请重试。';
-    err.hidden = !had;
+    $('keyErr').hidden = !had;
   }
-  $('keyVeil').classList.add('on');
-  setTimeout(() => $('keyInput').focus(), 60);
+  showLogin(authKnown ? authMode : 'single');
 }
-$('btnKey').onclick = async () => {
-  const v = $('keyInput').value.trim();
+/* 登录态后续动作：读 info（同步角色/模式）→ 收起登录层 → 启动轮询 + SSE。 */
+async function afterAuthSuccess() {
+  hideLogin();
+  await loadAuthInfo(true);
+  if (!authKnown) { authMode = 'single'; authUser = null; }
+  applyAuthUI();
+  start();
+  if (authEventsEnabled) connectEvents();
+  else if (typeof disableEvents === 'function') disableEvents('服务端已关闭实时事件');
+}
+async function submitLogin() {
+  const username = String(($('loginUser') || {}).value || '').trim();
+  const password = String(($('loginPass') || {}).value || '');
+  if (!username || !password) { if ($('loginErr')) { $('loginErr').hidden = false; $('loginErr').textContent = '请输入用户名和密码'; } return; }
+  const btn = $('btnLogin');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('auth/login', { method: 'POST', body: JSON.stringify({ username: username, password: password }) });
+    const token = (r && (r.token || r.session || r.access_token)) || '';
+    if (!token) throw new Error('登录响应缺少 token');
+    localStorage.setItem(LS_KEY, token);
+    if ($('loginErr')) $('loginErr').hidden = true;
+    if ($('loginPass')) $('loginPass').value = '';
+    await afterAuthSuccess();
+  } catch (e) {
+    if ($('loginErr')) {
+      $('loginErr').hidden = false;
+      $('loginErr').textContent = (e && e.status === 401) ? '用户名或密码错误' : ('登录失败：' + e.message);
+    }
+  } finally { if (btn) btn.disabled = false; }
+}
+async function submitKey() {
+  const v = String((($('keyInput') || {}).value) || '').trim();
   if (!v) return;
   localStorage.setItem(LS_KEY, v);
+  const btn = $('btnKey');
+  if (btn) btn.disabled = true;
   try {
     await api('overview?lite=1');   // 只验鉴权：用 lite（1-2 KB）即可，不拉全量账号
-    $('keyErr').hidden = true;
-    $('keyVeil').classList.remove('on');
-    start();   // 手动保存密钥成功 → 重置 401 停表状态并重启轮询
-  } catch (e) { $('keyErr').hidden = false; }
+    if ($('keyErr')) $('keyErr').hidden = true;
+    await afterAuthSuccess();
+  } catch (e) {
+    if ($('keyErr')) $('keyErr').hidden = false;
+  } finally { if (btn) btn.disabled = false; }
+}
+async function logout() {
+  const btn = $('btnLogout');
+  if (btn) btn.disabled = true;
+  try { await api('auth/logout', { method: 'POST' }); } catch (e) { /* 忽略：本地一定要退出 */ }
+  localStorage.removeItem(LS_KEY);
+  authUser = null;
+  authInfo = null;
+  authKnown = false;
+  authMode = 'single';
+  eventsEnabledCfg = false;   // 先关 SSE 开关再断流：避免关闭触发自动重连
+  pollArmed = false; pollAuthStopped = false; stopPollTimer();
+  abortEvents();
+  applyAuthUI();
+  showLogin('multi');
+  if (btn) btn.disabled = false;
+}
+if ($('btnKey')) $('btnKey').onclick = () => { submitKey(); };
+if ($('keyInput')) $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });
+if ($('btnLogin')) $('btnLogin').onclick = () => { submitLogin(); };
+if ($('loginPass')) $('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') submitLogin(); });
+if ($('loginUser')) $('loginUser').addEventListener('keydown', e => { if (e.key === 'Enter') submitLogin(); });
+if ($('btnLogout')) $('btnLogout').onclick = () => { if (confirm('退出当前账号？')) logout(); };
+if ($('keyModeSwitch')) $('keyModeSwitch').onclick = () => {
+  showLogin(authMode === 'multi' ? 'single' : 'multi');
+  authKnown = false;   // 手动切换后仍允许切回
+  if ($('keyModeSwitch')) { $('keyModeSwitch').hidden = false; }
 };
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+
+/* ── 实时事件 SSE（v2.4.0 #3）──────────────────────────────────────────
+   后端 GET /panel/api/events（withAuth，Bearer）：text/event-stream，事件
+     snapshot → {now,version,poll_interval_sec,counts{...},credits_sum,
+                 credits_total_sum,jobs:[...],events_enabled}
+     jobs     → {jobs:[...]}（进度条增量）
+     accounts → {counts,credits_sum,credits_total_sum,...}（统计条增量）
+     心跳注释 `: ping`（忽略）。
+   连接本身用 fetch + ReadableStream（EventSource 不能带 Authorization）。连接期间
+   跳过 jobs / lite overview 的 5s 轮询（避免双拉），当前页账号行仍按 5s 刷新（SSE
+   不推逐号行数据，冷却倒计时需要它）；断线/隐藏页面暂停并恢复轮询。404/501 或
+   events_enabled=false → eventsSupported=false 永久回落轮询，不再重连。 */
+const EVENTS_MAX_BACKOFF_MS = 30000;   // 指数退避上限 1s/2s/4s…30s
+let eventsSupported = true;            // 后端是否提供 SSE（404/501 后永久 false）
+let eventsConnecting = false;          // 建连在途
+let eventsConnected = false;           // 流已建立
+let eventsHasSnapshot = false;         // 已收到 snapshot/accounts（统计条可用）
+let eventsGotAny = false;              // 收到过任何数据事件（jobs 也可暂停轮询）
+let eventsAbort = null;                // AbortController（隐藏/退出/回落时断开）
+let eventsRetryTimer = null;
+let eventsRetryCount = 0;
+let eventsEnabledCfg = true;
+
+/* eventsLive 轮询开关：连上且收到过至少一个数据事件才暂停轮询，避免
+   「刚连上还没数据就跳过轮询」导致首屏空白。 */
+function eventsLive() { return eventsConnected && eventsGotAny; }
+function rtBadgeState() {
+  if (eventsConnected) return eventsHasSnapshot ? 'live' : 'connecting';
+  return eventsSupported ? 'connecting' : 'poll';
+}
+function setRtBadge(state) {
+  const b = $('rtBadge');
+  if (!b) return;
+  b.hidden = false;
+  b.textContent = state === 'live' ? '实时' : (state === 'connecting' ? '连接中' : '轮询');
+  b.className = 'rt-badge ' + (state === 'live' ? 'live' : (state === 'connecting' ? 'connecting' : 'poll'));
+  b.title = state === 'live'
+    ? '实时事件已连接（SSE），统计数据增量推送'
+    : (state === 'connecting' ? '正在建立实时连接，暂用轮询' : '实时事件不可用，已回落轮询刷新');
+}
+
+/* createSSEParser 纯函数：喂文本块 → 完整事件数组；跨块残帧留到下次。
+   兼容 \r\n / \n、多行 data、注释帧（: ping）、event 缺省 message。 */
+function createSSEParser() {
+  let buf = '';
+  return function feed(chunk) {
+    buf += String(chunk == null ? '' : chunk);
+    const out = [];
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const ev = parseSSEFrame(frame);
+      if (ev) out.push(ev);
+    }
+    return out;
+  };
+}
+function parseSSEFrame(frame) {
+  if (!frame || !frame.replace(/\s/g, '')) return null;
+  const lines = String(frame).split(/\r?\n/);
+  let event = 'message';
+  const data = [];
+  for (const line of lines) {
+    if (!line || line.charAt(0) === ':') continue;   // 心跳/注释
+    const i = line.indexOf(':');
+    const field = i >= 0 ? line.slice(0, i) : line;
+    let value = i >= 0 ? line.slice(i + 1) : '';
+    if (value.charAt(0) === ' ') value = value.slice(1);
+    if (field === 'event') event = value || 'message';
+    else if (field === 'data') data.push(value);
+  }
+  if (!data.length) return null;   // 只有注释/空帧
+  return { event: event, data: data.join('\n') };
+}
+function parseSSEData(ev) {
+  try { return JSON.parse(ev.data); } catch (e) { return null; }
+}
+
+/* applyLiveCounts 用 SSE 增量更新统计条（不整页刷新、不动账号表/模型锁池）。
+   字段缺失就保持现状；credits 优先用推送值。 */
+function applyLiveCounts(d) {
+  if (!d || typeof d !== 'object') return;
+  if (d.poll_interval_sec != null) pollBaseSec = pollIntervalSec(d.poll_interval_sec);
+  const c = d.counts || {};
+  const put = (id, v) => { if (v != null && $(id)) $(id).textContent = v; };
+  put('sTotal', c.total);
+  put('sHealthy', c.healthy);
+  put('sCooling', c.cooling);
+  put('sDisabled', c.disabled);
+  put('sPaused', c.paused);
+  put('sSticky', c.sticky_sessions);
+  if (d.credits_sum != null || d.credits_total_sum != null) {
+    creditsSum = { rem: Number(d.credits_sum) || 0, tot: Number(d.credits_total_sum) || 0 };
+    renderCreditsStat();
+  }
+  if (d.version != null) {
+    if ($('navSub')) $('navSub').textContent = 'v' + d.version;
+    if ($('navVer')) $('navVer').textContent = 'v' + d.version;
+  }
+  if (c.total != null || c.healthy != null) {
+    const total = Number(c.total);
+    const healthy = Number(c.healthy);
+    if ($('navState')) $('navState').textContent = healthy > 0 ? '服务正常' : (total ? '无可用账号' : '待添加账号');
+    if ($('navPulse')) $('navPulse').className = 'pulse' + (healthy > 0 ? '' : (total ? ' warn' : ' bad'));
+  }
+  // 时钟校准：后端 snapshot 同时给 RFC3339 的 now 与 now_unix（秒）。优先用后者，
+  // 让冷却倒计时与账号页的 skew 口径一致（304 期间也不漂移）。
+  const nowUnix = Number(d.now_unix);
+  if (Number.isFinite(nowUnix) && nowUnix > 0) accClockSkew = Date.now() - nowUnix * 1000;
+  else if (typeof d.now === 'number' && d.now > 0) accClockSkew = Date.now() - d.now * 1000;
+}
+/* handleSSEEvent 事件分发：snapshot/accounts 更新统计条，jobs 更新进度条。 */
+function handleSSEEvent(ev) {
+  if (!ev || !ev.event) return;
+  if (ev.event !== 'snapshot' && ev.event !== 'accounts' && ev.event !== 'jobs') return;
+  const d = parseSSEData(ev);
+  if (!d) return;
+  eventsConnected = true;
+  eventsGotAny = true;
+  if (ev.event === 'jobs') {
+    if (Array.isArray(d.jobs)) renderJobBar(normalizeJobs(d));
+    setRtBadge(rtBadgeState());
+    return;
+  }
+  eventsHasSnapshot = true;
+  if (d.events_enabled === false) { disableEvents('服务端已关闭实时事件'); return; }
+  applyLiveCounts(d);
+  if (ev.event === 'snapshot' && Array.isArray(d.jobs)) renderJobBar(normalizeJobs(d));
+  setRtBadge(rtBadgeState());
+}
+/* 环境兜底：老浏览器/极简 node harness 没有 AbortController/TextDecoder 时降级，
+   保证面板主流程（轮询）不被 SSE 依赖阻断。 */
+function newAbortController() {
+  if (typeof AbortController === 'function') return new AbortController();
+  return { signal: null, abort() {} };
+}
+function newTextDecoder() {
+  if (typeof TextDecoder === 'function') return new TextDecoder();
+  return { decode(v) { return String(v == null ? '' : v); } };
+}
+async function pumpEvents(r, ac) {
+  const reader = r.body.getReader();
+  const dec = newTextDecoder();
+  const feed = createSSEParser();
+  try {
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      const events = feed(dec.decode(step.value, { stream: true }));
+      for (const ev of events) handleSSEEvent(ev);
+      if (ac && ac.signal && ac.signal.aborted) break;
+    }
+  } catch (e) { /* 网络错误/主动 abort：走统一关闭分支 */ }
+  finally { onEventsClosed(); }
+}
+/* connectEvents 建连（幂等：在途/已连/隐藏/未登录时直接返回）。 */
+async function connectEvents() {
+  if (!eventsSupported || !eventsEnabledCfg || eventsConnecting || eventsConnected) return;
+  if (pollAuthStopped || pageHidden) return;
+  eventsConnecting = true;
+  const ac = newAbortController();
+  eventsAbort = ac;
+  try {
+    const h = {};
+    const k = localStorage.getItem(LS_KEY);
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    const r = await fetch('/panel/api/events', { headers: h, signal: ac.signal, cache: 'no-store' });
+    if (r.status === 401) { eventsConnecting = false; onAuthRequired(); return; }
+    if (r.status === 404 || r.status === 501) { eventsConnecting = false; disableEvents('HTTP ' + r.status); return; }
+    if (!r.ok || !r.body || !r.body.getReader) throw new Error('HTTP ' + r.status);
+    eventsConnecting = false;
+    eventsConnected = true;
+    eventsHasSnapshot = false;
+    eventsGotAny = false;
+    eventsRetryCount = 0;
+    setRtBadge('connecting');
+    pumpEvents(r, ac);   // 后台持续读流；关闭时 onEventsClosed 负责重连/回落
+  } catch (e) {
+    eventsConnecting = false;
+    if (e && e.name === 'AbortError') return;   // 主动断开（隐藏/退出/回落）
+    scheduleEventsRetry();
+  }
+}
+function onEventsClosed() {
+  const wasSupported = eventsSupported;
+  eventsConnected = false;
+  eventsHasSnapshot = false;
+  eventsGotAny = false;
+  eventsAbort = null;
+  setRtBadge(rtBadgeState());
+  if (wasSupported && !pageHidden && !pollAuthStopped) scheduleEventsRetry();
+  else if (wasSupported) scheduleNextPoll();   // 隐藏/未登录：交给轮询兜底
+}
+function scheduleEventsRetry() {
+  if (!eventsSupported || eventsRetryTimer || pageHidden || pollAuthStopped) return;
+  const ms = Math.min(EVENTS_MAX_BACKOFF_MS, 1000 * Math.pow(2, Math.min(eventsRetryCount, 5)));
+  eventsRetryCount += 1;
+  setRtBadge('connecting');
+  eventsRetryTimer = setTimeout(() => { eventsRetryTimer = null; connectEvents(); }, ms);
+}
+function abortEvents() {
+  if (eventsAbort) { try { eventsAbort.abort(); } catch (e) { /* 已关闭 */ } eventsAbort = null; }
+  if (eventsRetryTimer) { clearTimeout(eventsRetryTimer); eventsRetryTimer = null; }
+  eventsConnecting = false;
+  eventsConnected = false;
+  eventsHasSnapshot = false;
+  eventsGotAny = false;
+}
+/* disableEvents 永久回落：404/501 或服务端 events_enabled=false。 */
+function disableEvents(reason) {
+  eventsSupported = false;
+  abortEvents();
+  const b = $('rtBadge');
+  if (b) { b.hidden = false; b.className = 'rt-badge poll'; b.textContent = '轮询'; b.title = '实时事件不可用，已回落轮询刷新' + (reason ? '（' + reason + '）' : ''); }
+  scheduleNextPoll();
+}
+/* 页面隐藏：断流省电（回来时 pollTick/visibility 重连）；可见：立即重连。 */
+function eventsVisibilityChange() {
+  const hiddenNow = !!(document && document.visibilityState === 'hidden');
+  if (hiddenNow) abortEvents();
+  else if (eventsSupported && eventsEnabledCfg) connectEvents();
+}
+if (document && document.addEventListener) document.addEventListener('visibilitychange', eventsVisibilityChange);
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -379,6 +835,11 @@ const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟�
 // 视图代码保留在下方，仅不再可从导航/直链进入。
 const TITLES = { accounts: '账号池', usage: '用量', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
+  // v2.4.0 #6：非 admin 角色不展示配置视图（导航已隐藏，这里兜住直链/历史 hash）。
+  if (v === 'config' && !roleCan('config')) {
+    toast('当前角色无配置权限', 'err');
+    v = 'accounts';
+  }
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
@@ -670,6 +1131,10 @@ const dotaskBusy = new Set();
 function accDoTaskBtn(s) {
   if (!s || s.enterprise) return '';
   const busy = dotaskBusy.has(s.uid);
+  // v2.4.0 #6：viewer 只读 → 按钮禁用并标注原因（operator/admin 可用）。
+  if (!roleCan('task')) {
+    return '<button class="xs ghost" data-a="dotask" data-u="' + esc(s.uid) + '" disabled title="' + esc(roleDenyText()) + '">做任务</button>';
+  }
   return '<button class="xs ghost" data-a="dotask" data-u="' + esc(s.uid) + '"' +
     (busy ? ' disabled' : '') +
     ' title="对该账号一键执行全部可自动任务（含真实对话，约 1-2 分钟）">' +
@@ -910,19 +1375,19 @@ function renderAccounts(list, meta) {
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
         (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
         // 单号积分构成：只查这一个账号（1 次上游请求）。整池对比视图已下线——
         // 逐号实时查询的批量特征有风控风险，明细改为按需单查。
         '<button class="xs ghost" data-a="pk" data-u="' + esc(s.uid) + '" title="查看单号积分构成（仅查这 1 个账号）">积分</button>' +
         (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '"' + roleDenyAttr('task') + '>任务</button>') +
         accDoTaskBtn(s) +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
+        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + '>解冻</button>'
+                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + '>恢复选号</button>'
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + ' title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '"' + roleDenyAttr('write') + '>禁用</button>') +
+        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '"' + roleDenyAttr('danger') + '>移除</button>' +
       '</td></tr>';
   }).join('');
   if (server) updateAccPagerMeta(meta, accAll.length);
@@ -1127,8 +1592,10 @@ function applyOverviewMeta(d) {
   renderModelLocks(d.model_locks);
 }
 
-/* loadSummary 只拉 lite overview：5s 轮询的常驻请求，~1-2 KB。 */
+/* loadSummary 只拉 lite overview：5s 轮询的常驻请求，~1-2 KB。
+   v2.4.0 #3：SSE 已推送 snapshot/accounts 时跳过（统计条由事件增量更新）。 */
 async function loadSummary(quiet) {
+  if (eventsLive()) return true;
   try {
     const d = await api('overview?lite=1');
     applyOverviewMeta(d);
@@ -1211,8 +1678,15 @@ async function loadAccountPage(quiet) {
    ④ 仅当「积分到期」tab 激活时才按 60s 窗口补完整 overview（低频）。
    列表 tab 下不拉全量——这是「账号池不再每 5s 拉 689KB」的落点。 */
 async function refreshAccountsView(quiet) {
-  const [summaryOK, pageOK] = await Promise.all([loadSummary(quiet), loadAccountPage(quiet)]);
-  loadJobs(true);   // 进度条跟随轮询刷新；404/失败静默（不影响账号池刷新与退避）
+  // v2.4.0 #3：SSE 已连上并收到数据后，统计条由 snapshot/accounts 事件增量更新，
+  // jobs 由 jobs 事件推送——这两路 5s 轮询跳过（避免双拉）；当前页账号行仍按
+  // 轮询刷新（SSE 不推逐号行，冷却倒计时依赖它）。
+  const live = eventsLive();
+  const [summaryOK, pageOK] = await Promise.all([
+    live ? Promise.resolve(true) : loadSummary(quiet),
+    loadAccountPage(quiet),
+  ]);
+  if (!live) loadJobs(true);   // 进度条跟随轮询刷新；404/失败静默（不影响账号池刷新与退避）
   if (accTab === 'expiry' && view === 'accounts') {
     const ok = await ensureFullOverview(quiet);
     if (ok && overviewData) renderExpirySnapshot(overviewData);
@@ -1345,8 +1819,10 @@ function renderJobBar(jobs) {
   }
   if ($('btnJobCancel')) $('btnJobCancel').disabled = j.state !== 'running';
 }
-/* loadJobs 一轮 jobs 拉取（静默：失败不打断账号池刷新，也不计入轮询退避）。 */
+/* loadJobs 一轮 jobs 拉取（静默：失败不打断账号池刷新，也不计入轮询退避）。
+   v2.4.0 #3：SSE jobs 事件已推送时跳过（断线后自动恢复）。 */
 async function loadJobs(quiet) {
+  if (eventsLive()) return true;
   if (!jobsSupported || jobsLoading) return false;
   jobsLoading = true;
   try {
@@ -1370,6 +1846,7 @@ async function loadJobs(quiet) {
 /* cancelJob 取消当前 running job：confirm 说明「只停后续账号」，成功/失败都 toast。
    后端返回 {ok,canceled:true|false}：false = 请求到达时任务已结束（无需取消）。 */
 async function cancelJob() {
+  if (!roleGuard('task')) return;
   const j = jobsActive;
   if (!j || !j.id) return;
   if (!confirm('取消「' + jobKindText(j.kind) + '」：只停后续账号，当前正在执行的账号会跑完。确认取消？')) return;
@@ -1387,6 +1864,7 @@ async function cancelJob() {
 }
 /* runBatchTask 批量端点统一调用：成功 toast 指向顶部进度条；409 等错误原样展示后端文案。 */
 async function runBatchTask(path, label, btn) {
+  if (!roleGuard('task')) return;
   const b = btn || null;
   if (b) b.disabled = true;
   try {
@@ -2556,6 +3034,7 @@ $('btnEye').onclick = () => {
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
+  if (!roleGuard('config')) return;   // v2.4.0 #6：非 admin 不允许保存配置
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
   markDurationFields();
   const firstBad = DURATION_FIELDS.find(durationBad);
@@ -2598,6 +3077,7 @@ $('cfgForm').onsubmit = async ev => {
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
+  if (!roleGuard('add')) return;
   $('addVeil').classList.add('on');
   // 重置到登录标签
   switchAddTab('login');
@@ -2662,6 +3142,7 @@ $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
+  if (!roleGuard('import')) { $('importFile').value = ''; return; }
   const file = $('importFile').files[0];
   if (!file) return;
   $('importDone').hidden = true; $('importErr').hidden = true;
@@ -2804,11 +3285,12 @@ async function pollTick() {
   scheduleNextPoll();
 }
 
-/* onAuthRequired 401 统一处理：停止自动轮询（避免后台标签页反复弹密钥框），
-   密钥框每个失败周期只自动弹一次；btnKey 保存成功 / 配置保存成功后恢复。 */
+/* onAuthRequired 401 统一处理：停止自动轮询/实时流（避免后台标签页反复弹登录层），
+   登录层每个失败周期只自动弹一次；重新登录成功 / 配置保存成功后恢复。 */
 function onAuthRequired() {
   pollAuthStopped = true;
   stopPollTimer();
+  abortEvents();
   if (keyPrompted) return;
   keyPrompted = true;
   openKey();
@@ -2860,7 +3342,37 @@ async function checkAuthGate() {
   try { await api('overview?lite=1'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
 }
-start();
+
+/* bootPanel 启动编排（v2.4.0 #6）：
+   ① 先读 /auth/info 确认模式/角色（多用户模式可能带已保存的会话 token）；
+   ② 200 → 应用角色 UI 后启动轮询 + SSE；
+   ③ 401 → 登录层已由 onAuthRequired 打开（模式未知先按密钥表单），等登录成功；
+   ④ 其它错误（旧后端无 /auth/info、网络抖动）→ 沿用单密钥 admin 行为直接启动，
+      保证升级兼容（后端未部署 v2.4.0 时不至于白屏）。 */
+async function bootPanel() {
+  try {
+    applyAuthInfo(await api('auth/info'));
+    applyAuthUI();
+    start();
+    if (authEventsEnabled) connectEvents();
+    else if (typeof disableEvents === 'function') disableEvents('服务端已关闭实时事件');
+    return;
+  } catch (e) {
+    if (e && e.status === 401) {
+      if (!authKnown) { authMode = 'single'; authUser = null; }
+      if (!($('keyVeil') && $('keyVeil').classList.contains('on'))) showLogin(authKnown ? authMode : 'single');
+      return;
+    }
+    // 旧后端/接口未实现：保持 v2.3.x 行为（单密钥 + 轮询），SSE 会自行 404 回落。
+    authKnown = false;
+    authMode = 'single';
+    authUser = null;
+    applyAuthUI();
+    start();
+    connectEvents();
+  }
+}
+bootPanel();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null;
