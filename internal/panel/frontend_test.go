@@ -2974,7 +2974,8 @@ const calls = [];
 const sinks = {};
 const sinkIds = ['accBody', 'accCount', 'accPageInfo', 'accPrev', 'accNext', 'sTotal', 'sHealthy',
   'sCooling', 'sDisabled', 'sPaused', 'sCredits', 'sSticky', 'navSub', 'navVer', 'navRedis',
-  'navState', 'navPulse', 'accNote', 'subMeta', 'expBox', 'expList', 'expNote', 'expPad', 'cfgForm'];
+  'navState', 'navPulse', 'accNote', 'subMeta', 'expBox', 'expList', 'expNote', 'expPad', 'cfgForm',
+  'accTruncHint', 'btnRescan'];
 for (const id of sinkIds) sinks[id] = { innerHTML: '', textContent: '', hidden: false, disabled: false,
   className: '', value: '', dataset: {}, children: [], addEventListener() {}, style: {} };
 const fetchStub = url => {
@@ -2983,6 +2984,7 @@ const fetchStub = url => {
   let body = {};
   if (u.indexOf('overview?lite=1') >= 0) body = lite;
   else if (u.indexOf('/panel/api/overview') >= 0) body = full;
+  else if (u.indexOf('/panel/api/accounts/rescan') >= 0) body = { scanned: 2, added: 1, removed: 0 };
   else if (u.indexOf('/panel/api/accounts?') >= 0) body = page;
   return Promise.resolve({ status: 200, ok: true, headers: { get: () => null }, json: async () => body });
 };
@@ -2996,6 +2998,7 @@ const sandbox = new Proxy({
               addEventListener() {}, documentElement: inert, head: inert, body: inert,
               createElement: () => inert, cookie: '' },
   fetch: fetchStub,
+  toast: () => {},
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
   MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
@@ -3089,6 +3092,30 @@ const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0)
   out.emptyFiltered = { html: sinks.accBody.innerHTML, count: sinks.accCount.textContent };
   R.renderAccounts([], { total: 0, filtered: 0, page: 1, pages: 1, now: now });
   out.emptyPool = { html: sinks.accBody.innerHTML };
+  // P2-1：账号集合变更（重新扫描）后，除当前页外还后台补拉一次完整 overview，
+  // 让积分历史下拉 / 积分条基准 / 到期快照立刻跟上（不再等切到期 tab 或整页刷新）。
+  const f4 = fullCount(), l4 = liteCount(), a4 = accCount();
+  await sinks.btnRescan.onclick();
+  await wait(() => fullCount() === f4 + 1 && accCount() > a4);
+  out.mutationRefetch = {
+    fullRefetched: fullCount() === f4 + 1,
+    liteRefreshed: liteCount() > l4,
+    pageRefreshed: accCount() > a4,
+    overviewAccounts: R.state().overviewAccounts,
+  };
+  // P2-2：page_size=0（全部）被服务端 2000 上限截断时给出提示；未截断/普通分页不显示。
+  R.setFilters({ q: '', state: '', ver: '' });
+  R.renderAccounts(rows, { total: 2500, filtered: 2500, page: 1, pages: 1, page_size: 0, now: now });
+  out.truncHint = { hidden: sinks.accTruncHint.hidden, text: sinks.accTruncHint.textContent,
+                    count: sinks.accCount.textContent };
+  // 带筛选时 total 是池总数：命中 2 个 < 上限，不构成截断（用 filtered 判断）。
+  R.renderAccounts(rows, { total: 2500, filtered: 2, page: 1, pages: 1, page_size: 0, now: now });
+  out.truncFiltered = { hidden: sinks.accTruncHint.hidden, text: sinks.accTruncHint.textContent };
+  R.renderAccounts(rows, { total: 2, filtered: 2, page: 1, pages: 1, page_size: 0, now: now });
+  out.truncNone = { hidden: sinks.accTruncHint.hidden, text: sinks.accTruncHint.textContent,
+                    count: sinks.accCount.textContent };
+  R.renderAccounts(rows, { total: 2500, filtered: 2500, page: 1, pages: 2, page_size: 100, now: now });
+  out.truncPaged = { hidden: sinks.accTruncHint.hidden, count: sinks.accCount.textContent };
   process.stdout.write(JSON.stringify(out));
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });`
@@ -3104,7 +3131,12 @@ const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0)
 		`"legacyRender":{"count":"共 2 个","info":"1 / 1","next":true,"rows":2,"meta":null},` +
 		`"emptyFiltered":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">没有符合筛选条件的账号</div></td></tr>",` +
 		`"count":"命中 0 / 共 5 个"},` +
-		`"emptyPool":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">账号池是空的</div></td></tr>"}}`
+		`"emptyPool":{"html":"<tr><td colspan=\"9\"><div class=\"empty\">账号池是空的</div></td></tr>"},` +
+		`"mutationRefetch":{"fullRefetched":true,"liteRefreshed":true,"pageRefreshed":true,"overviewAccounts":2},` +
+		`"truncHint":{"hidden":false,"text":"仅显示前 2 个（服务端上限 2000，建议用筛选或分页）","count":"共 2500 个"},` +
+		`"truncFiltered":{"hidden":true,"text":""},` +
+		`"truncNone":{"hidden":true,"text":"","count":"共 2 个"},` +
+		`"truncPaged":{"hidden":true,"count":"共 2500 个"}}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("账号池服务端分页/懒加载=%s\nwant %s", got, want)
 	}
@@ -3296,5 +3328,227 @@ const parseSec = html => {
 		`"accountsCalls":3,"decreased5":true,"decreased10":true}`
 	if got := feNode(t, script); got != want {
 		t.Fatalf("304 倒计时=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSAuditAndTaskRuns v2.2.0 #5/#9 只读 UI 的渲染与加载路径（node 切片）。
+//
+// 覆盖：时间格式化容错（空/脏/秒/毫秒）、字段别名兜底（ts/time、ip/client_ip、
+// action/act、runs 字段）、ok 缺失显示「—」、动作/类型/触发中文标签、表格行与列数、
+// 空态提示、点击加载的接口路径与失败行内错误态（+toast、按钮恢复可重试）。
+func TestAppJSAuditAndTaskRuns(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const AUDIT_LIMIT = 200;');
+const end = src.indexOf("if ($('btnAuditLoad'))");
+if (start < 0 || end < 0 || end < start) throw new Error('audit section not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: false, className: '', disabled: false });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  $: id => (sinks[id] || mk(id)),
+  Date, isNaN, isFinite, Number, String, Array, Object, Math, JSON,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.__r = {' +
+  ' normalizeAuditEntries, renderAudit, auditActionText, auditUidText, fmtRunTime,' +
+  ' normalizeTaskRuns, renderTaskRuns, loadAudit, loadTaskRuns,' +
+  '};', ctx);
+const R = ctx.__r;
+(async () => {
+  const out = {};
+  out.fmt = {
+    empty: R.fmtRunTime(''),
+    missing: R.fmtRunTime(null),
+    bogus: R.fmtRunTime('not-a-time'),
+    zero: R.fmtRunTime(0),
+    sameSecMs: R.fmtRunTime(1700000000) === R.fmtRunTime(1700000000000),
+    shaped: /^\d\d-\d\d \d\d:\d\d:\d\d$/.test(R.fmtRunTime(1700000000)),
+  };
+  const auditNorm = R.normalizeAuditEntries({ entries: [
+    { ts: 1700000000, ip: '1.2.3.4', action: 'account_remove', uid: '1234567890abcdefXYZ', ok: false, detail: '删凭证失败' },
+    { time: '2026-01-02T03:04:05Z', client_ip: '5.6.7.8', act: 'checkin_all', success: true, message: 'ok' },
+    {},
+  ] });
+  out.auditNorm = {
+    count: auditNorm.length,
+    failOk: auditNorm[0].ok === false,
+    uidShort: R.auditUidText(auditNorm[0].uid),
+    aliasIp: auditNorm[1].ip,
+    aliasOk: auditNorm[1].ok === true,
+    aliasAction: R.auditActionText(auditNorm[1].action),
+    missingOkNull: auditNorm[2].ok === null,
+    missingActionText: R.auditActionText(auditNorm[2].action),
+    missingIp: auditNorm[2].ip,
+    unknownActionText: R.auditActionText('brand_new_action'),
+    notArrayCount: R.normalizeAuditEntries({ entries: 'oops' }).length,
+  };
+  R.renderAudit(auditNorm);
+  const ah = sinks.auditBody.innerHTML;
+  out.auditRender = {
+    stateHidden: sinks.auditState.hidden,
+    tableShown: sinks.auditTable.hidden === false,
+    note: sinks.auditNote.textContent,
+    rows: (ah.match(/<tr>/g) || []).length,
+    cells: (ah.match(/<td/g) || []).length,
+    hasRemoved: ah.indexOf('移除账号') >= 0,
+    hasAllCheckin: ah.indexOf('全部签到') >= 0,
+    hasFail: ah.indexOf('失败') >= 0,
+    hasOk: ah.indexOf('成功') >= 0,
+    hasUnknown: ah.indexOf('<span class="tag mute">—</span>') >= 0,
+    hasDetail: ah.indexOf('删凭证失败') >= 0,
+  };
+  R.renderAudit([]);
+  out.auditEmpty = {
+    stateHidden: sinks.auditState.hidden, stateText: sinks.auditState.textContent,
+    tableHidden: sinks.auditTable.hidden, note: sinks.auditNote.textContent,
+    body: sinks.auditBody.innerHTML,
+  };
+  const runsNorm = R.normalizeTaskRuns({ runs: [
+    { id: 'r1', kind: 'checkin', trigger: 'manual', started_at: 1700000000,
+      finished_at: 1700000060, total: 3, done: 2, fail: 1, skip: 0, error: '' },
+    { task: 'balance', started: 1700000100, count: 5, success: 5, skipped: 0 },
+  ] });
+  out.runsNorm = {
+    count: runsNorm.length,
+    kindAlias: runsNorm[1].kind,
+    triggerMissing: runsNorm[1].trigger,
+    startedAlias: runsNorm[1].started_at,
+    failDefault: runsNorm[1].fail,
+    finishedMissing: runsNorm[1].finished_at,
+    notArrayCount: R.normalizeTaskRuns({ runs: null }).length,
+  };
+  R.renderTaskRuns(runsNorm);
+  const rh = sinks.runsBody.innerHTML;
+  out.runsRender = {
+    stateHidden: sinks.runsState.hidden,
+    tableShown: sinks.runsTable.hidden === false,
+    note: sinks.runsNote.textContent,
+    rows: (rh.match(/<tr>/g) || []).length,
+    cells: (rh.match(/<td/g) || []).length,
+    hasCheckin: rh.indexOf('签到') >= 0,
+    hasBalance: rh.indexOf('刷新余额') >= 0,
+    hasManual: rh.indexOf('手动') >= 0,
+    hasCounts: rh.indexOf('>3<') >= 0 && rh.indexOf('>2<') >= 0 && rh.indexOf('>1<') >= 0 && rh.indexOf('>5<') >= 0,
+    hasErrorDash: rh.indexOf('>—</td>') >= 0,
+  };
+  R.renderTaskRuns([]);
+  out.runsEmpty = {
+    stateHidden: sinks.runsState.hidden, stateText: sinks.runsState.textContent,
+    tableHidden: sinks.runsTable.hidden, note: sinks.runsNote.textContent, body: sinks.runsBody.innerHTML,
+  };
+  let apiPath = '', apiErr = null;
+  const toasts = [];
+  ctx.api = async p => { apiPath = p; if (apiErr) throw new Error('HTTP 500'); return { entries: [{ ts: 0, action: 'login', ok: true }] }; };
+  ctx.toast = (m, c) => toasts.push([m, c || '']);
+  sinks.btnAuditLoad = { textContent: '加载', disabled: false };
+  await R.loadAudit();
+  out.loadAuditOk = { path: apiPath, rows: (sinks.auditBody.innerHTML.match(/<tr>/g) || []).length,
+                      stateHidden: sinks.auditState.hidden, btn: sinks.btnAuditLoad.textContent };
+  apiErr = 'HTTP 500';
+  await R.loadAudit();
+  out.loadAuditErr = { stateHidden: sinks.auditState.hidden, stateClass: sinks.auditState.className,
+                       toast: toasts.length ? toasts[toasts.length - 1][0] : '',
+                       btn: sinks.btnAuditLoad.textContent, btnDisabled: sinks.btnAuditLoad.disabled };
+  let runPath = '';
+  ctx.api = async p => { runPath = p; return { runs: [] }; };
+  sinks.btnRunsLoad = { textContent: '加载', disabled: false };
+  await R.loadTaskRuns();
+  out.loadRuns = { path: runPath, stateHidden: sinks.runsState.hidden,
+                   stateText: sinks.runsState.textContent, btn: sinks.btnRunsLoad.textContent };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"fmt":{"empty":"—","missing":"—","bogus":"—","zero":"—","sameSecMs":true,"shaped":true},` +
+		`"auditNorm":{"count":3,"failOk":true,"uidShort":"1234567890abcdef…","aliasIp":"5.6.7.8",` +
+		`"aliasOk":true,"aliasAction":"全部签到","missingOkNull":true,"missingActionText":"—",` +
+		`"missingIp":"","unknownActionText":"brand_new_action","notArrayCount":0},` +
+		`"auditRender":{"stateHidden":true,"tableShown":true,"note":"最近 3 条","rows":3,"cells":18,` +
+		`"hasRemoved":true,"hasAllCheckin":true,"hasFail":true,"hasOk":true,"hasUnknown":true,"hasDetail":true},` +
+		`"auditEmpty":{"stateHidden":false,"stateText":"暂无审计记录（面板写操作成功后会自动留痕）",` +
+		`"tableHidden":true,"note":"—","body":""},` +
+		`"runsNorm":{"count":2,"kindAlias":"balance","triggerMissing":"","startedAlias":1700000100,` +
+		`"failDefault":0,"finishedMissing":"","notArrayCount":0},` +
+		`"runsRender":{"stateHidden":true,"tableShown":true,"note":"最近 2 条","rows":2,"cells":18,` +
+		`"hasCheckin":true,"hasBalance":true,"hasManual":true,"hasCounts":true,"hasErrorDash":true},` +
+		`"runsEmpty":{"stateHidden":false,"stateText":"暂无任务执行记录（批量任务/单号任务结束后自动记录）",` +
+		`"tableHidden":true,"note":"—","body":""},` +
+		`"loadAuditOk":{"path":"audit?limit=200","rows":1,"stateHidden":true,"btn":"加载"},` +
+		`"loadAuditErr":{"stateHidden":false,"stateClass":"state err",` +
+		`"toast":"读取操作审计失败：HTTP 500","btn":"加载","btnDisabled":false},` +
+		`"loadRuns":{"path":"task_runs?limit=100","stateHidden":false,` +
+		`"stateText":"暂无任务执行记录（批量任务/单号任务结束后自动记录）","btn":"加载"}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("审计/任务历史渲染=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelAuditTaskRunsWiring 审计/任务历史 + 两个 P2 修复的源码接线：
+// 控件 id 双侧存在、接口路径/limit 正确、只在点击时拉取（无轮询）、
+// 账号集合变更分支统一走 refreshAccountPoolAfterMutation（会补拉全量 overview）、
+// page_size=0 截断提示元素已接入。
+func TestPanelAuditTaskRunsWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		"const AUDIT_LIMIT = 200;",
+		"const TASK_RUNS_LIMIT = 100;",
+		"api('audit?limit=' + AUDIT_LIMIT)",
+		"api('task_runs?limit=' + TASK_RUNS_LIMIT)",
+		"function normalizeAuditEntries(",
+		"function normalizeTaskRuns(",
+		"function renderAudit(",
+		"function renderTaskRuns(",
+		"$('btnAuditLoad').onclick = loadAudit;",
+		"$('btnRunsLoad').onclick = loadTaskRuns;",
+		// P2-1：账号集合变更统一收尾（当前页 + 静默补拉全量 overview）。
+		"function refreshFullOverviewInBackground(",
+		"function refreshAccountPoolAfterMutation(",
+		"ensureFullOverview(true, true)",
+		// P2-2：page_size=0 被 2000 上限截断时的提示。
+		"const ACC_MAX_PAGE_SIZE = 2000;",
+		"$('accTruncHint').hidden = !truncated;",
+		"建议用筛选或分页",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 缺少 %q", want)
+		}
+	}
+	// 只读区块只在点击时拉取：函数定义各 1 处、无 setInterval 轮询。
+	if n := strings.Count(j, "loadAudit()"); n != 1 {
+		t.Errorf("app.js 出现 %d 处 loadAudit()（应只有函数定义，仅点击触发）", n)
+	}
+	if n := strings.Count(j, "loadTaskRuns()"); n != 1 {
+		t.Errorf("app.js 出现 %d 处 loadTaskRuns()（应只有函数定义，仅点击触发）", n)
+	}
+	for _, forbidden := range []string{"setInterval(loadAudit", "setInterval(loadTaskRuns"} {
+		if strings.Contains(j, forbidden) {
+			t.Errorf("审计/任务历史不应轮询：%q", forbidden)
+		}
+	}
+	// 账号集合变更的 4 个分支（删号/重扫/登录成功/导入成功）+ 定义 = ≥5 处引用。
+	if n := strings.Count(j, "refreshAccountPoolAfterMutation("); n < 5 {
+		t.Errorf("refreshAccountPoolAfterMutation 引用 %d 处（定义 + 删号/重扫/登录/导入 至少 5 处）", n)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{
+		`id="accTruncHint"`,
+		`id="auditBox"`, `id="btnAuditLoad"`, `id="auditTable"`, `id="auditBody"`,
+		`id="auditState"`, `id="auditNote"`,
+		`id="runsBox"`, `id="btnRunsLoad"`, `id="runsTable"`, `id="runsBody"`,
+		`id="runsState"`, `id="runsNote"`,
+		"操作审计", "任务执行历史", "来源 IP", "触发", "跳过",
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺少 %q", want)
+		}
 	}
 }

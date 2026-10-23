@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
@@ -66,6 +67,10 @@ type Config struct {
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
+	// RollbackConfig 用上一版配置备份（config.json.bak）恢复并热应用，返回需要重启
+	// 才能生效的字段列表（v2.2.0 #15：POST /panel/api/config/rollback）。nil 时回滚
+	// 接口返回 501；无备份/备份非法等用户可纠正的错误由 handler 映射 400。
+	RollbackConfig func() (restartRequired []string, err error)
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
@@ -82,6 +87,12 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// StateFile state.json 路径（v2.2.0 #5/#9）：面板侧 JSONL 落盘目录由它推导
+	// （审计 panel-audit.jsonl 与任务历史 task-runs.jsonl 与 state 同目录，
+	// 与 usage/request-logs 同一口径）。为空时回落 ConfigPath 推导（见 panelDataDir）。
+	// main.go 装配一行：StateFile: cfg.StateFile（由 Lead 合入；不改本包之外的代码）。
+	StateFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -111,6 +122,17 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// apiRequests 面板 API 请求计数（v2.2.0 #8：/panel/api/* 全部计入，含 401/429；
+	// 仅作 /metrics 的 workbuddy_panel_requests_total 展示）。
+	apiRequests atomic.Int64
+
+	// dataDir 面板自有 JSONL 落盘目录（审计/任务历史与 state 文件同目录）；空 = 未装配，
+	// 两项旁路功能自动关闭（测试与只读装配不产生副作用文件）。
+	dataDir string
+	// auditLog 操作审计 JSONL（v2.2.0 #5）；taskRunsLog 任务执行历史 JSONL（#9）。
+	auditLog    *jsonlLog
+	taskRunsLog *jsonlLog
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -153,6 +175,9 @@ func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
 		cfg.RedisMode = "noop"
 	}
+	// 面板侧 JSONL（审计/任务历史）落盘目录：与 state 文件同目录；未装配 StateFile 时
+	// 回落 ConfigPath 推导；两者都空 = 功能关闭（不落盘，测试无副作用）。
+	dataDir := panelDataDir(cfg.StateFile, cfg.ConfigPath)
 	p := &Panel{
 		cfg:          cfg,
 		mux:          http.NewServeMux(),
@@ -160,6 +185,9 @@ func New(cfg Config) *Panel {
 		logs:         NewRing(500),
 		logins:       map[string]loginSession{},
 		authFailures: newAuthFailLimiter(authFailLimiterMaxIPs),
+		dataDir:      dataDir,
+		auditLog:     newJSONLLog(joinDataFile(dataDir, auditFileName)),
+		taskRunsLog:  newJSONLLog(joinDataFile(dataDir, taskRunsFileName)),
 	}
 	p.routes()
 	return p
@@ -173,6 +201,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
 	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
+
+	// ---- 只读接口 ----
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	// v2.1 #1：账号池列表服务端分页/筛选/排序/字段裁剪/ETag（与 /overview 旧接口并存，
 	// 旧接口语义零变化）。放在 /accounts/{uid}/... 之前只是可读性，ServeMux 按路径匹配。
@@ -182,40 +212,64 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
-	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
-	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
+	// v2.2.0 #8 可观测（readyz/metrics）+ #5/#9 查询接口（审计/任务历史，新在前）。
+	p.mux.HandleFunc("GET /panel/api/readyz", p.withAuth(p.readyz))
+	p.mux.HandleFunc("GET /panel/api/metrics", p.withAuth(p.metrics))
+	p.mux.HandleFunc("GET /panel/api/audit", p.withAuth(p.auditHandler))
+	p.mux.HandleFunc("GET /panel/api/task_runs", p.withAuth(p.taskRunsHandler))
+
+	// ---- 写操作 ----
+	// v2.2.0 #5：统一经 withAudit 包一层落操作审计（成功/失败都记，detail 取响应
+	// 错误/提示文案）。action 枚举见 audit.go；只有写操作审计，GET 只读不记。
+	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.withAudit(auditActionLoginStart, p.loginStart)))
+	// OAuth 登录轮询是 GET，但完成时会创建账号：只在「完成/失败」时记一条，pending
+	// 每 3s 的轮询不记，避免审计文件被轮询噪音淹没。
+	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.withAuditConditional(auditActionLogin,
+		func(ar *auditResponse) bool {
+			if ar.status >= 400 {
+				return true
+			}
+			done, _ := responseJSONBool(ar.body.Bytes(), "done")
+			return done
+		}, p.loginPoll)))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
-	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
-	p.mux.HandleFunc("POST /panel/api/accounts/rescan", p.withAuth(p.accountsRescan))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.withAudit(auditActionImport, p.importCockpit)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.withAudit(auditActionAccountRevive, p.accountRevive)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.withAudit(auditActionAccountDisable, p.accountDisable)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.withAudit(auditActionAccountPause, p.accountPause)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.withAudit(auditActionAccountResume, p.accountResume)))
+	p.mux.HandleFunc("POST /panel/api/accounts/rescan", p.withAuth(p.withAudit(auditActionAccountsRescan, p.accountsRescan)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.withAudit(auditActionAccountCheckin, p.accountCheckin)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.withAudit(auditActionAccountBalance, p.accountBalance)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.withAudit(auditActionAccountRemove, p.accountRemove)))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.accountTaskClaim))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.accountTaskAuto))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/run", p.withAuth(p.accountTasksRun))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.withAudit(auditActionTaskAccept, p.accountTaskAccept)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.withAudit(auditActionTaskAcceptAll, p.taskAcceptAll)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.withAudit(auditActionTaskClaim, p.accountTaskClaim)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.withAudit(auditActionTaskAuto, p.accountTaskAuto)))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.withAudit(auditActionTaskAutoAll, p.accountTaskAutoAll)))
+	// 单账号「做任务」= 审计（人的操作）+ 任务历史（执行结果，v2.2.0 #9）。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/run", p.withAuth(
+		p.withAudit(auditActionTasksRun, p.withTaskRunCapture(taskKindTasksRun, taskTriggerManual, p.accountTasksRun))))
+	// 扫描只读、不产生副作用：不审计（生产上由任务中心按钮触发，只读上游）。
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
-	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
+	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.withAudit(auditActionTasksRunQueue, p.tasksRunQueue)))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
-	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
-	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
-	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
-	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
-	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.withAudit(auditActionCheckinAll, p.checkinAll)))
+	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.withAudit(auditActionTravelAll, p.travelAll)))
+	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.withAudit(auditActionActivityAll, p.activityAll)))
+	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.withAudit(auditActionKeepaliveAll, p.keepaliveAll)))
+	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.withAudit(auditActionBalanceAll, p.balanceAll)))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
-	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.withAudit(auditActionUsageSave, p.usageSave)))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
-	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// v2.2.0 #15：一键回滚（恢复 config.json.bak 并热应用）。走 config_save 同一
+	// 审计通道（动作名 config_rollback），成功/失败都留痕。
+	p.mux.HandleFunc("POST /panel/api/config/rollback", p.withAuth(p.withAudit(auditActionConfigRollback, p.rollbackConfig)))
+	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.withAudit(auditActionConfigSave, p.saveConfig)))
 }
 
 // ServeHTTP 统一入口：先写安全响应头，再按来源 IP 做鉴权失败限速前置，最后
@@ -224,6 +278,10 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	// 压缩能力声明对所有面板响应生效（含未压缩的小响应与 304），便于反代/CDN 正确分桶缓存。
 	w.Header().Set("Vary", "Accept-Encoding")
+	// v2.2.0 #8：面板 API 请求计数（/metrics 展示；含 401/429，反映真实到达量）。
+	if isPanelAPIPath(r.URL.Path) {
+		p.apiRequests.Add(1)
+	}
 
 	// 鉴权失败限速前置：被限的 IP 暂时连正确 key 也回 429，客户端按 Retry-After 退避。
 	// 只作用于 /panel/api/*：页面本身无秘密、可匿名加载，不必一并掐掉（否则被限 IP
@@ -1139,6 +1197,9 @@ func (p *Panel) accountsRescan(w http.ResponseWriter, r *http.Request) {
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
+//
+// v2.2.0 #9：收尾写一条任务执行历史（kind=checkin，trigger=manual，total=1）——
+// 企业版（无签到体系）记 skip，上游拒绝记 fail，成功/幂等已签记 done。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -1148,10 +1209,28 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
+	started := time.Now()
+	fail, skip := 0, 0
+	defer func() {
+		done := 0
+		if fail == 0 && skip == 0 {
+			done = 1
+		}
+		errMsg := ""
+		if fail > 0 {
+			errMsg = checkinMsg
+		}
+		p.recordTaskRun(TaskRun{
+			Kind: taskKindCheckin, Trigger: taskTriggerManual, UID: uid,
+			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
+			Total: 1, Done: done, Fail: fail, Skip: skip, Error: errMsg,
+		})
+	}()
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
 	if a.IsEnterprise() {
+		skip = 1
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
@@ -1159,6 +1238,8 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
+		} else {
+			fail = 1
 		}
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)
@@ -1193,6 +1274,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
+// v2.2.0 #9：收尾写一条任务执行历史（kind=balance，trigger=manual，total=1）。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -1200,8 +1282,24 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	started := time.Now()
+	refreshErr := ""
+	defer func() {
+		done, fail := 0, 0
+		if refreshErr == "" {
+			done = 1
+		} else {
+			fail = 1
+		}
+		p.recordTaskRun(TaskRun{
+			Kind: taskKindBalance, Trigger: taskTriggerManual, UID: uid,
+			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
+			Total: 1, Done: done, Fail: fail, Error: refreshErr,
+		})
+	}()
 	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
+		refreshErr = err.Error()
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
@@ -1259,77 +1357,65 @@ func writeBatchConflict(w http.ResponseWriter, msg string) {
 }
 
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
+//
+// v2.2.0 #9：单飞 gate/异步/409 语义不变，统一改走 triggerBatchTask——任务结束
+// 后写一条任务执行历史（kind=checkin，trigger=manual；调度器内部逐号统计 panel
+// 侧拿不到，历史里只记触发时账号总数与起止时间）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 	sch := p.cfg.Scheduler
 	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !sch.BeginTask(scheduler.TaskCheckin) {
+	if !p.triggerBatchTask(sch, scheduler.TaskCheckin, taskKindCheckin, sch.RunCheckinNow) {
 		writeBatchConflict(w, "全量签到正在执行中，请等本轮结束后再试")
 		return
 	}
-	go func() {
-		defer sch.EndTask(scheduler.TaskCheckin)
-		sch.RunCheckinNow()
-	}()
 	log.Printf("panel: 手动全量签到已触发（含连登管家；后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// travelAll 手动触发全量猫猫旅行巡检（异步执行）。
+// travelAll 手动触发全量猫猫旅行巡检（异步执行；任务历史 kind=travel）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	sch := p.cfg.Scheduler
 	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !sch.BeginTask(scheduler.TaskTravel) {
+	if !p.triggerBatchTask(sch, scheduler.TaskTravel, taskKindTravel, sch.RunTravelNow) {
 		writeBatchConflict(w, "全量旅行巡检正在执行中，请等本轮结束后再试")
 		return
 	}
-	go func() {
-		defer sch.EndTask(scheduler.TaskTravel)
-		sch.RunTravelNow()
-	}()
 	log.Printf("panel: 手动全量旅行巡检已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
+// activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置；任务历史 kind=activity）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 	sch := p.cfg.Scheduler
 	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !sch.BeginTask(scheduler.TaskActivity) {
+	if !p.triggerBatchTask(sch, scheduler.TaskActivity, taskKindActivity, sch.RunActivityNow) {
 		writeBatchConflict(w, "全量活跃上报正在执行中，请等本轮结束后再试")
 		return
 	}
-	go func() {
-		defer sch.EndTask(scheduler.TaskActivity)
-		sch.RunActivityNow()
-	}()
 	log.Printf("panel: 手动全量活跃上报已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// keepaliveAll 手动触发全量 token 保活（异步执行）。
+// keepaliveAll 手动触发全量 token 保活（异步执行；任务历史 kind=keepalive）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	sch := p.cfg.Scheduler
 	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !sch.BeginTask(scheduler.TaskKeepalive) {
+	if !p.triggerBatchTask(sch, scheduler.TaskKeepalive, taskKindKeepalive, sch.RunKeepaliveNow) {
 		writeBatchConflict(w, "全量 token 保活正在执行中，请等本轮结束后再试")
 		return
 	}
-	go func() {
-		defer sch.EndTask(scheduler.TaskKeepalive)
-		sch.RunKeepaliveNow()
-	}()
 	log.Printf("panel: 手动全量保活已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -1339,21 +1425,20 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 // schedule.balance_refresh_concurrency 有界并发查上游、写回池内 credits（含解冻
 // 语义）并同步昵称——不再让 HTTP 请求挂到全池刷完（1146 号池会触发反代 504）。
 // 重复点击/后台周期刷新撞车 → 409。前端补拉 overview 获取结果。
+// v2.2.0 #9：任务历史 kind=balance（含昵称同步这一步的总时长）。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	sch := p.cfg.Scheduler
 	if sch == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	if !sch.BeginTask(scheduler.TaskBalance) {
+	if !p.triggerBatchTask(sch, scheduler.TaskBalance, taskKindBalance, func() {
+		sch.RunBalanceRefreshNow()
+		p.syncNicknames()
+	}) {
 		writeBatchConflict(w, "全量余额刷新正在执行中，请等本轮结束后再试")
 		return
 	}
-	go func() {
-		defer sch.EndTask(scheduler.TaskBalance)
-		sch.RunBalanceRefreshNow()
-		p.syncNicknames()
-	}()
 	log.Printf("panel: 手动全量余额刷新已触发（后台执行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }

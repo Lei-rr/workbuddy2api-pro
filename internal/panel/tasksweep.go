@@ -25,6 +25,7 @@ package panel
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 )
@@ -42,7 +43,11 @@ type TaskSweepStats struct {
 
 // RunTaskSweepOnce 对所有账号做一轮幂等补领清扫（账号间并发、账号内串行）。
 // 由 scheduler 的 ticker 调用（详见 scheduler.StartTaskSweep）。
+//
+// v2.2.0 #9：本轮确有动作/错误时（与日志同条件，避免空转轮次刷屏）写一条任务
+// 执行历史：kind=catch_up、trigger=schedule；done = 接受成功数 + 领奖成功数。
 func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
+	started := time.Now()
 	var st TaskSweepStats
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -75,6 +80,11 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 {
 		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 接受 %d · 领奖 %d · +%d 分 +%d 能 · 出错 %d",
 			st.Accounts, st.Skipped, st.Accepted, st.Claimed, st.Credits, st.Energy, st.Errors)
+		p.recordTaskRun(TaskRun{
+			Kind: taskKindCatchUp, Trigger: taskTriggerSchedule,
+			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
+			Total: st.Accounts, Done: st.Accepted + st.Claimed, Fail: st.Errors, Skip: st.Skipped,
+		})
 	}
 	return st
 }

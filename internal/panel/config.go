@@ -55,3 +55,30 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		"restart_required": restartRequired,
 	})
 }
+
+
+// rollbackConfig 一键回滚（v2.2.0 #15）：用 config.json.bak 恢复上一版配置。
+//
+// 校验/写盘/热应用由 main 注入的 RollbackConfig 闭包完成（与保存同一套流程：
+// 校验 → 原子替换 → 热应用 → 返回需重启字段）；错误统一回 400——无备份、备份
+// 被手工改坏都属用户可纠正的问题，错误文案可直接展示。
+func (p *Panel) rollbackConfig(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RollbackConfig == nil {
+		writeErr(w, http.StatusNotImplemented, "config rollback not available")
+		return
+	}
+	restartRequired, err := p.cfg.RollbackConfig()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if restartRequired == nil {
+		restartRequired = []string{}
+	}
+	log.Printf("panel: 配置已从备份回滚（热生效完成；需重启字段 %d 个）", len(restartRequired))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"restart_required": restartRequired,
+		"backup":           "config.json.bak",
+	})
+}

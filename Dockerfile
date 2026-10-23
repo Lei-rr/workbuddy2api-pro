@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+FROM golang:1.24-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+# go.mod 与 go.sum 一起 COPY：依赖层缓存可稳定命中（缺 go.sum 时 go mod download
+# 依赖「自动补 go.sum」的隐式行为，缓存键与校验语义都不清晰）。
+COPY go.mod go.sum ./
 # 防止因为直接使用官方源导致下载失败
 RUN go env -w GOPROXY=https://goproxy.cn,direct && \
     go env GOPROXY && \

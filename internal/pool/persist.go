@@ -1,9 +1,10 @@
-// 持久化：本地 state.json 落盘/加载、Redis 快照镜像（StoreSnapshotter）、
-// 后台 flusher、择新恢复（RestoreFromSnapshot）。
+// 持久化：本地 state.json 落盘/加载、滚动备份与损坏回退（v2.2 #13）、
+// Redis 快照镜像（StoreSnapshotter）、后台 flusher、择新恢复（RestoreFromSnapshot）。
 package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,6 +14,10 @@ import (
 )
 
 var flushInterval = 5 * time.Second
+
+// backupSuffix state.json 滚动备份的后缀（保留最近 1 份；v2.2 #13）。
+// 每次主文件**写成功后**把上一版内容复制到这里；主文件损坏时 load 自动回退。
+const backupSuffix = ".bak"
 
 // persistLogEvery 连续落盘失败每 N 次打一条提醒（flusher 5s 一把 ≈ 1 分钟一次），
 // 避免磁盘持续满/权限丢失时日志刷屏。
@@ -116,18 +121,72 @@ func (p *Pool) Flush() {
 	p.mu.Unlock()
 }
 
-// Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// backupPath 返回 state.json 的滚动备份路径（保留最近 1 份）。
+func (p *Pool) backupPath() string { return p.stateFp + backupSuffix }
+
+// load 从本地 state.json 恢复池状态（New 构造期调用，此时无并发，不持 p.mu）。
+//
+// v2.2 #13 可靠性：
+//   - 首次运行（文件不存在）静默返回；
+//   - 主文件不可读 / JSON 损坏 → 打 ERROR/WARN，**隔离坏文件**（.corrupt-<ts>，
+//     保留人工抢救价值，避免下一次 flush 用空状态静默覆盖证据），再尝试 .bak；
+//   - .bak 有效 → 恢复并立即回写主文件；.bak 也无效 → 空池启动（与引入前一致，
+//     不 fatal，进程仍可用）。
 func (p *Pool) load() {
 	raw, err := os.ReadFile(p.stateFp)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return // 首次运行：无 state.json 属正常
+		}
+		log.Printf("WARN: pool: 读取 state.json 失败（尝试 .bak 恢复）: %v", err)
+		p.loadBackup("主文件不可读")
 		return
 	}
 	var sf stateFile
-	if json.Unmarshal(raw, &sf) != nil {
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		log.Printf("ERROR: pool: state.json 解析失败（文件损坏）: %v（尝试 .bak 恢复）", err)
+		p.quarantineCorrupt()
+		p.loadBackup("主文件损坏")
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
 	p.restoreSchedulingLocked(sf.Scheduling)
+}
+
+// quarantineCorrupt 把损坏的 state.json 改名隔离为 state.json.corrupt-<UnixNano>。
+// 改名失败只 WARN（退化为旧行为：主文件随后可能被下一次 flush 覆盖）——隔离是
+// 尽力而为的抢救措施，不能反过来阻断启动。
+func (p *Pool) quarantineCorrupt() {
+	bad := fmt.Sprintf("%s.corrupt-%d", p.stateFp, time.Now().UnixNano())
+	if err := os.Rename(p.stateFp, bad); err != nil {
+		log.Printf("WARN: pool: 隔离损坏的 state.json 失败: %v（下次落盘会覆盖它，建议尽快手工备份）", err)
+		return
+	}
+	log.Printf("WARN: pool: 损坏的 state.json 已隔离为 %s（保留抢救价值；可人工修复后改名回主文件）", filepath.Base(bad))
+}
+
+// loadBackup 主文件不可用时尝试 state.json.bak 恢复。
+// 恢复成功后置 dirty 并立即回写主文件（下一次重启不再依赖损坏的主文件；损坏文件
+// 已隔离时主文件不存在 → saveLocked 不会滚动覆盖 .bak）；.bak 缺失/损坏 → 空池
+// 启动（保持引入前「损坏即空池」的非 fatal 语义，但已打 WARN + 隔离证据）。
+func (p *Pool) loadBackup(reason string) {
+	bakRaw, err := os.ReadFile(p.backupPath())
+	if err != nil {
+		log.Printf("WARN: pool: %s，且无可用 state.json.bak（%v）：以空池启动（数据目录请人工检查）", reason, err)
+		return
+	}
+	var sf stateFile
+	if err := json.Unmarshal(bakRaw, &sf); err != nil {
+		log.Printf("WARN: pool: %s，且 state.json.bak 同样不可解析（%v）：以空池启动", reason, err)
+		return
+	}
+	p.applyAccountsLocked(sf.Accounts)
+	p.restoreSchedulingLocked(sf.Scheduling)
+	p.dirty.Store(true)
+	log.Printf("WARN: pool: 已从 state.json.bak 恢复 %d 个账号（%s）；主文件将按恢复后状态重写",
+		len(sf.Accounts), reason)
+	// 立即回写主文件。构造期（New）调用，flusher 尚未启动，无并发。
+	p.saveLocked()
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -250,6 +309,12 @@ func (p *Pool) saveLocked() {
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
+	// 先读上一版内容（用于写成功后的滚动备份）。读失败 = 首次写盘或文件不可读，
+	// 此时没有可滚动的旧版本——备份缺失不阻断主写入。
+	var prev []byte
+	if b, rerr := os.ReadFile(p.stateFp); rerr == nil {
+		prev = b
+	}
 	tmp := p.stateFp + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
@@ -259,6 +324,9 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
+	// 主文件已成功落盘 → 才把上一版滚动为 .bak。写失败路径在上面直接返回，
+	// 绝不覆盖上一份可用备份（「备份只在写成功后更新」）。
+	p.rotateBackupLocked(prev)
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -270,6 +338,26 @@ func (p *Pool) saveLocked() {
 		if err == nil {
 			p.store.SaveState(snapRaw)
 		}
+	}
+}
+
+// rotateBackupLocked 把上一版 state.json 内容滚动写入 state.json.bak（保留最近 1 份）。
+// 只在主文件写成功后调用；备份本身用 tmp+rename 原子替换，写/改名失败只 WARN
+// （主文件已成功，备份是附加保险，不能反过来把主状态标记为落盘失败）。
+// 调用方必须已持有 p.mu（saveLocked 同锁）。
+func (p *Pool) rotateBackupLocked(prev []byte) {
+	if len(prev) == 0 {
+		return // 首次写盘 / 旧文件为空：没有可滚动的上一版
+	}
+	bak := p.backupPath()
+	tmp := bak + ".tmp"
+	if err := os.WriteFile(tmp, prev, 0o600); err != nil {
+		log.Printf("WARN: pool: 写 state.json.bak 失败（主文件已成功落盘）: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, bak); err != nil {
+		log.Printf("WARN: pool: 替换 state.json.bak 失败（主文件已成功落盘）: %v", err)
+		_ = os.Remove(tmp)
 	}
 }
 

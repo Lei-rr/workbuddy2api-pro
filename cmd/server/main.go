@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,7 +34,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.1.0-pro"
+const appVersion = "2.2.0-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -88,6 +89,13 @@ func main() {
 		log.Printf("WARN: panel.api_key 未配置，面板与网关共用同一把 api_key（建议分离；panel.api_key 变更需重启）")
 	case cfg.Security.AllowAnonymous:
 		log.Printf("WARN: api_key 与 panel.api_key 均为空且 security.allow_anonymous=true：网关与面板均无鉴权（仅限可信网络）")
+	}
+
+	// v2.2 #13 启动自检（warn 而非 fatal）：auth_dir / state 目录可写性 + 磁盘水位。
+	// 容器/宿主挂载与权限问题很常见，直接拒绝启动会让用户失去管理面板这个排查入口；
+	// 逐条 WARN + 修复提示，把是否继续的决定权留给用户。
+	for _, warning := range startupSelfCheck(cfg.AuthDir, cfg.StateFile) {
+		log.Printf("WARN: %s", warning)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -345,13 +353,21 @@ func main() {
 		PollIntervalSec: cfg.Panel.PollIntervalSec,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
+		ProbeFile: stateSibling(cfg.StateFile, "output_probes.json"),
+		// v2.2.0 #5/#9：面板操作审计与任务执行历史 JSONL 与 state 同目录
+		// （data/panel-audit.jsonl、data/task-runs.jsonl）。
+		StateFile:  cfg.StateFile,
 		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch)
+		},
+		// v2.2.0 #15：一键回滚（POST /panel/api/config/rollback）——用 config.json.bak
+		// 恢复并热应用；与保存共用 applyConfigRuntime，热生效范围一致。
+		RollbackConfig: func() ([]string, error) {
+			return rollbackConfig(*cfgPath, live, p, up, sch)
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -389,9 +405,20 @@ func main() {
 		ModelsHidden: cfg.Models.Hidden,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go sch.Run(ctx)
+	// v2.2 #14 优雅停机：显式信号通道（不用 signal.NotifyContext——需要两级语义：
+	// 第一次信号走优雅停机，停机期间再按一次立即强制退出）。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 后台任务登记：停机时先 cancel 让它们不再取新任务，再等待收敛
+	//（收敛上限由 server.shutdown_timeout 的同一时间预算兜底）。
+	// 注：sch.StartBalanceRefresh/StartTaskSweep 在 scheduler 包内部另起 goroutine，
+	// 随 ctx 取消退出但不纳入本 WaitGroup（scheduler 不在本任务改动范围）；
+	// 其手头若有正在跑的上游请求，最坏被进程退出截断，最终 state 仍会在停机时落盘。
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
+	go func() { defer bgWG.Done(); sch.Run(ctx) }()
+	go func() { defer bgWG.Done(); warmModelRates(ctx, up, p) }()
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
@@ -400,9 +427,7 @@ func main() {
 	// ModelRate 恒返回空串——积分保底的目录兜底在这段空窗期内形同虚设，触底号
 	// 会被当成「收费未知」放行并打穿（实测：重启后 2 分钟，97 分的账号打收费
 	// 模型归零；倍率表当时尚未建立）。
-	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
-	go warmModelRates(ctx, up, p)
-
+	// 已在上面以「可收敛的后台任务」登记（bgWG）：优雅停机时随 ctx 取消，不得拖住退出。
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
@@ -418,18 +443,69 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
-	go func() {
-		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
+	// 显式 goroutine Serve：主 goroutine 负责信号编排（Shutdown 会让 Serve 返回
+	// http.ErrServerClosed，由主 goroutine 按停机流程处理）。
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+
+	// 缓冲 2：第一次信号触发优雅停机；停机等待期间再收到一次信号立即强退。
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	log.Printf("workbuddy2api-pro listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	log.Printf("优雅停机：SIGINT/SIGTERM 后等待在途请求至多 %s（server.shutdown_timeout；期间再次收到信号立即强退）", cfg.ShutdownTimeoutDur)
+
+	var (
+		shutdownStart time.Time
+		shutdownRes   shutdownResult
+	)
+	select {
+	case err := <-serveErr:
+		// Serve 自身返回（非本进程 Shutdown 触发）→ 监听失败等致命错误，直接退出。
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			cancel()
+			log.Fatalf("http: %v", err)
+		}
+		// 理论上不可达（Shutdown 只由下方信号分支触发）：保守按停机流程收尾。
+		shutdownStart = time.Now()
+		shutdownRes = gracefulShutdown(shutdownDeps{
+			Shutter:    srv,
+			Cancel:     cancel,
+			Background: &bgWG,
+			Flush:      p.Flush,
+			Timeout:    cfg.ShutdownTimeoutDur,
+		})
+	case sig := <-sigCh:
+		shutdownStart = time.Now()
+		log.Printf("收到退出信号 %v：开始优雅停机（上限 %s）", sig, cfg.ShutdownTimeoutDur)
+		// 二次信号：不再等待，立即强制退出。130 = 128+SIGINT 的约定俗成退出码。
+		go func() {
+			sig2 := <-sigCh
+			log.Printf("再次收到退出信号 %v：立即强制退出（在途请求/未落盘计数可能丢失）", sig2)
+			os.Exit(130)
+		}()
+		shutdownRes = gracefulShutdown(shutdownDeps{
+			Shutter:    srv,
+			Cancel:     cancel,
+			Background: &bgWG,
+			Flush:      p.Flush,
+			Timeout:    cfg.ShutdownTimeoutDur,
+		})
 	}
+
+	// 最终资源收尾：观测账本（usage/reqlog）→ 会话 GC → 池状态/Redis 异步写。
+	// 与 main 顶部 defer 的兜底重复调用是安全的（各处 Stop/Close 均幂等）。
+	rec.Stop()
+	requestLog.Close()
+	if sessRouter != nil {
+		sessRouter.StopGC()
+	}
+	p.Close()
+	_ = store.Close()
+
+	log.Printf("graceful shutdown complete in %dms（在途请求超时=%v，后台任务已收敛=%v）",
+		time.Since(shutdownStart).Milliseconds(), shutdownRes.TimedOut, shutdownRes.BackgroundDone)
 	log.Printf("bye")
 }
 
@@ -528,84 +604,32 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := rejectClearingAPIKey(cur, incoming, newCfg); err != nil {
 		return nil, err
 	}
+	// 2.2) 危险值拦截（v2.2.0 #15，逻辑见 config_backup.go）：auth_dir/state_file 不
+	// 允许保存为空；listen 的监听面（回环 ↔ 非回环）允许改但写审计日志，便于事后
+	// 追溯公网暴露操作。oldRaw 是保存前原文（merge 已原地改写 cur，不能拿 cur 判旧值）。
+	if err := verifyDangerousConfigValues(newCfg); err != nil {
+		return nil, err
+	}
+	if note := listenChangeAuditNote(oldRaw, newCfg.Listen); note != "" {
+		log.Printf("panel: 配置保存 %s", note)
+	}
 
-	// 3) 落盘（原子替换）。
+	// 3) 落盘：先备份当前生效版本（config.json.bak，v2.2.0 #15 回滚点），再原子替换。
+	//    校验失败已在上面的 2.x 提前返回，不会触碰 .bak；写盘失败时 .bak 仍是当前生效版本。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
+	if _, err := backupConfigFile(path); err != nil {
+		return nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if openErr != nil {
-			_ = os.Remove(tmp)
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
-		}
-		_, writeErr := f.Write(out)
-		if writeErr == nil {
-			writeErr = f.Sync()
-		}
-		closeErr := f.Close()
-		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
-		// 可手工恢复）；写成功才清理。
-		if writeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
-		}
-		_ = os.Remove(tmp)
-		if closeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
-		}
+	if err := writeConfigAtomic(path, out); err != nil {
+		return nil, err
 	}
 
-	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
-		PollIntervalSec:      newCfg.Panel.PollIntervalSec,
-	})
-	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
-	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
-	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
-	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
-	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
-	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
-	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
-	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
-	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
-	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
-	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
-	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
-	sch.Reconfigure(
-		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
-		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		newCfg.Schedule.GrowthHours,
-		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
-		!newCfg.Schedule.GrowthEnabled)
-	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
-	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
-	// v2.0.1 #10/#11：余额刷新并发上限与补跑窗口均支持热生效（下一轮读新值）；
-	// 启动首刷的延迟/强制开关只在 StartBalanceRefresh 启动时消费一次，列入
-	// restartRequiredFields 提示重启。
-	sch.SetBalanceRefreshConcurrency(newCfg.Schedule.BalanceRefreshConcurrency)
-	sch.SetCatchUpMinutes(newCfg.Schedule.CatchUpMinutes)
-
-	return restartRequiredFields(newCfg), nil
+	// 4) 热应用（与 rollbackConfig 共用 config_backup.go 的 applyConfigRuntime，
+	//    保存/回滚的热生效范围保证一致）。
+	return applyConfigRuntime(newCfg, live, p, up, sch), nil
 }
 
 // rejectClearingAPIKey 拦截「把网关 api_key 保存为空」（v2.0.1 #4-2）。
@@ -669,6 +693,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// v2.2 #14：优雅停机时限只在启动时读取一次（进入 http.Server 停机编排），
+	// 运行期热改无效，改后需重启 → 列入重启清单。
+	out = append(out, "server.shutdown_timeout")
 	// panel.api_key 在装配期进入 panel.Config（面板鉴权读取的静态字段），运行期
 	// 不再读配置——热改会让「面板认新 key、进程内旧实例认旧 key」错位，故要求重启。
 	// panel.poll_interval_sec 走 livecfg 快照热生效，不在此列。

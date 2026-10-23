@@ -34,6 +34,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # 显式声明 Go module/build 缓存（setup-go v5 默认开启，依赖 go.sum 命中；
+          # 写出来是为了让「依赖层缓存」成为 workflow 契约的一部分，不随默认值变化漂移）。
+          cache: true
+      # 显式 go vet（go test 只跑 vet 子集，不会覆盖组装约束/可疑代码）：与 test 同 job，
+      # 任一失败即红。gofmt 检查暂不加入：HEAD 基线有 15 个历史文件未 gofmt（非本版引入），
+      # 等一次性 gofmt 清理提交后再开闸。
+      - run: go vet ./...
       # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
       - run: go test ./...
 
@@ -54,6 +61,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
       - name: 取源码版本号
         id: ver

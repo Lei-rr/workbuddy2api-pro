@@ -136,6 +136,7 @@ type queueState struct {
 	mu        sync.Mutex
 	running   bool
 	startedAt time.Time
+	trigger   string // 本轮的触发方式（manual/schedule），写任务历史用
 	items     []queueItem
 	conc      int
 	seq       int
@@ -166,7 +167,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if body.Concurrency > 4 {
 		body.Concurrency = 4
 	}
-	started, total, seq, msg := p.startGrowthQueue(body.Concurrency, body.Growth)
+	started, total, seq, msg := p.startGrowthQueue(body.Concurrency, body.Growth, taskTriggerManual)
 	switch {
 	case seq == -1:
 		writeErr(w, http.StatusConflict, msg)
@@ -180,13 +181,16 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 // startGrowthQueue 扫描全部账号待办并启动队列（HTTP「执行全部待办」与调度器
 // growth 时点共用核心）。返回 (started, total, seq, msg)：seq==-1 表示队列
 // 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
-// [1,4]；growth 开关同 HTTP 入参语义。
-func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total int, seq int, msg string) {
+// [1,4]；growth 开关同 HTTP 入参语义；trigger 记入任务历史（manual/schedule）。
+func (p *Panel) startGrowthQueue(concurrency int, growth bool, trigger string) (started bool, total int, seq int, msg string) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 	if concurrency > 4 {
 		concurrency = 4
+	}
+	if trigger == "" {
+		trigger = taskTriggerManual
 	}
 	q := p.queue()
 	q.mu.Lock()
@@ -198,6 +202,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	// 判拒，避免两个 goroutine 同时启动互相覆盖 q.items/q.seq。无待办时回滚。
 	q.running = true
 	q.startedAt = time.Now()
+	q.trigger = trigger
 	q.mu.Unlock()
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
@@ -292,7 +297,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	seq = q.seq
 	q.mu.Unlock()
 
-	go p.runQueueItems(accts, items, concurrency)
+	go p.runQueueItems(accts, items, concurrency, trigger)
 	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", len(items), concurrency, growth)
 	return true, len(items), seq, ""
 }
@@ -301,8 +306,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 // 「执行全部待办」按钮完全同管线（成长，串行并发 1）。Sequential 族
 // 每日零点解锁一环，此前只能手动扫描推进；此回调让链条每天自动走一环。
 // 异步执行（startGrowthQueue 启动 goroutine 即返），已在跑/无待办安全跳过。
+// v2.2.0 #9：队列执行历史 trigger=schedule（区分手动「执行全部待办」）。
 func (p *Panel) RunGrowthQueueOnce() {
-	started, total, _, _ := p.startGrowthQueue(1, true)
+	started, total, _, _ := p.startGrowthQueue(1, true, taskTriggerSchedule)
 	if started {
 		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
 	}
@@ -310,13 +316,35 @@ func (p *Panel) RunGrowthQueueOnce() {
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
 // 账号间并发（信号量）。每项结果写回队列状态。
-func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
+//
+// v2.2.0 #9：收尾按 items 状态统计并写一条任务执行历史（kind=tasks_run，
+// trigger 由调用方传入 manual/schedule）——这是 panel 侧能拿到精确逐项计数的
+// 任务链路之一。
+func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int, trigger string) {
 	q := p.queue()
+	started := time.Now()
 	defer func() {
 		q.mu.Lock()
 		q.running = false
+		total := len(q.items)
+		done, fail, skip := 0, 0, 0
+		for _, it := range q.items {
+			switch it.Status {
+			case "done":
+				done++
+			case "error":
+				fail++
+			case "skipped":
+				skip++
+			}
+		}
 		q.mu.Unlock()
-		log.Printf("panel: 队列执行结束（共 %d 项）", len(items))
+		log.Printf("panel: 队列执行结束（共 %d 项）", total)
+		p.recordTaskRun(TaskRun{
+			Kind: taskKindTasksRun, Trigger: trigger,
+			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
+			Total: total, Done: done, Fail: fail, Skip: skip,
+		})
 	}()
 
 	sem := make(chan struct{}, concurrency)

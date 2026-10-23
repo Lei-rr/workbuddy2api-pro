@@ -737,6 +737,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="enterprise">企业版</option>
           </select>
           <span class="grow"></span>
+          <span class="flab" id="accTruncHint" hidden></span>
           <span class="flab" id="accCount"></span>
           <select id="accPageSize" aria-label="每页条数">
             <option value="50">50 / 页</option>
@@ -1385,6 +1386,45 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
             </tr></thead>
             <tbody id="creditBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box" id="auditBox">
+        <header>
+          <h3>操作审计 <span class="hint">面板写操作留痕（账号增删/禁用/启动任务/改配置等，最近 200 条）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="auditNote">—</span>
+          <button class="xs" id="btnAuditLoad">加载</button>
+        </header>
+        <div class="pad">
+          <div class="state" id="auditState">点击右上角「加载」查看操作审计（只在点击时拉取，不轮询）</div>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc" id="auditTable" hidden>
+            <thead><tr><th>时间</th><th>来源 IP</th><th>动作</th><th>账号</th><th>结果</th><th>详情</th></tr></thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box" id="runsBox">
+        <header>
+          <h3>任务执行历史 <span class="hint">批量/单号任务每次执行结束记一条（最近 100 条）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="runsNote">—</span>
+          <button class="xs" id="btnRunsLoad">加载</button>
+        </header>
+        <div class="pad">
+          <div class="state" id="runsState">点击右上角「加载」查看任务执行历史（只在点击时拉取，不轮询）</div>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc" id="runsTable" hidden>
+            <thead><tr>
+              <th>开始</th><th>结束</th><th>类型</th><th>触发</th>
+              <th class="num">总数</th><th class="num">完成</th><th class="num">失败</th><th class="num">跳过</th><th>错误</th>
+            </tr></thead>
+            <tbody id="runsBody"></tbody>
           </table>
         </div>
       </div>

@@ -71,6 +71,11 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// ShutdownTimeout 优雅停机时限（v2.2 #14）：收到 SIGINT/SIGTERM 后等待
+		// 在途 HTTP 请求（含 SSE 长流）自然结束的上限。缺省 "30s"；范围 5-120s
+		//（越界 clamp；0/负值/非法时长启动报错——停机必须有上限，立即退出用二次信号）。
+		// 启动时读取一次，改动需重启进程。
+		ShutdownTimeout string `json:"shutdown_timeout"` // "30s"
 	} `json:"server"`
 
 	Cooldown struct {
@@ -298,6 +303,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ShutdownTimeoutDur 解析后的优雅停机时限（v2.2 #14）；默认 30s，clamp 5..120s。
+	ShutdownTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -311,6 +318,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.ShutdownTimeout = "30s"
 	c.Panel.PollIntervalSec = 5
 	c.Panel.PackageDetailLimit = 5
 	// Security.AllowAnonymous 缺省 false（零值即默认）：非回环监听 + 空密钥会启动失败。
@@ -466,6 +474,10 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	// v2.2 #14 优雅停机时限（Go duration；空/非法由 normalize 统一校验）。
+	if v := os.Getenv("WB2A_SHUTDOWN_TIMEOUT"); v != "" {
+		c.Server.ShutdownTimeout = v
+	}
 	// v2.0.1 配置基座（面板分离密钥 / 轮询间隔 / 匿名逃生门 / 调度器参数）。
 	if v := os.Getenv("WB2A_PANEL_KEY"); v != "" {
 		c.Panel.APIKey = v
@@ -599,6 +611,25 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 优雅停机时限（v2.2 #14）：空值回落默认 30s；非法/0/负值 fail fast
+	//（停机必须有上限，0 无法表达「不限」；立即退出由二次信号负责）；
+	// 越界 clamp 到 [5s,120s]（与 UPGRADE_PROPOSALS #14 建议范围一致）。
+	if c.Server.ShutdownTimeout == "" {
+		c.Server.ShutdownTimeout = "30s"
+	}
+	if c.ShutdownTimeoutDur, err = time.ParseDuration(c.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %w", err)
+	}
+	switch {
+	case c.ShutdownTimeoutDur <= 0:
+		return fmt.Errorf("server.shutdown_timeout: 必须为正时长（收到 %q；立即退出请发送二次信号）", c.Server.ShutdownTimeout)
+	case c.ShutdownTimeoutDur < 5*time.Second:
+		c.Server.ShutdownTimeout = "5s"
+		c.ShutdownTimeoutDur = 5 * time.Second
+	case c.ShutdownTimeoutDur > 120*time.Second:
+		c.Server.ShutdownTimeout = "120s"
+		c.ShutdownTimeoutDur = 120 * time.Second
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

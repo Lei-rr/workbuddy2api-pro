@@ -668,9 +668,16 @@ function updateAccPager(shown, pages) {
   if ($('accNext')) $('accNext').disabled = !pages || accPage >= pages;
 }
 
+/* ACC_MAX_PAGE_SIZE 与服务端 accountsMaxPageSize 对齐：page_size=0（全部）时
+   服务端最多返回 2000 行，超出部分前端要明确提示用筛选/分页，避免用户以为
+   "全部"就真的是全部（v2.1.0 QA P2）。 */
+const ACC_MAX_PAGE_SIZE = 2000;
+
 /* updateAccPagerMeta 服务端分页模式的计数/页码：total = 池总数，
-   filtered = 筛选后总数（服务端已算好，前端不再数当前页）。 */
-function updateAccPagerMeta(meta) {
+   filtered = 筛选后总数（服务端已算好，前端不再数当前页）。
+   shownRows = 本次实际渲染的行数：page_size=0 且 total > shownRows 时说明被服务端
+   上限截断，在 accTruncHint 里提示（计数文案保持简洁，移动端不挤爆）。 */
+function updateAccPagerMeta(meta, shownRows) {
   if (!meta) return;
   const total = Number(meta.total) || 0;
   const filtered = Number(meta.filtered);
@@ -684,6 +691,16 @@ function updateAccPagerMeta(meta) {
   if ($('accPageInfo')) $('accPageInfo').textContent = page + ' / ' + pages;
   if ($('accPrev')) $('accPrev').disabled = page <= 1;
   if ($('accNext')) $('accNext').disabled = pages <= 1 || page >= pages;
+  const shownCount = shownRows == null ? null : Number(shownRows);
+  // 「全部」模式的截断只跟筛选后的集合有关（带筛选时 total 是池总数，不能用它判断）。
+  const truncated = Number(meta.page_size) === 0 && shownCount !== null &&
+    shownCount > 0 && (isNaN(filtered) ? total : filtered) > shownCount;
+  if ($('accTruncHint')) {
+    $('accTruncHint').hidden = !truncated;
+    $('accTruncHint').textContent = truncated
+      ? '仅显示前 ' + shownCount + ' 个（服务端上限 ' + ACC_MAX_PAGE_SIZE + '，建议用筛选或分页）'
+      : '';
+  }
 }
 
 /* accCreditsMax 积分进度条的池内基准。分页模式下当前页只有 100 行，逐页取 max
@@ -735,7 +752,7 @@ function renderAccounts(list, meta) {
     const total = Number(meta.total) || 0;
     tb.innerHTML = '<tr><td colspan="9"><div class="empty">' +
       (total > 0 ? '没有符合筛选条件的账号' : '账号池是空的') + '</div></td></tr>';
-    updateAccPagerMeta(meta);
+    updateAccPagerMeta(meta, 0);
     return;
   }
   // 倒计时基准：本地时钟 - 与服务端 now 的偏差（见 accNowMs）。light 投影没有
@@ -821,7 +838,7 @@ function renderAccounts(list, meta) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
-  if (server) updateAccPagerMeta(meta);
+  if (server) updateAccPagerMeta(meta, accAll.length);
   else updateAccPager(filteredCount, pages);
 }
 
@@ -1115,6 +1132,24 @@ async function refreshAccountPool(quiet) {
   return refreshAccountsView(quiet);
 }
 
+/* refreshFullOverviewInBackground 静默补拉一次完整 overview。
+   v2.1.0 QA P2：账号增/删/重扫/登录/导入后，列表 tab 不会主动拉全量；而积分历史
+   下拉（poolAccountList）、积分条基准（accCreditsMax）、到期快照都依赖完整
+   accounts → 不补拉会一直滞后到切「积分到期」或整页刷新。这里在账号集合变更的
+   收尾处后台补一次（force 绕过 60s 窗口），失败/在途都静默忽略，不影响当前视图
+   与轮询退避。 */
+function refreshFullOverviewInBackground() {
+  invalidateFullOverview();
+  try { ensureFullOverview(true, true); } catch (e) { /* 静默：补拉失败不影响主流程 */ }
+}
+
+/* refreshAccountPoolAfterMutation 账号集合变更（增/删/重扫/导入/登录成功）后的
+   统一收尾：先刷新 summary + 当前页，再后台补拉完整 overview（见上）。 */
+function refreshAccountPoolAfterMutation(quiet) {
+  refreshAccountPool(quiet);
+  refreshFullOverviewInBackground();
+}
+
 
 /* runAccountDotask 账号行「做任务」：单账号执行全部可自动任务。
    与「任务」弹窗（看进度、单项执行）并行保留：这个按钮是「没空逐项点」时的
@@ -1190,7 +1225,13 @@ $('accBody').addEventListener('click', async ev => {
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; refreshAccountPool(true); }
+  finally {
+    b.disabled = false;
+    // 移除账号会改变账号集合：除当前页外还要后台补拉完整 overview（积分历史
+    // 下拉/积分条基准/到期快照都依赖全量 accounts，v2.1.0 QA P2）。
+    if (a === 'remove') refreshAccountPoolAfterMutation(true);
+    else refreshAccountPool(true);
+  }
 });
 
 $('btnCheckinAll').onclick = async () => {
@@ -1207,7 +1248,7 @@ if ($('btnRescan')) $('btnRescan').onclick = async () => {
   try {
     const r = await api('accounts/rescan', { method: 'POST' });
     toast('扫描 ' + r.scanned + ' 个文件：新增 ' + r.added + '，剔除 ' + r.removed, 'ok');
-    refreshAccountPool(true);
+    refreshAccountPoolAfterMutation(true);   // 账号集合变了：当前页 + 全量快照都刷新
   } catch (e) { toast(e.message, 'err'); }
 };
 $('btnTravelAll').onclick = async () => {
@@ -1718,6 +1759,209 @@ async function loadCreditHistory() {
   renderCreditHistory(d);
 }
 
+/* ── 操作审计 / 任务执行历史（v2.2.0 #5/#9，只读、点击拉取）───────────────
+   两个区块都**不轮询**：用户点「加载」才请求一次，不给面板加常驻流量。
+   后端契约（v2.2.0，字段名以 backend-c 最终为准，这里全部做宽松兜底）：
+     GET /panel/api/audit?limit=200     → {ok, entries:[{ts,ip,action,uid,ok,detail}]}
+     GET /panel/api/task_runs?limit=100 → {ok, runs:[{id,kind,trigger,started_at,
+                                             finished_at,total,done,fail,skip,error}]}
+   渲染函数是纯函数（只吃数组 + 写固定 DOM 节点），便于 node harness 切片测试。 */
+const AUDIT_LIMIT = 200;
+const TASK_RUNS_LIMIT = 100;
+let auditData = [], taskRunsData = [];
+
+/* 审计动作枚举与 backend-c 的 audit.go 常量对齐（未知值原样显示，便于后端扩展）。 */
+const AUDIT_ACTION_LABEL = {
+  login_start: '获取授权链接', login: '添加账号', import: '导入账号',
+  account_remove: '移除账号', account_disable: '禁用账号', account_revive: '解冻账号',
+  account_pause: '暂停选号', account_resume: '恢复选号',
+  account_checkin: '单号签到', account_balance: '单号刷新余额',
+  accounts_rescan: '重新扫描',
+  task_accept: '接受任务', task_accept_all: '全部接受任务', task_claim: '领取任务',
+  task_auto: '一键完成任务', task_auto_all: '一键完成全部任务',
+  tasks_run: '单号做任务', tasks_run_queue: '执行任务队列',
+  checkin_all: '全部签到', travel_all: '旅行巡检', activity_all: '活跃上报',
+  keepalive_all: '全部保活', balance_all: '刷新全部余额',
+  usage_save: '保存用量数据', config_save: '保存配置', config_rollback: '回滚配置',
+};
+const TASK_KIND_LABEL = {
+  checkin: '签到', travel: '旅行', activity: '活跃上报', keepalive: '保活',
+  balance: '刷新余额', tasks_run: '单号做任务', catch_up: '补跑',
+  growth: '成长任务', task_sweep: '任务补领',
+};
+const TASK_TRIGGER_LABEL = { manual: '手动', schedule: '定时', catch_up: '补跑', startup: '启动' };
+
+/* fmtRunTime 时间戳 → 本地「MM-DD HH:mm:ss」：兼容 RFC3339 字符串、unix 秒/毫秒
+   与零值/脏数据（历史 JSONL 里可能有缺失或空 time），非法一律显示「—」。 */
+function fmtRunTime(v) {
+  if (v == null || v === '') return '—';
+  let ms;
+  if (typeof v === 'number') {
+    ms = v > 1e12 ? v : v * 1000;
+  } else {
+    const s = String(v).trim();
+    if (!s) return '—';
+    if (/^\d+(\.\d+)?$/.test(s)) { const n = Number(s); ms = n > 1e12 ? n : n * 1000; }
+    else ms = Date.parse(s);
+  }
+  if (!isFinite(ms) || ms <= 0) return '—';
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return '—';
+  const p2 = n => String(n).padStart(2, '0');
+  return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' +
+    p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+}
+function numOr0(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+
+/* normalizeAuditEntries 审计条目兜底：字段别名（ts/time、ip/client_ip、
+   action/act、detail/message/error）+ 缺失 + ok 非布尔都容忍。ok 缺失时保留
+   null（界面显示「—」），不武断当成成功。 */
+function normalizeAuditEntries(d) {
+  const list = (d && (d.entries || d.items || d.rows)) || [];
+  if (!Array.isArray(list)) return [];
+  return list.map(raw => {
+    const e = raw || {};
+    const okRaw = e.ok !== undefined ? e.ok : e.success;
+    const pick = (a, b, c) => (a !== undefined && a !== null) ? a : ((b !== undefined && b !== null) ? b : c);
+    return {
+      ts: pick(e.ts, e.time, ''),
+      ip: String(pick(e.ip, e.client_ip, '')),
+      action: String(pick(e.action, e.act, '')),
+      uid: String(pick(e.uid, '', '')),
+      ok: (okRaw === undefined || okRaw === null) ? null : !!okRaw,
+      detail: String(pick(e.detail, e.message, pick(e.error, '', ''))),
+    };
+  });
+}
+function auditActionText(action) {
+  const code = String(action || '');
+  return AUDIT_ACTION_LABEL[code] || code || '—';
+}
+function auditUidText(uid) {
+  const s = String(uid || '');
+  if (!s) return '—';
+  return s.length > 16 ? s.slice(0, 16) + '…' : s;
+}
+/* auditRowHtml 单行渲染（纯函数，便于测试列/标签/转义）：时间/IP/动作/账号/结果/详情 */
+function auditRowHtml(e) {
+  const result = e.ok === null ? '<span class="tag mute">—</span>'
+    : (e.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>');
+  return '<tr>' +
+    '<td>' + esc(fmtRunTime(e.ts)) + '</td>' +
+    '<td>' + esc(e.ip || '—') + '</td>' +
+    '<td title="' + esc(e.action || '') + '">' + esc(auditActionText(e.action)) + '</td>' +
+    '<td>' + esc(auditUidText(e.uid)) + '</td>' +
+    '<td>' + result + '</td>' +
+    '<td title="' + esc(e.detail || '') + '">' + esc(e.detail || '—') + '</td>' +
+    '</tr>';
+}
+function renderAudit(entries) {
+  auditData = Array.isArray(entries) ? entries : [];
+  const body = $('auditBody'), table = $('auditTable'), state = $('auditState'), note = $('auditNote');
+  if (!body) return;
+  if (table) table.hidden = !auditData.length;
+  if (note) note.textContent = auditData.length ? '最近 ' + auditData.length + ' 条' : '—';
+  if (state) {
+    state.hidden = auditData.length > 0;
+    state.className = 'state';
+    state.textContent = auditData.length ? '' : '暂无审计记录（面板写操作成功后会自动留痕）';
+  }
+  body.innerHTML = auditData.map(auditRowHtml).join('');
+}
+
+/* normalizeTaskRuns 任务历史兜底：runs/entries/items 别名 + 字段别名 + 数字缺失。 */
+function normalizeTaskRuns(d) {
+  const list = (d && (d.runs || d.entries || d.items || d.rows)) || [];
+  if (!Array.isArray(list)) return [];
+  return list.map(raw => {
+    const r = raw || {};
+    const pick = (a, b, c) => (a !== undefined && a !== null) ? a : ((b !== undefined && b !== null) ? b : c);
+    return {
+      id: String(pick(r.id, '', '')),
+      kind: String(pick(r.kind, r.task, '')),
+      trigger: String(pick(r.trigger, '', '')),
+      started_at: pick(r.started_at, r.started, ''),
+      finished_at: pick(r.finished_at, r.finished, ''),
+      total: numOr0(pick(r.total, r.count, 0)),
+      done: numOr0(pick(r.done, r.success, 0)),
+      fail: numOr0(pick(r.fail, r.failed, pick(r.error_count, 0, 0))),
+      skip: numOr0(pick(r.skip, r.skipped, 0)),
+      error: String(pick(r.error, '', '')),
+    };
+  });
+}
+function taskKindText(kind) {
+  const code = String(kind || '');
+  return TASK_KIND_LABEL[code] || code || '—';
+}
+function taskTriggerText(trigger) {
+  const code = String(trigger || '');
+  return TASK_TRIGGER_LABEL[code] || code || '—';
+}
+/* taskRunRowHtml 单行渲染（纯函数）：开始/结束/类型/触发/总数/完成/失败/跳过/错误 */
+function taskRunRowHtml(r) {
+  return '<tr>' +
+    '<td>' + esc(fmtRunTime(r.started_at)) + '</td>' +
+    '<td>' + esc(fmtRunTime(r.finished_at)) + '</td>' +
+    '<td title="' + esc(r.kind || '') + '">' + esc(taskKindText(r.kind)) + '</td>' +
+    '<td title="' + esc(r.trigger || '') + '">' + esc(taskTriggerText(r.trigger)) + '</td>' +
+    '<td class="num">' + r.total + '</td>' +
+    '<td class="num">' + r.done + '</td>' +
+    '<td class="num">' + r.fail + '</td>' +
+    '<td class="num">' + r.skip + '</td>' +
+    '<td title="' + esc(r.error || '') + '">' + esc(r.error || '—') + '</td>' +
+    '</tr>';
+}
+function renderTaskRuns(runs) {
+  taskRunsData = Array.isArray(runs) ? runs : [];
+  const body = $('runsBody'), table = $('runsTable'), state = $('runsState'), note = $('runsNote');
+  if (!body) return;
+  if (table) table.hidden = !taskRunsData.length;
+  if (note) note.textContent = taskRunsData.length ? '最近 ' + taskRunsData.length + ' 条' : '—';
+  if (state) {
+    state.hidden = taskRunsData.length > 0;
+    state.className = 'state';
+    state.textContent = taskRunsData.length ? '' : '暂无任务执行记录（批量任务/单号任务结束后自动记录）';
+  }
+  body.innerHTML = taskRunsData.map(taskRunRowHtml).join('');
+}
+
+/* loadAudit / loadTaskRuns 点击才拉一次（不轮询）。失败：行内错误态 + toast，
+   按钮恢复可点（可重试）。 */
+async function loadAudit() {
+  const btn = $('btnAuditLoad'), state = $('auditState');
+  if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+  if (state) { state.hidden = false; state.className = 'state'; state.textContent = '加载中…'; }
+  try {
+    const d = await api('audit?limit=' + AUDIT_LIMIT);
+    renderAudit(normalizeAuditEntries(d));
+  } catch (e) {
+    const msg = '读取操作审计失败：' + e.message;
+    if (state) { state.hidden = false; state.className = 'state err'; state.textContent = msg; }
+    toast(msg, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '加载'; }
+  }
+}
+async function loadTaskRuns() {
+  const btn = $('btnRunsLoad'), state = $('runsState');
+  if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+  if (state) { state.hidden = false; state.className = 'state'; state.textContent = '加载中…'; }
+  try {
+    const d = await api('task_runs?limit=' + TASK_RUNS_LIMIT);
+    renderTaskRuns(normalizeTaskRuns(d));
+  } catch (e) {
+    const msg = '读取任务执行历史失败：' + e.message;
+    if (state) { state.hidden = false; state.className = 'state err'; state.textContent = msg; }
+    toast(msg, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '加载'; }
+  }
+}
+if ($('btnAuditLoad')) $('btnAuditLoad').onclick = loadAudit;
+if ($('btnRunsLoad')) $('btnRunsLoad').onclick = loadTaskRuns;
+
+
 /* poolAccountList 账号全集（积分历史下拉 / 备注弹窗等需要「全部账号」的场景）：
    v2.1 #1 之后账号表只有当前页 rows（accAll），全量列表优先取完整 overview 快照
    （页面加载时后台拉一次；积分到期 tab 会按 60s 窗口刷新），没有快照才退当前页。 */
@@ -2155,7 +2399,7 @@ async function pollLogin() {
       $('addReady').hidden = true;
       $('addDone').hidden = false;
       $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
-      setTimeout(() => { closeAdd(); refreshAccountPool(true); }, 1600);
+      setTimeout(() => { closeAdd(); refreshAccountPoolAfterMutation(true); }, 1600);
     }
   } catch (e) {
     stopPoll();
@@ -2188,7 +2432,7 @@ $('importFile').onchange = async () => {
     if (d.errors && d.errors.length) {
       console.warn('import errors:', d.errors);
     }
-    refreshAccountPool(true);
+    refreshAccountPoolAfterMutation(true);   // 导入可能新增账号：当前页 + 全量快照
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
