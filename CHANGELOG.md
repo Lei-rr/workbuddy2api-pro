@@ -8,6 +8,46 @@
 
 ---
 
+## v2.6.0-pro（2026-10-24）
+
+生产化审计批次：用户要求「审计全部项目代码、优化升级、允许架构重构、清理垃圾文件、符合线上标准」。四路并行审计（Go 核心 / panel / 运维配置与仓库卫生 / 前端）共发现 **P0 6 项、P1 50+ 项**，本版修复全部 P0 与主要 P1。
+
+### 安全 P0
+
+- **默认密钥风险**：`config.example.json` 不再含 `test_key`（`api_key` 为空）；新增弱密钥启动守卫——`api_key`/`panel.api_key` 命中弱值名单（test_key/changeme/password/123456/example 等）且监听非回环时**拒绝启动**并提示生成随机密钥（回环仅 WARN）；Docker 默认配置因此 fail-fast，不再出现「公网已知密钥网关」
+- **`/v1` 请求体无上限**：新增 `server.max_body_mb`（默认 64MiB，env `WB2A_MAX_BODY_MB`，clamp 1–1024）；`/v1/chat/completions`、`/v1/messages` 等用 `http.MaxBytesReader` 限长，超限 413（OpenAI/Anthropic 错误体）；面板 POST 同样限长（普通 1MiB / import 32MiB）
+- **面板敏感响应**：`/panel/api/*` 默认 `Cache-Control: no-store`（config 回显含密钥/口令不再被缓存；accounts 的 ETag/304 语义保持）；`meta`/`jobs` 写操作补操作审计（`account_meta_update/delete`、`job_run/cancel`）
+
+### 可靠性与性能 P0
+
+- **session 粘性 O(n)**：pool 新增按 (model, realm) 的可用账号 `AvailabilityView` 缓存（Contains O(1)、权重槽复用、membership 代际 + 500ms TTL、容量 256），session 快路径 O(1)；10k 下每请求 7.6–8.9ms → **108–131ns（0 alloc）**
+- **pool 落盘锁内 IO**：改为锁内快照 + 锁外原子写（`persistMu` 串行 + 版本号防旧覆盖，保留 .bak/失败语义）；10k 状态约 76ms 的 marshal+写盘不再阻塞 Pick/chat
+- **停机竞态**：scheduler 余额刷新/补领清扫等后台循环纳入统一 WaitGroup（`WaitBackground`），停机顺序改为 cancel → Shutdown → 等后台循环 → **最后** Flush；超时 WARN 仍 Flush
+- **账号级无上限扇出**：补领清扫/任务扫描/成长队列/昵称同步改为有界 worker pool（`schedule.task_sweep_concurrency` 默认 8，clamp 1–64，env `WB2A_TASK_SWEEP_CONCURRENCY`），10k 池不再瞬时上万 goroutine；进度聚合、ctx 取消即停
+
+### 其它修复
+
+- panel：`writeJSON` 序列化失败不再 200 空 body（改 500+日志）；import 空 `auth_dir` 拒绝（不写 CWD）；抽 `readJSONBody`/`parseLimit`/`accountForRequest`/`fanOutAccounts` 等公共 helper；删除死代码、修正 8 处失准注释
+- 前端：4 类 HTML 注入兜底（未知枚举/数值字段全部转义）、fetch 15s 超时、usage/logs/packages/meta 请求序号防旧响应覆盖、日志页重数据请求降频（5s 轮询请求数 −75%）、mobile observer 按视口增量处理、6 个弹层可访问性（role/aria-modal/焦点陷阱/Esc）、死代码与重复格式化器清理
+- 启动/运维：`login.sh` 写 auth 强制 0600；`config.json.bak` 加入 .gitignore；`.dockerignore` 排除文档/tools；热生效清单按代码修正（jobs/notify/prompt/global/dns/session_sticky.enabled/panel.events/upstream 身份/allow_anonymous/max_body_mb 等改为明确「需重启」）；upstash 清空/修改后提示生效条件；scheduler「启动关闭→运行期开启」改为明确提示需重启
+- 工程化：全仓 gofmt 清零 + CI **gofmt 门禁**、CI setup-node 24、构建加 `-trimpath`；修正 README 文档漂移（prompt.mode 默认 passthrough、UA 默认 `WorkBuddy/5.5.4 … CLI/2.137.1`、仅 linux/amd64、请求体上限、出处表行号易漂移提示、失效的文件引用）
+
+### 兼容性/行为变更（升级需注意）
+
+- **镜像不带配置直接启动不再可用**：默认 `api_key` 为空 + 非回环监听 → fail-fast；请挂载/生成含随机 `api_key` 的 config.json（首启自动生成配置仍含随机密钥）
+- **老配置使用 test_key 等弱密钥且非回环监听时升级会启动失败**，需改随机密钥（预期安全修复）
+- 请求体超过 `server.max_body_mb` 返回 413（此前由上游或内存行为决定）
+- 响应 JSON 无法序列化时由「200 空 body」改为「500 + 错误体」
+- panel.Config 新增 `TaskSweepConcurrency`，config 新增 `schedule.task_sweep_concurrency`；`server.max_body_mb`；无移除字段
+
+### 测试与验证
+
+- 新增测试：弱密钥守卫/body 上限 413/pool AvailabilityView/persist 锁外/停机顺序/scheduler recover/credithist 锁外、panel 有界扇出与 16 项 P1、前端 XSS/超时/序号/日志降频/可访问性等；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
+- 审计报告：`D:\dsh\tmp\audit-core.md`、`audit-panel.md`、`audit-ops.md`、`audit-frontend.md`（不入库）
+- QA 独立验证：见交付报告（`D:\dsh\tmp\verify-final-v260.md`）
+
+---
+
 ## v2.5.0-pro（2026-10-24）
 
 性能专项：针对 1k–10k+ 账号规模重构热路径（用户要求）。完整数据见 [PERF.md](PERF.md)。

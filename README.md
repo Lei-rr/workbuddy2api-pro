@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.5.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.6.0-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -33,6 +33,7 @@
 > 9. **v2.3.1 调度与体验批次**：签到并发（`schedule.checkin_concurrency` 默认 3）+ **跳过当日已签** + 429 瞬态重试分层；**按族解耦调度**（慢签到不再阻塞旅行/活跃）；定时/补跑批次进入 Job 历史；账号池**标签筛选**（`tag=` + `GET meta/tags`）；通知渠道扩展 **企业微信 / Telegram / Bark**；`scripts/panel_frontend_check.mjs` 前端工程化检查接入 CI。
 > 10. **v2.4.0/v2.4.1 实时批次**：**SSE 事件推送**（`GET /panel/api/events`，snapshot/jobs/accounts + 心跳，替代轮询，断线自动回落）；前端 `#rtBadge` 实时徽标。v2.4.1 按用户要求移除了 v2.4.0 试做的「多用户/RBAC」与「凭证静态加密」，保持单密钥与明文 auths 行为。
 > 11. **v2.5.0 性能专项**：针对 1k–10k+ 账号重构热路径——Pool 快照/摘要缓存（`Snapshot`/`Summary`/`Version`/模型锁 O(1)）、面板 overview/metrics/accounts/ETag 304 缓存、启动 LoadDir 并行 + Realm 记忆化。**10k 账号：启动 1.6s→0.6s、RSS 214→92MB、混合读吞吐 327→4132 req/s、p95 69→5.9ms**（详见 [PERF.md](PERF.md)）。
+> 12. **v2.6.0 生产化审计批次**（用户要求全项目审计/重构/清理）：修复审计发现的 **6 项 P0**——镜像/文档默认弱密钥、`/v1` 请求体无上限、session 粘性每请求 O(n)、pool 落盘锁内 IO、停机竞态、账号级无上限 goroutine 扇出；补齐 gofmt/CI 门禁、敏感响应 no-store、操作审计覆盖、请求体上限、跨端 XSS 兜底与请求超时/竞态；修正文档漂移与仓库卫生。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -153,7 +154,7 @@ WorkBuddy2API Pro 是一个自托管的 **OpenAI 兼容反向代理网关**，�
 | 召唤开学季专家 | +50c +1抽奖 | viewed 后 mp 事件链（召唤×3 + 对话） |
 | 学生认证 | +100c | 需微信学生真实认证，不做 |
 
-抽奖次数自动全部抽完。期间逆向成果（cf-connect 加密通道、mp 云对话全链路）记录在 `data/desktop-task-protocol.md` §8。
+抽奖次数自动全部抽完。期间逆向成果（cf-connect 加密通道、mp 云对话全链路）记录在维护者本地数据目录（未随仓库分发）。
 
 同一活动在成长任务中心还有两条**小程序口径**任务（`X-Client-Platform: miniprogram` 专属下发，默认列表不可见，各 +100c+5e）：
 
@@ -247,12 +248,12 @@ flowchart LR
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+CI 会自动构建 `linux/amd64` 镜像并发布到 GHCR，`git clone` 之外的部署路径：
 
 ```bash
 # 1. 准备配置与数据目录
 mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    必须编辑 config.json 设置随机 api_key（非回环监听下空密钥或弱密钥会拒绝启动）
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api-pro \
@@ -263,6 +264,8 @@ docker run -d --name workbuddy2api-pro \
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 ```
+
+> **v2.6.0 行为变更**：镜像内默认 `config.json` 的 `api_key` 为空。直接 `docker run` 而**不挂载**含随机 `api_key` 的配置时，非回环监听会**拒绝启动**（fail-fast，防止已知默认密钥网关）——请务必先 `cp config.example.json config.json` 并填入随机 `api_key`。
 
 > **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-pro` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
@@ -279,7 +282,7 @@ cd workbuddy2api-pro
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    必须编辑 config.json 设置随机 api_key（非回环监听下空密钥或弱密钥会拒绝启动）
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -387,18 +390,20 @@ curl -s http://localhost:7863/v1/search/messages \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置）。**v2.6.0 起非回环监听下弱密钥（test_key/changeme/password 等）会拒绝启动**；回环仅 WARN |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `dns_servers` | 空 | **出站解析**用的 DNS 服务器（数组，按顺序试，都用不上才报错）；空 = 系统解析器。/etc/resolv.conf 不存在或不可用的环境（Android、精简容器）必须显式配，否则 Go 解析器会退回 `127.0.0.1:53`，查任何域名都变成"连本机 53 端口"（`dial tcp: lookup ... on [::1]:53: connection refused`）。只换 `Transport.DialContext`，不动超时与连接池 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `server.shutdown_timeout` | `30s` | **优雅停机**（v2.2.0）等待在途请求/后台任务收敛的上限（clamp 5–120s；0/负/非法启动报错）；超时后继续收尾并退出；改动需重启 |
-| `jobs.max_concurrency` | `4` | Job Runner 并发闸门：同时执行的批量任务 Job 数上限（clamp 1–32，热生效）；账号级并行度仍由各任务自身控制 |
+| `server.max_body_mb` | `64` | **入站请求体上限**（v2.6.0，MiB，clamp 1–1024，env `WB2A_MAX_BODY_MB`）：`/v1/*` 与面板 POST 超限返回 413；改动需重启 |
+| `jobs.max_concurrency` | `4` | Job Runner 并发闸门：同时执行的批量任务 Job 数上限（clamp 1–32，**装配期生效/改动需重启**）；账号级并行度仍由各任务自身控制 |
 | `jobs.retain` | `50` | `data/jobs.json` 保留的最近任务条数（clamp 5–500） |
 | `notify.webhook_url` | 空 | **事件通知 Webhook**（v2.3.0）：空=关闭；非空时异步 POST `{"event","ts","data"}` |
 | `notify.timeout` | `10s` | Webhook 单次请求超时（Go duration，clamp 1–60s） |
 | `notify.events` | 默认三件套 | 订阅事件：`job_done` / `account_disabled` / `checkin_failed`；空=默认集合 |
 | `schedule.checkin_concurrency` | `3` | **签到并发**（v2.3.1）：签到批次账号级 worker 数（clamp 1–16，热生效）；1146 号池建议 3–5，过高易触发上游风控 |
+| `schedule.task_sweep_concurrency` | `8` | **账号级扇出并发上限**（v2.6.0 审计 P0）：补领清扫/任务扫描/成长队列/昵称同步等的 worker 数（clamp 1–64，env `WB2A_TASK_SWEEP_CONCURRENCY`）；此前每账号一个 goroutine，10k 池会瞬时上万 goroutine |
 | `notify.channel` | `webhook` | 通知渠道（v2.3.1）：`webhook`（通用 JSON）/ `wecom`（企业微信群机器人）/ `telegram`（Bot sendMessage）/ `bark`（iOS Bark） |
 | `notify.telegram_chat_id` | 空 | telegram 渠道必填的目标 chat_id（数字 id 或 @channel） |
 | `notify.title` | `WorkBuddy2API Pro` | 渠道消息标题（wecom/bark 使用） |
@@ -430,10 +435,10 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `WorkBuddy/5.5.4 <platform>/5.5.4 CLI/2.137.1`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
-| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
+| `prompt.mode` | `passthrough` | 系统提示词模式：`passthrough`（默认）= 透传客户端原始 system（降级重试仍切到网关提示词）；`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
@@ -807,7 +812,7 @@ http://127.0.0.1:7863/panel/
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
-涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
+涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`server.max_body_mb`、`jobs.*`、`notify.*`、`prompt.*`、`global.*`、`cn.*`、`dns_servers`、`session_sticky.enabled`/`ttl`、`panel.events_enabled`、`security.allow_anonymous`、`upstream.*`、`upstash.*`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
 
@@ -850,7 +855,7 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体网关侧不设上限（超限类错误由上游返回，见常见问题） |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 `server.max_body_mb`（默认 64MiB；超限返回 413 `request_too_large`） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -906,7 +911,7 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/accept` | POST | 接受任务（`{"task_codes":[...]}`） |
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
-出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+出站请求统一携带 `WorkBuddy/5.5.4 <platform>/5.5.4 CLI/2.137.1` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
 ## 请求级日志
 
@@ -1146,18 +1151,20 @@ readinessProbe:
 
 ### 系统提示词被内容策略误杀怎么办？
 
-默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
+默认 `prompt.mode=passthrough` 透传客户端 system（`custom` 由用户显式选择），从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `WorkBuddy/5.5.4 <platform>/5.5.4 CLI/2.137.1` 现状（指纹净化考虑，可配而非改死）。
 
 ## 关键断言 ↔ 代码出处
 
+> **注（v2.6.0）**：源码经过重构后行号会漂移；下表请优先按符号名（函数/常量名）在源码中检索，不要依赖行号。
+
 | 断言 | 出处 |
 |---|---|
-| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段 |
+| `prompt.mode` 默认 `passthrough` | `cmd/server/config.go`（`c.Prompt.Mode = "passthrough"`） |
+| 请求体上限 `server.max_body_mb`（默认 64MiB，超限 413） | `internal/server/handler.go`（`readBodyLimited`/`readChatBody`） |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
@@ -1166,7 +1173,7 @@ readinessProbe:
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
+| 出站 UA 覆盖（空 = 现状 `WorkBuddy/5.5.4 <platform>/5.5.4 CLI/2.137.1`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
 | disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
@@ -1182,7 +1189,7 @@ readinessProbe:
 ## 维护与后续优化（Pro）
 
 - **[MAINTAINERS.md](MAINTAINERS.md)**：基线 / 关键版本决策 / 部署链路（含从旧 fork 迁移步骤）/ 实测基线 / 已知坑 / 跟随上游与发布流程——接手维护先读这页。
-- **[CHANGELOG.md](CHANGELOG.md)**：v2.0.0-pro 变更清单 + 上游最终版 60 个提交吸收内容（防止误以为“只删了补偿”）。
+- **[CHANGELOG.md](CHANGELOG.md)**：完整版本变更线（v2.0.0 → v2.6.0）+ 上游最终版 60 个提交吸收内容。
 - **[UPGRADE_PROPOSALS.md](UPGRADE_PROPOSALS.md)**：后续优化建议（性能 / 安全 / 可观测 / 账号运维 / 可靠性 / 工程质量 / 体验），按 P0/P1/P2 分级并注明工作量，供按优先级采纳。
 
 ## 免责声明

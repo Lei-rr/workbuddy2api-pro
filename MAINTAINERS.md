@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.5.0-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.6.0-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -60,6 +60,7 @@ node --check internal/panel/mobile.js
 10. **v2.3.1 调度器完整优化**（2026-10-24）：签到 worker pool 并发（`schedule.checkin_concurrency` 默认 3）+ 跳过当日已签（进程内，重启重打）+ 429 重试分层 + 按族解耦（慢签到不阻塞其它族）；定时/补跑批次进入 Job 历史（trigger=schedule/catch_up，可取消）；标签服务端筛选（accounts tag + meta/tags 索引）；通知渠道 wecom/telegram/bark；`scripts/panel_frontend_check.mjs` 入 CI。**改调度语义时先看 checkin11_test.go 的分层/跳过/并发断言**。
 11. **v2.4.0/v2.4.1 实时与清理**（2026-10-24）：v2.4.0 实现 SSE 事件推送（`GET /panel/api/events` + 前端 fetch/ReadableStream + 断线回落轮询）；**v2.4.1 按用户要求移除 v2.4.0 试做的多用户/RBAC 与凭证静态加密**（auth 路由/`panel.users`/`encrypt_auths`/authcrypt 全部删除），保留 SSE。**不要再引入多用户或 auths 加密，除非用户明确要求**。
 12. **v2.5.0 性能专项**（2026-10-24）：Pool 快照/摘要缓存（`Snapshot`/`Version`/`Summary`/`AvailableUIDsSorted`，`List` 保持拷贝语义）、`ModelLockView` 空锁 O(1)、面板 overview/metrics/accounts 热路径与 ETag/304 LRU 缓存、gzip 池、启动 LoadDir 并行 + Realm 记忆化 + 启动分段日志、`?accounts=0` 轻量 overview、tools/perfbench 基准。**改热路径先读 PERF.md 与 pool/cache.go 注释：Snapshot 返回切片只读；Version 不覆盖 InFlight 瞬时变化；面板 ETag 缓存 TTL 10s 兜底**。
+13. **v2.6.0 生产化审计**（2026-10-24）：四路审计（core/panel/ops/frontend）修复 P0 6 项——弱密钥启动守卫（非回环 fail-fast）、`/v1` body 上限（`server.max_body_mb`）、session `AvailabilityView` O(1)、pool 落盘锁外、停机 WaitBackground、账号级有界扇出（`schedule.task_sweep_concurrency`）；另修 writeJSON/审计覆盖/no-store/import 守卫/XSS 兜底/请求超时/竞态、gofmt+CI 门禁、文档漂移。**新增安全默认：镜像无配置直接启动会 fail-fast（必须随机 api_key）；弱密钥+非回环启动失败是预期行为**。
 
 ## 部署链路
 
@@ -145,6 +146,12 @@ services:
 - v2.5.0 面板 ETag 缓存：键=归一化 accountsQuery，失效=pool 代际/accountMetaSeq/TTL 10s；304 快速路径不读快照不构 rows；200 仍按当前时间重算 rows（now/in_flight/cool_remaining 新鲜）。
 - v2.5.0 启动日志新增 3 行 `startup: …`；10k 冷启动若明显偏慢先看 load auths / ready 分段。
 - v2.5.0 全量 `overview`（默认含 accounts）仍是重接口（10k ~123ms/7.1MB），新脚本/监控用 `?lite=1` 或 `?accounts=0`。
+- v2.6.0 弱密钥守卫名单在 `cmd/server/config.go`（`weakAPIKeyGuard`）；新增/调整名单时同步测试。非回环 + 弱密钥是启动错误而非 WARN，不要为「兼容老配置」放宽。
+- v2.6.0 请求体上限：`server.max_body_mb` 默认 64；`/v1/chat`、`/v1/messages` 与面板 POST 均限长（面板普通 1MiB / import 32MiB），新增读 body 的端点必须走 `readBodyLimited`/`readJSONBody` helper。
+- v2.6.0 账号级批量任务一律走有界 fanOut（`schedule.task_sweep_concurrency` 默认 8）；禁止再写「每账号一个 goroutine」的循环（10k 池会瞬时上万 goroutine）。
+- v2.6.0 停机顺序：cancel → HTTP Shutdown → scheduler `WaitBackground` → **最后** pool Flush；新增后台循环必须纳入 shutdown 等待组（`shutdownDeps.WaitExtra`/scheduler bgWG）。
+- v2.6.0 面板响应默认 `Cache-Control: no-store`；accounts 的 ETag/304 响应需覆盖为 `private, no-cache`，新增可缓存 GET 时确认缓存头。
+- v2.6.0 CI 已有 gofmt 门禁（`gofmt -l` 非空失败）：本地提交前跑 `gofmt -w`；仓库工作区为 CRLF（autocrlf=true），不要手改行尾。
 - v2.4.1 起面板回到**单密钥模式**：`api_key`/`panel.api_key` Bearer 即 admin；v2.4.0 的 auth 端点已删除（旧脚本调用会 404）。
 - v2.4.1 起 auths **恢复明文**：曾用 v2.4.0 authcrypt 加密过 auths 的部署，升级前必须先用 v2.4.0 的 authcrypt `-decrypt` 恢复明文。
 - v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。
