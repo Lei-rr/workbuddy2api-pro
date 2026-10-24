@@ -8,6 +8,30 @@
 
 ---
 
+## v2.4.1-pro（2026-10-24）
+
+按用户要求移除 v2.4.0 试做的两个功能，保留 SSE 实时事件。
+
+### 移除：多用户 / RBAC（#6）
+
+- 删除 `POST /panel/api/auth/login`、`POST auth/logout`、`GET auth/info` 端点与全部角色门禁/session store/密码校验/`panel_login` 审计
+- 删除 `panel.users`、`panel.session_ttl` 配置、`WB2A_PANEL_SESSION_TTL` env、前端「用户名/密码」登录/模式切换/角色禁用/退出按钮/用户名显示
+- `withAuth` 恢复 v2.3.1 单密钥逻辑（与 `git show e7821c5:internal/panel/panel.go` 逐字节一致，仅保留 SSE 的 events 路由与 gzip 绕过差异）
+- 旧 `config.json` 若含 `panel.users`/`panel.session_ttl`：JSON 解码忽略未知键，无需迁移；建议顺手删除
+
+### 移除：凭证静态加密（#7）
+
+- 删除 `internal/auth` 加密层（crypto.go/加密写回/密文解析）、`cmd/authcrypt` 命令、`security.encrypt_auths` 配置、`WB2A_MASTER_KEY`/`WB2A_ENCRYPT_AUTHS` env、启动加密装配与日志、compose 的 `WB2A_MASTER_KEY` 示例
+- `internal/auth` 恢复 v2.3.1 明文行为；存量明文 auths 零影响
+- 若曾按 v2.4.0 文档执行过 `authcrypt -encrypt`：请先恢复到明文再升级（用 v2.4.0 的 authcrypt `-decrypt`，或换回旧版镜像处理），否则 v2.4.1 无法读取密文 auth 文件；`.plain.bak`/`.enc.bak` 视需要清理
+
+### 保留
+
+- **SSE 事件推送（#3）**：`GET /panel/api/events`、`panel.events_enabled`、前端实时徽标/断线回落轮询全部保留，行为与 v2.4.0 一致
+- 其余 v2.0-v2.3 功能零改动；`go build` / `go vet` / `go test -count=1 ./...` 全绿（19 包）
+
+---
+
 ## v2.4.0-pro（2026-10-24）
 
 安全与实时批次（UPGRADE_PROPOSALS #3 / #6 / #7 / #20 收尾）。

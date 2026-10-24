@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.4.0-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.4.1-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -31,7 +31,7 @@
 > 7. **v2.2.0 工程与可靠性批次**：优雅停机（SIGTERM 收尾 + state flush）、state.json 滚动备份/损坏回退/启动自检、Go 1.24、CI vet + 容器日志轮转/stop_grace_period、配置保存 .bak + 一键回滚、`/panel/api/readyz` + `/metrics`（Prometheus）、操作审计（JSONL）、任务执行历史（JSONL）。
 > 8. **v2.3.0 运维效能批次**：全池批量任务 **Job Runner**（异步/进度/取消/持久化/单飞）、**Webhook 事件通知**（job_done/account_disabled/checkin_failed）、**账号备注/标签服务端化**（data/account-meta.json，替代 localStorage）、面板 Job 进度条与备注迁移。
 > 9. **v2.3.1 调度与体验批次**：签到并发（`schedule.checkin_concurrency` 默认 3）+ **跳过当日已签** + 429 瞬态重试分层；**按族解耦调度**（慢签到不再阻塞旅行/活跃）；定时/补跑批次进入 Job 历史；账号池**标签筛选**（`tag=` + `GET meta/tags`）；通知渠道扩展 **企业微信 / Telegram / Bark**；`scripts/panel_frontend_check.mjs` 前端工程化检查接入 CI。
-> 10. **v2.4.0 安全与实时批次**：**SSE 事件推送**（`GET /panel/api/events`，替代轮询，断线自动回落）、**多用户/RBAC**（`panel.users` admin/operator/viewer + 登录会话 + 角色门禁）、**凭证静态加密**（可选 AES-256-GCM，`WB2A_MASTER_KEY` + `authcrypt` 迁移工具）。
+> 10. **v2.4.0/v2.4.1 实时批次**：**SSE 事件推送**（`GET /panel/api/events`，snapshot/jobs/accounts + 心跳，替代轮询，断线自动回落）；前端 `#rtBadge` 实时徽标。v2.4.1 按用户要求移除了 v2.4.0 试做的「多用户/RBAC」与「凭证静态加密」，保持单密钥与明文 auths 行为。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -401,10 +401,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `notify.channel` | `webhook` | 通知渠道（v2.3.1）：`webhook`（通用 JSON）/ `wecom`（企业微信群机器人）/ `telegram`（Bot sendMessage）/ `bark`（iOS Bark） |
 | `notify.telegram_chat_id` | 空 | telegram 渠道必填的目标 chat_id（数字 id 或 @channel） |
 | `notify.title` | `WorkBuddy2API Pro` | 渠道消息标题（wecom/bark 使用） |
-| `panel.users` | `[]` | **面板多用户**（v2.4.0 #6）：`[{name,password\|password_hash,role}]`，role=admin/operator/viewer；空 = 单密钥模式（api_key 行为不变）；`api_key` 始终等价 admin |
-| `panel.session_ttl` | `12h` | 面板登录会话有效期（Go duration，clamp 5m–7d） |
-| `panel.events_enabled` | `true` | **SSE 事件推送**开关（v2.4.0 #3）：false → `/panel/api/events` 404，前端回落轮询 |
-| `security.encrypt_auths` | `false` | **凭证静态加密**（v2.4.0 #7）：true 时 `auths/` 用 AES-256-GCM 加密落盘，必须设置 `WB2A_MASTER_KEY`（32 字节 base64/hex） |
+| `panel.events_enabled` | `true` | **SSE 事件推送**开关（v2.4.0）：false → `/panel/api/events` 404，前端回落轮询 |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `panel.api_key` | 空 | **面板专用密钥**（v2.0.1）：空 = 回落 `api_key`（面板与网关共用）；设置后仅面板使用此 key，`/v1/*` 仍只认 `api_key`。改动需重启 |
 | `panel.poll_interval_sec` | `5` | 面板轮询间隔（秒，2–60，热生效）；前端按约 ±20% 抖动，页面隐藏时暂停 |
@@ -473,7 +470,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_JOBS_MAX_CONCURRENCY` · `WB2A_JOBS_RETAIN` · `WB2A_NOTIFY_WEBHOOK` · `WB2A_NOTIFY_TIMEOUT`(duration) · `WB2A_NOTIFY_EVENTS`(逗号分隔) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool) · `WB2A_CHECKIN_CONCURRENCY` · `WB2A_NOTIFY_CHANNEL` · `WB2A_NOTIFY_TELEGRAM_CHAT_ID` · `WB2A_NOTIFY_TITLE` · `WB2A_PANEL_SESSION_TTL`(duration) · `WB2A_PANEL_EVENTS_ENABLED`(bool) · `WB2A_ENCRYPT_AUTHS`(bool) · `WB2A_MASTER_KEY`(32B base64/hex)
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_SHUTDOWN_TIMEOUT`(duration) · `WB2A_JOBS_MAX_CONCURRENCY` · `WB2A_JOBS_RETAIN` · `WB2A_NOTIFY_WEBHOOK` · `WB2A_NOTIFY_TIMEOUT`(duration) · `WB2A_NOTIFY_EVENTS`(逗号分隔) · `WB2A_PANEL_KEY` · `WB2A_POLL_INTERVAL_SEC` · `WB2A_ALLOW_ANONYMOUS`(bool) · `WB2A_CATCH_UP_MINUTES` · `WB2A_BALANCE_REFRESH_CONCURRENCY` · `WB2A_BALANCE_REFRESH_STARTUP_DELAY`(duration) · `WB2A_BALANCE_REFRESH_STARTUP_FORCE`(bool) · `WB2A_CHECKIN_CONCURRENCY` · `WB2A_NOTIFY_CHANNEL` · `WB2A_NOTIFY_TELEGRAM_CHAT_ID` · `WB2A_NOTIFY_TITLE` · `WB2A_PANEL_EVENTS_ENABLED`(bool)
 
 ## 核心行为语义
 
@@ -752,8 +749,6 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-
-**多用户与角色（v2.4.0）**：配置 `panel.users` 后自动启用「用户名 + 密码」登录（`POST /panel/api/auth/login`），会话 token 存 localStorage 并同时下发 HttpOnly Cookie；角色分 `admin`（全部）/ `operator`（任务与运维写、无配置/删号/导入/添加账号）/ `viewer`（只读）。`api_key`/`panel.api_key` 作为 root 通道等价 admin，脚本调用零破坏。未配置 users = 单密钥模式（行为与旧版完全一致）。
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
 
 | 视图 | 功能 |
@@ -825,8 +820,7 @@ http://127.0.0.1:7863/panel/
 | 可观测（v2.2.0） | `GET readyz`（就绪探测：config/auth_dir/state_dir 可写 + pool_loaded，失败 503）· `GET metrics`（Prometheus text v0.0.4：池计数/在途/积分合计/模型锁/面板请求计数）· `GET audit?limit=200`（面板操作审计 JSONL，新的在前）· `GET task_runs?limit=100`（任务执行历史 JSONL） |
 | 任务调度（v2.3.0/v2.3.1） | `GET jobs?limit=20`（Job 列表，新→旧；**v2.3.1 起含定时/补跑批次 trigger=schedule/catch_up**）· `GET jobs/{id}` · `POST jobs/{kind}/run`（kind=checkin/travel/activity/keepalive/balance；同类在跑 409）· `POST jobs/{id}/cancel`（只停后续账号）；旧批量端点保留 `ok/started` 并新增 `job_id` |
 | 备注/标签（v2.3.0/v2.3.1） | `GET meta`（全部账号备注/标签）· **`GET meta/tags`（标签及计数，count 降序）** · `GET accounts/{uid}/meta` · `PUT accounts/{uid}/meta`（body `{note,tags}`；note≤500 字符、tags≤10×32 字符）· `DELETE accounts/{uid}/meta`；`GET accounts?tag=<标签>` 服务端筛选 |
-| 认证/会话（v2.4.0） | `POST auth/login`（`{username,password}` → `{ok,user:{name,role},token,expires_at}` + `wb2_session` Cookie；失败 401/限速 429）· `POST auth/logout` · `GET auth/info`（`mode=single\|multi`、当前 user/role、`events_enabled`） |
-| 事件推送（v2.4.0） | `GET events`（SSE：`snapshot`/`jobs`/`accounts` 事件 + 15s 心跳；Bearer 鉴权；`panel.events_enabled=false` → 404） |
+| 事件推送（v2.4.0） | `GET events`（SSE：`snapshot`/`jobs`/`accounts` 事件 + 15s 心跳；Bearer 鉴权；`panel.events_enabled=false` → 404；单实例进程内推送） |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 
@@ -953,7 +947,6 @@ http://127.0.0.1:7863/panel/
 | 脚本 | 用途 |
 |---|---|
 | `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
-| `authcrypt`（`go run ./cmd/authcrypt`） | **auths 加密/解密迁移**（v2.4.0）：`-encrypt`/`-decrypt` `-config config.json` `[-dir auths]` `[-dry-run]`；保留 `.plain.bak`/`.enc.bak`，退出码 0/1 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
@@ -1012,25 +1005,6 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **空密钥阻断（v2.0.1）**：`listen` 为非回环地址且 `api_key` / `panel.api_key` 全空 → 启动直接失败（`security.allow_anonymous: true` 可显式放行）；保存配置也不允许把 `api_key` 清空
 - **登录失败限速（v2.0.1）**：面板鉴权失败按来源 IP 限速（20 次/分钟 → `429` + `Retry-After`），成功一次即清桶；静态页面不受影响。实现为**进程内 best-effort**（重启清零；`X-Forwarded-For` 可被伪造用于分散计数），应部署在可信反代之后
 - **面板密钥改动需重启（v2.0.1）**：`panel.api_key` 属装配期字段，面板保存后会在 `restart_required` 中提示；重启后面板需用新密钥登录（旧浏览器保存的是网关 key 时会 401 并提示重新输入）
-
-### 3. 凭证静态加密（v2.4.0）
-
-可选开启（默认关闭，明文行为不变）：
-
-1. 生成并**离线备份**主密钥：`openssl rand -base64 32`（32 字节；丢失即加密凭证不可恢复）
-2. 停服 → 先 dry-run 确认统计：`./authcrypt -encrypt -config config.json -dry-run` → 正式迁移：`./authcrypt -encrypt -config config.json`
-3. `config.json` 设 `"security": {"encrypt_auths": true}`，环境变量 `WB2A_MASTER_KEY=<key>`，启动（日志出现「auths 静态加密已启用（AES-256-GCM；主密钥指纹 …）」）
-4. 回滚：停服 → 设 `encrypt_auths=false` → `./authcrypt -decrypt -config config.json`
-
-实现说明：AES-256-GCM 整文件包装（随机 nonce、0600 原子写）；旧明文文件可读（混合目录），开启加密后所有写回路径（登录/刷新 token/realm 回填/面板加号导入）自动写密文；token 刷新时主密钥不可用会**拒绝写回**而非降级明文。`authcrypt` 会在同目录留 `.plain.bak`（加密前明文）/`.enc.bak`（解密前密文）——验证无误后应立即安全删除，且不要纳入备份/仓库。`scripts/*.py` 工具直接读明文 JSON，加密后需先解密或等待后续 export 工具。
-
-### 4. 面板多用户 / RBAC（v2.4.0）
-
-- 配置 `panel.users` 后启用用户名/密码登录与会话（HttpOnly Cookie + Bearer token；会话仅进程内保存，重启后需重新登录）
-- 角色：`admin` 全部；`operator` 任务/账号运维写（checkin/balance/revive/disable/pause/resume、tasks、jobs、meta），**无**配置读写/删号/重扫/导入/添加账号；`viewer` 只读（GET），配置页不可见
-- `api_key`/`panel.api_key` Bearer 始终等价 admin（脚本/自动化兼容；单密钥模式行为与旧版一致）
-- 登录失败沿用 20 次/分钟/IP 限速并统一返回「用户名或密码错误」（不泄露用户是否存在）；审计记录 `panel_login`（不含密码）
-- 已知取舍：Cookie 会话暂未加 CSRF token（SameSite=Lax + JSON API）；用户管理仍改配置重启；会话仅内存；多实例部署需各自维护用户/会话（面板一般单实例）
 
 ### 3. 发布来源与合规边界
 
@@ -1119,11 +1093,9 @@ readinessProbe:
 
 每次保存配置前会自动把上一版备份为 `config.json.bak`（保留最近 1 份）。调用 `POST /panel/api/config/rollback`（Bearer 鉴权）即可恢复并热应用，响应含 `restart_required`；无备份或备份非法返回 400 且不改动当前配置。
 
-### v2.4.0 的 SSE / 多用户 / 加密怎么用？
+### SSE 实时事件怎么工作（v2.4.0）？
 
-- **SSE 实时事件**：面板默认自动连接 `GET /panel/api/events`（顶栏「实时」徽标绿色）；断线按 1→30s 退避重连，`panel.events_enabled=false` 或旧服务端自动回落 5s 轮询（徽标灰色）。SSE 为进程内推送，多实例部署各实例独立。
-- **多用户/RBAC**：在 `config.json` 的 `panel.users` 配置用户名/密码/角色后重启，登录页会切换为账号密码模式；`api_key` 仍可作为 admin 直接调用 API。密码可写 `password`（明文，config 需 0600）或 `password_hash`（`sha256:<salt>:<hex>`，hex=sha256(salt+password)）。
-- **凭证加密**：见「安全与合规 → 3. 凭证静态加密」步骤；务必先离线备份主密钥，迁移后用 `authcrypt` 的 `.bak` 文件验证后删除。
+面板默认自动连接 `GET /panel/api/events`（Bearer 鉴权，fetch+ReadableStream 解析；顶栏「实时」徽标绿色）。事件：首帧 `snapshot`（计数/积分/最近 Job/版本/轮询间隔），之后 `jobs`/`accounts` 变化推送 + 15s 心跳。断线按 1→30s 退避重连；`panel.events_enabled=false` 或旧服务端自动回落 5s 轮询（徽标灰色）。SSE 为单实例进程内推送，心跳 15s，反代空闲超时需 >15s。
 
 ### 如何配置 Webhook 事件通知（v2.3.0）？
 
