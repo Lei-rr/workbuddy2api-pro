@@ -8,6 +8,28 @@
 
 ---
 
+## v2.6.2-pro（2026-10-24）
+
+修复 v2.6.1 新增 CI race job 首次运行捕获的真实数据竞争（发布阻断项）。
+
+### internal/jobs 数据竞争
+
+- 根因：`Registry.Run()` 启动后台 goroutine 后在锁外 `cloneJob` 返回，与 `execute()` 锁内写 `job.State/StartedAt` 并发（race 栈 read@cloneJob vs write@execute）；除竞争外还可能返回撕裂快照
+- 修复：Run 在 `r.mu` 内生成 pending 深拷贝快照后再解锁/启动 goroutine/返回（调用方与内部状态零共享）；全路径核对 execute/finish/Record/persist/Get/List/Cancel 均在锁内；OnFinish/notify 保持锁外调用（无嵌套死锁）
+- 顺带修复 Close 与启动竞争窗口：execute 登记 cancel 后复检 `closed/base.Err()`，命中则清理登记并终止为 canceled
+
+### 测试
+
+- 新增 `internal/jobs/race_test.go`：快照隔离、200 goroutine Run/Get/List/Cancel/Record/reader 压力、Close/Run 竞争 20 轮（`-count=20` 全 PASS）
+- CI 失败用例 `TestCatchUpBatchCreatesJobWithCatchUpTrigger` `-count=20` PASS；`go build/vet/test ./...` 全绿（21 包）；gofmt 0
+- CI `race` job 对 v2.6.2 复跑通过后发布（本版本即修复门禁的验证版本）
+
+### 兼容性
+
+- 无 API/状态机/jobs.json/OnFinish 行为变化；唯一可见差异：Run 返回快照稳定为 pending（原文档语义，调用方仅用 job.ID）
+
+---
+
 ## v2.6.1-pro（2026-10-24）
 
 架构重构批次（审计后续）：巨型文件按职责拆分，**纯移动、零契约/行为变化**。

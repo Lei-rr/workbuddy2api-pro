@@ -12,6 +12,8 @@
 > **补充（v2.6.0，非本清单条目）**：用户要求全项目代码审计 + 重构 + 清理 + 线上标准。四路审计修复 P0 6 项（弱密钥守卫/请求体上限/session O(1)/pool 落盘锁外/停机竞态/有界扇出）与主要 P1（writeJSON/审计/no-store/import 守卫/XSS/超时/竞态/gofmt+CI 门禁/文档漂移）。
 >
 > **补充（v2.6.1，非本清单条目）**：架构重构完成——panel.go 2335→294 + 按域拆分；autotask/taskcenter/upstream client/scheduler 拆分（纯移动、chunk 级等价）；前端源码 14 模块 + Go 拼接单文件服务（字节级等价）；巨型测试文件拆分；CI race job + coverage（详见 CHANGELOG v2.6.1）。
+>
+> **补充（v2.6.2）**：CI race job 首跑捕获 `internal/jobs` Run/execute 数据竞争（已修复：锁内 pending 快照 + Close 窗口修复 + 200 goroutine 压力测试），修复后 race 门禁转绿再发布。
 
 ---
 
