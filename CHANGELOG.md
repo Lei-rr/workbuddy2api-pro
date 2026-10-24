@@ -15,7 +15,7 @@
 ### 安全 P0
 
 - **默认密钥风险**：`config.example.json` 不再含 `test_key`（`api_key` 为空）；新增弱密钥启动守卫——`api_key`/`panel.api_key` 命中弱值名单（test_key/changeme/password/123456/example 等）且监听非回环时**拒绝启动**并提示生成随机密钥（回环仅 WARN）；Docker 默认配置因此 fail-fast，不再出现「公网已知密钥网关」
-- **`/v1` 请求体无上限**：新增 `server.max_body_mb`（默认 64MiB，env `WB2A_MAX_BODY_MB`，clamp 1–1024）；`/v1/chat/completions`、`/v1/messages` 等用 `http.MaxBytesReader` 限长，超限 413（OpenAI/Anthropic 错误体）；面板 POST 同样限长（普通 1MiB / import 32MiB）
+- **`/v1` 请求体无上限**：新增 `server.max_body_mb`（默认 64MiB，env `WB2A_MAX_BODY_MB`，clamp 1–1024）；`/v1/chat/completions`、`/v1/search/messages`（Anthropic 兼容端点）等用 `http.MaxBytesReader` 限长；`/v1/messages` 为保留路径（404），超限 413（OpenAI/Anthropic 错误体）；面板 POST 同样限长（普通 1MiB / import 32MiB）
 - **面板敏感响应**：`/panel/api/*` 默认 `Cache-Control: no-store`（config 回显含密钥/口令不再被缓存；accounts 的 ETag/304 语义保持）；`meta`/`jobs` 写操作补操作审计（`account_meta_update/delete`、`job_run/cancel`）
 
 ### 可靠性与性能 P0
