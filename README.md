@@ -34,7 +34,7 @@
 > 10. **v2.4.0/v2.4.1 实时批次**：**SSE 事件推送**（`GET /panel/api/events`，snapshot/jobs/accounts + 心跳，替代轮询，断线自动回落）；前端 `#rtBadge` 实时徽标。v2.4.1 按用户要求移除了 v2.4.0 试做的「多用户/RBAC」与「凭证静态加密」，保持单密钥与明文 auths 行为。
 > 11. **v2.5.0 性能专项**：针对 1k–10k+ 账号重构热路径——Pool 快照/摘要缓存（`Snapshot`/`Summary`/`Version`/模型锁 O(1)）、面板 overview/metrics/accounts/ETag 304 缓存、启动 LoadDir 并行 + Realm 记忆化。**10k 账号：启动 1.6s→0.6s、RSS 214→92MB、混合读吞吐 327→4132 req/s、p95 69→5.9ms**（详见 [PERF.md](PERF.md)）。
 > 12. **v2.6.0 生产化审计批次**（用户要求全项目审计/重构/清理）：修复审计发现的 **6 项 P0**——镜像/文档默认弱密钥、`/v1` 请求体无上限、session 粘性每请求 O(n)、pool 落盘锁内 IO、停机竞态、账号级无上限 goroutine 扇出；补齐 gofmt/CI 门禁、敏感响应 no-store、操作审计覆盖、请求体上限、跨端 XSS 兜底与请求超时/竞态；修正文档漂移与仓库卫生。
-> 13. **v2.6.1 架构重构批次**：巨型文件按职责拆分（**零契约/行为变化**）——`panel.go` 2335→294 行 + 10 个按域文件；`autotask.go`/`taskcenter.go` 拆分；`upstream/client.go` 2497→6 文件；`scheduler.go` 1757→7 文件；前端 `app.js` 拆为 `web/*.js` 14 个模块、Go 端拼接后仍单文件服务且与服务端产物**字节级一致**；巨型测试文件按域拆分（测试名集合不变）；CI 增加 **race job** 与 coverage 摘要（race 首跑发现 `internal/jobs` 竞争，已在 v2.6.2 修复并复验）。
+> 13. **v2.6.1 架构重构批次**：巨型文件按职责拆分（**零契约/行为变化**）——`panel.go` 2335→185 行 + 10 个按域文件；`autotask.go`/`taskcenter.go` 拆分；`upstream/client.go` 2497→6 文件；`scheduler.go` 1757→7 文件；前端 `app.js` 拆为 `web/*.js` 14 个模块、Go 端拼接后仍单文件服务且与服务端产物**字节级一致**；巨型测试文件按域拆分（测试名集合不变）；CI 增加 **race job** 与 coverage 摘要（race 首跑发现 `internal/jobs` 竞争，已在 v2.6.2 修复并复验）。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -1162,7 +1162,7 @@ readinessProbe:
 
 审计后按职责拆分巨型文件（纯移动、零契约变化）：
 
-- `internal/panel/`：`panel.go`（Config/Panel/New/ServeHTTP/withAuth，~294 行）+ `routes.go`/`overview.go`/`accounts.go`/`accounts_ops.go`/`models.go`/`logs.go`/`usage.go`/`httpjson.go`/`gzip.go`/`ratelimit.go`/`helpers.go`；`autotask*`/`taskcenter*`/`taskqueue` 按动作/运行器/HTTP 拆分
+- `internal/panel/`：`panel.go`（Config/Panel/New/ServeHTTP/withAuth，185 行）+ `routes.go`/`overview.go`/`accounts.go`/`accounts_ops.go`/`models.go`/`logs.go`/`usage.go`/`httpjson.go`/`gzip.go`/`ratelimit.go`/`helpers.go`；`autotask*`/`taskcenter*`/`taskqueue` 按动作/运行器/HTTP 拆分
 - 面板前端源码：`internal/panel/web/*.js`（14 个模块，按文件名字典序拼接）→ Go `//go:embed` 后仍以**单文件 `/panel/app.js`** 输出（URL/缓存/浏览器行为不变，拼接结果与重构前字节级一致）
 - `internal/upstream/client.go`（2497 行）→ `client.go`/`chat.go`/`errors.go`/`refresh.go`/`models.go`/`billing.go`；`internal/scheduler/scheduler.go`（1757 行）→ `scheduler.go`/`batch.go`/`tasks.go`/`catchup.go`/`hooks.go`/`balance.go`/`sweep.go`
 - 巨型测试文件按域拆分（server 114 个测试名/ pool 210 / cmd-server 103，测试名集合与拆分前完全一致）；CI 增加 **race job**（关键并发包）与 coverage 摘要

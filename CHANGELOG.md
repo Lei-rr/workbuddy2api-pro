@@ -36,7 +36,7 @@
 
 ### panel 包
 
-- `panel.go` 2335 → **294 行**（保留 Config/Panel/New/ServeHTTP/withAuth 等核心）；拆出 `routes.go`/`overview.go`/`accounts.go`/`accounts_ops.go`/`models.go`/`logs.go`/`usage.go`/`httpjson.go`/`gzip.go`/`ratelimit.go`/`helpers.go`（60 路由数量不变）
+- `panel.go` 2335 → **185 行**（保留 Config/Panel/New/ServeHTTP/withAuth 等核心）；拆出 `routes.go`/`overview.go`/`accounts.go`/`accounts_ops.go`/`models.go`/`logs.go`/`usage.go`/`httpjson.go`/`gzip.go`/`ratelimit.go`/`helpers.go`（60 路由数量不变）
 - `autotask.go` 1437 → 252 + `autotask_actions.go`/`autotask_runner.go`/`autotask_http.go`；`taskcenter.go` 587 → 46 + `taskqueue.go`/`taskcenter_http.go`
 - 响应出口统一到 `httpjson.go`（`writeJSON`/`writeErr`/`writeJSONStatus`/`readJSONBody`）；错误形状/状态码/文案不变
 
