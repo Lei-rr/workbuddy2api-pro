@@ -12,13 +12,10 @@
     "api_key": "",
     "poll_interval_sec": 5,
     "package_detail_limit": 5,
-    "session_ttl": "12h",
-    "events_enabled": true,
-    "users": []
+    "events_enabled": true
   },
   "security": {
-    "allow_anonymous": false,
-    "encrypt_auths": false
+    "allow_anonymous": false
   },
   "logging": {
     "request_archive_enabled": true,

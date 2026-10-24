@@ -23,11 +23,6 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
-      # v2.4.0 #7 凭证静态加密：仅当 config.json 的 security.encrypt_auths=true 时
-      # 必填（缺失/非法会启动失败）。值为 32 字节主密钥的 base64 或 64 位 hex，例如
-      # `openssl rand -base64 32` 的输出。请单独备份主密钥、不要与 auths/ 放一起：
-      # 丢失后已加密的凭证不可恢复。启用前先停服执行 authcrypt -encrypt 迁移。
-      # - WB2A_MASTER_KEY: "<base64-32B>"
     ports:
       - "7863:7863"
     volumes:

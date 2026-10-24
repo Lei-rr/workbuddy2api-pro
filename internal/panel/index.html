@@ -153,11 +153,6 @@ body {
 .rt-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .75; }
 .rt-badge.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
 .rt-badge.connecting { color: var(--warn); }
-/* v2.4.0 #6 当前用户/角色（多用户模式） */
-.cur-user { font-size: 12px; color: var(--ink-2); white-space: nowrap; max-width: 220px;
-  overflow: hidden; text-overflow: ellipsis; }
-.login-dlg .body { display: flex; flex-direction: column; gap: 8px; }
-.login-dlg .body input { width: 100%; }
 .view { padding: 22px 24px 60px; max-width: 1560px; margin: 0 auto; width: 100%; }
 .view[hidden] { display: none; }
 
@@ -663,7 +658,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
-      <li id="navConfigLi"><a href="#config" data-view="config">
+      <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
       <li><a href="#logs" data-view="logs">
@@ -688,11 +683,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="grow"></div>
       <!-- v2.4.0 #3：实时事件徽标（绿色=SSE 已连接，灰色=回落轮询） -->
       <span class="rt-badge poll" id="rtBadge" hidden title="实时事件未连接，使用轮询刷新">轮询</span>
-      <!-- v2.4.0 #6：当前登录用户（多用户模式显示；单密钥模式隐藏） -->
-      <span class="cur-user" id="curUser" hidden></span>
-      <button class="icon ghost" id="btnLogout" title="退出登录" aria-label="退出登录" hidden>
-        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M6.5 2.5h-4v11h4"/><path d="M10 5l3 3-3 3M13 8H6"/></svg>
-      </button>
       <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
@@ -1595,30 +1585,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<!-- 登录层（v2.4.0 #6）：单密钥模式=面板密钥输入；多用户模式=用户名/密码。
-     模式未知（/auth/info 401/不可达）时默认密钥表单，footer 提供切换入口。 -->
 <div class="veil" id="keyVeil" data-lock="1">
-  <div class="dlg login-dlg" style="width:420px">
+  <div class="dlg" style="width:420px">
     <header>
-      <h3 id="loginTitle">需要访问密钥</h3>
-      <div class="hint" id="loginHint">该面板已启用密钥鉴权。请输入<b>面板密钥</b>（config.json 的 <code>panel.api_key</code>）；未单独配置面板密钥时，回落到网关 <code>api_key</code>。</div>
+      <h3>需要访问密钥</h3>
+      <div class="hint">该面板已启用密钥鉴权。请输入<b>面板密钥</b>（config.json 的 <code>panel.api_key</code>）；未单独配置面板密钥时，回落到网关 <code>api_key</code>。</div>
     </header>
     <div class="body">
-      <div id="keySingle">
-        <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="面板密钥（panel.api_key）" autocomplete="off"></form>
-        <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
-      </div>
-      <div id="keyMulti" hidden>
-        <input type="text" id="loginUser" placeholder="用户名" autocomplete="username">
-        <input type="password" id="loginPass" placeholder="密码" autocomplete="current-password">
-        <div class="state err" id="loginErr" hidden style="margin-top:10px">用户名或密码错误</div>
-      </div>
+      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="面板密钥（panel.api_key）" autocomplete="off"></form>
+      <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
-      <button class="xs ghost" id="keyModeSwitch" hidden>用账号密码登录</button>
       <span class="grow"></span>
-      <button id="btnKey">进入</button>
-      <button class="primary" id="btnLogin" hidden>登录</button>
+      <button class="primary" id="btnKey">进入</button>
     </footer>
   </div>
 </div>

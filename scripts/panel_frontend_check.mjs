@@ -71,14 +71,11 @@ const HTML_ONLY_ID_PREFIX_ALLOW = ['view-'];
 const APP_ONLY_ID_ALLOW = new Map([]);
 
 /* api()/apiCached() 允许的相对路径前缀（后端面板 API 契约；只增不改名）。
-   这里的每一项都对应 internal/panel 的既有路由或其动态子路径。
-   v2.4.0（Lead 授权）：新增 events（SSE）与 auth/（login/logout/info）前缀。 */
+   这里的每一项都对应 internal/panel 的既有路由或其动态子路径。 */
 const API_PATH_PREFIXES = [
   'accounts/',
   'accounts?',
-  'activity_all',
   'audit?',
-  'auth/',
   'balance_all',
   'checkin_all',
   'config',

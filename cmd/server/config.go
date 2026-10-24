@@ -38,11 +38,6 @@ type Config struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 
-		// Users 面板多用户（v2.4.0 #6 RBAC）：空 = 单密钥模式（api_key/panel.api_key 行为不变）。
-		// 非空时启用用户名/密码登录 + 角色（admin/operator/viewer）；api_key 仍等价 admin（脚本兼容）。
-		Users []PanelUser `json:"users"`
-		// SessionTTL 面板登录会话有效期（Go duration，默认 "12h"，clamp 5m..7d）。
-		SessionTTL string `json:"session_ttl"`
 		// EventsEnabled SSE 事件推送开关（v2.4.0 #3；默认 true，前端不支持/断流时自动回落轮询）。
 		EventsEnabled bool `json:"events_enabled"`
 	} `json:"panel"`
@@ -53,10 +48,6 @@ type Config struct {
 		// 默认 false：这种组合会在启动时直接拒绝（防止把面板与 /v1 裸奔暴露到网络）。
 		// 仅回环监听（127.0.0.1 / ::1 / localhost）无需本开关即可免密钥自用。
 		AllowAnonymous bool `json:"allow_anonymous"`
-
-		// EncryptAuths 凭证静态加密（v2.4.0 #7）：true 时 auths/ 用 AES-256-GCM 加密落盘，
-		// 需设置环境变量 WB2A_MASTER_KEY（base64 或 hex 的 32 字节密钥）。
-		EncryptAuths bool `json:"encrypt_auths"`
 	} `json:"security"`
 
 	Logging struct {
@@ -351,19 +342,6 @@ type Config struct {
 
 	// NotifyTimeoutDur 解析后的 Webhook 超时（v2.3 #19）；默认 10s，clamp 1..60s。
 	NotifyTimeoutDur time.Duration `json:"-"`
-
-	// PanelSessionTTLDur 解析后的面板会话有效期（v2.4 #6）；默认 12h，clamp 5m..7d。
-	PanelSessionTTLDur time.Duration `json:"-"`
-}
-
-// PanelUser 面板多用户条目（v2.4.0 #6 RBAC）。
-// Password 为明文（config.json 应 0600）或 PasswordHash 为 sha256:<salt>:<hex>；
-// 两者都为空 = 该用户不可登录（仅保留展示）。Role 缺省 viewer。
-type PanelUser struct {
-	Name         string `json:"name"`
-	Password     string `json:"password,omitempty"`
-	PasswordHash string `json:"password_hash,omitempty"`
-	Role         string `json:"role"`
 }
 
 // Default 默认配置。
@@ -387,7 +365,6 @@ func Default() *Config {
 	c.Notify.Events = []string{"job_done", "account_disabled", "checkin_failed"}
 	c.Panel.PollIntervalSec = 5
 	c.Panel.PackageDetailLimit = 5
-	c.Panel.SessionTTL = "12h"
 	c.Panel.EventsEnabled = true
 	// Security.AllowAnonymous 缺省 false（零值即默认）：非回环监听 + 空密钥会启动失败。
 	// Schedule 里 v2.0.1 新增键的推荐值（scheduler 后续任务消费）。
@@ -610,17 +587,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_NOTIFY_TITLE"); v != "" {
 		c.Notify.Title = v
 	}
-	if v := os.Getenv("WB2A_PANEL_SESSION_TTL"); v != "" {
-		c.Panel.SessionTTL = v
-	}
 	if v := os.Getenv("WB2A_PANEL_EVENTS_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Panel.EventsEnabled = b
-		}
-	}
-	if v := os.Getenv("WB2A_ENCRYPT_AUTHS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Security.EncryptAuths = b
 		}
 	}
 	if v := os.Getenv("WB2A_NOTIFY_EVENTS"); v != "" {
@@ -768,55 +737,6 @@ func (c *Config) normalize() error {
 	}
 	if c.Jobs.Retain > 500 {
 		c.Jobs.Retain = 500
-	}
-	// v2.4 面板多用户与会话（#6）：角色/用户名校验，session_ttl 默认 12h、clamp 5m..7d。
-	if c.Panel.SessionTTL == "" {
-		c.Panel.SessionTTL = "12h"
-	}
-	var sttlErr error
-	if c.PanelSessionTTLDur, sttlErr = time.ParseDuration(c.Panel.SessionTTL); sttlErr != nil {
-		return fmt.Errorf("panel.session_ttl: %w", sttlErr)
-	}
-	switch {
-	case c.PanelSessionTTLDur <= 0:
-		return fmt.Errorf("panel.session_ttl: 必须为正时长（收到 %q）", c.Panel.SessionTTL)
-	case c.PanelSessionTTLDur < 5*time.Minute:
-		c.Panel.SessionTTL = "5m"
-		c.PanelSessionTTLDur = 5 * time.Minute
-	case c.PanelSessionTTLDur > 7*24*time.Hour:
-		c.Panel.SessionTTL = "168h"
-		c.PanelSessionTTLDur = 7 * 24 * time.Hour
-	}
-	if len(c.Panel.Users) > 0 {
-		seenUsers := make(map[string]bool, len(c.Panel.Users))
-		for i := range c.Panel.Users {
-			u := &c.Panel.Users[i]
-			u.Name = strings.TrimSpace(u.Name)
-			if u.Name == "" {
-				return fmt.Errorf("panel.users[%d]: name 不能为空", i)
-			}
-			if seenUsers[u.Name] {
-				return fmt.Errorf("panel.users: 用户名重复 %q", u.Name)
-			}
-			seenUsers[u.Name] = true
-			u.Role = strings.ToLower(strings.TrimSpace(u.Role))
-			switch u.Role {
-			case "":
-				u.Role = "viewer"
-			case "admin", "operator", "viewer":
-			default:
-				return fmt.Errorf("panel.users[%d] %q: role 只支持 admin/operator/viewer", i, u.Name)
-			}
-			if u.Password != "" && u.PasswordHash != "" {
-				return fmt.Errorf("panel.users[%d] %q: password 与 password_hash 只能二选一", i, u.Name)
-			}
-			if u.Password == "" && u.PasswordHash == "" {
-				return fmt.Errorf("panel.users[%d] %q: 必须配置 password 或 password_hash", i, u.Name)
-			}
-			if u.PasswordHash != "" && !strings.HasPrefix(u.PasswordHash, "sha256:") {
-				return fmt.Errorf("panel.users[%d] %q: password_hash 格式应为 sha256:<salt>:<hex>", i, u.Name)
-			}
-		}
 	}
 	// v2.3 #19 通知渠道：空 WebhookURL = 关闭；timeout 默认 10s，clamp 1..60s。
 	if c.Notify.Timeout == "" {

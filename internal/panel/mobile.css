@@ -59,11 +59,6 @@
   .topbar button { padding: 5px 9px; font-size: 12.5px; border-radius: 8px; }
   .topbar button.icon { padding: 5px 8px; }
   .topbar #btnAdd { padding: 5px 12px; }
-  /* v2.4.0 #3/#6：实时徽标与当前用户不挤占顶栏；多用户登录层窄屏整宽不溢出 */
-  #rtBadge { flex: none; }
-  #curUser { max-width: 38vw; min-width: 0; }
-  #keyVeil .dlg { width: min(420px, calc(100vw - 20px)); }
-  #keyVeil .body input { width: 100%; }
 
   /* ── 3. 宽表 → 卡片 ────────────────────────────────────────────────
      关键一条：.tbl-wrap 必须覆盖桌面端的 overflow-x:auto，否则卡片列再好看，
@@ -347,3 +342,7 @@
   #accTagFilter { max-width: 100%; min-width: 0; }
 }
 
+/* v2.4.0 #3 实时徽标：顶栏窄屏不挤压其它控件 */
+@media (max-width: 760px) {
+  #rtBadge { flex: none; }
+}

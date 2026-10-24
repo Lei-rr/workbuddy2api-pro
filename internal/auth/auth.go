@@ -278,26 +278,10 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 //
 //	嵌套形 {"auth":{...},"account":{...}}  （插件 OAuth 输出）
 //	扁平形 {"accessToken":...,"uid":...}   （手写/旧版）
-//
-// v2.4.0 #7：若内容是加密包装（{"encrypted":true,...}）则先用主密钥解密再按明文
-// 解析；旧明文文件零改动兼容（混合目录可直接工作）。解密失败返回明确错误（不含
-// 密文）；需要文件名时用 ParseFile。
 func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
-	if IsEncryptedFile(raw) {
-		plain, err := Decrypt(raw)
-		if err != nil {
-			return nil, err
-		}
-		raw = plain
-	}
-	return parsePlain(raw)
-}
-
-// parsePlain 解析明文 auth JSON（Parse 解密后的核心路径；格式见 Parse 注释）。
-func parsePlain(raw []byte) (*Auth, error) {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -402,15 +386,6 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	// v2.4.0 #7：开启静态加密后一律写密文（内部 JSON 与明文完全一致）；主密钥不可用
-	// 则拒绝写回——绝不静默降级成明文覆盖掉一个已加密文件。
-	if EncryptionEnabled() {
-		encrypted, encErr := Encrypt(raw)
-		if encErr != nil {
-			return fmt.Errorf("%w（uid=%s，文件 %s）: %v", ErrEncryptionUnavailable, a.UID, a.FilePath, encErr)
-		}
-		raw = encrypted
-	}
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
@@ -440,9 +415,6 @@ func LoadDir(dir string) ([]*Auth, error) {
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
-	// v2.4.0 #7：加密开启但目录里仍有明文旧文件时，汇总一条 WARN 提示迁移（不阻断）。
-	var plaintextFiles int
-	var firstPlaintext string
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
@@ -450,18 +422,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 		a, err := Parse(raw)
 		if err != nil {
-			// 明文文件解析失败保持历史"静默跳过"；加密文件解密失败必须点名告警——
-			// 否则主密钥错误/文件损坏会表现为"账号莫名消失"。
-			if IsEncryptedFile(raw) {
-				log.Printf("WARN: auth %s 解密失败（主密钥不正确或文件损坏，已跳过）: %v", f, err)
-			}
 			continue
-		}
-		if EncryptionEnabled() && !IsEncryptedFile(raw) {
-			plaintextFiles++
-			if firstPlaintext == "" {
-				firstPlaintext = f
-			}
 		}
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
@@ -479,12 +440,6 @@ func LoadDir(dir string) ([]*Auth, error) {
 			}
 		}
 		out = append(out, a)
-	}
-	// v2.4.0 #7：加密已启用但仍有明文旧文件 → 可读（混合目录兼容），提示尽快迁移。
-	if plaintextFiles > 0 {
-		log.Printf("WARN: auths 静态加密已启用，但发现 %d 个明文凭证文件（如 %s）；"+
-			"建议运行 authcrypt -encrypt 迁移（未迁移文件仍可读，写回时会自动加密）",
-			plaintextFiles, firstPlaintext)
 	}
 	return out, nil
 }

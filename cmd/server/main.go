@@ -36,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.4.0-pro"
+const appVersion = "2.4.1-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -50,26 +50,6 @@ func stateSibling(stateFile, name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
-}
-
-// panelUsersFromCfg 把 cmd/server 的 panel.users 配置转换为 panel 包类型
-// （v2.4.0 #6 RBAC；panel 包不依赖 cmd/server，转换在装配层完成）。
-// 密码/哈希原样透传：panel 侧做常时比较（明文→sha256 摘要；password_hash→
-// sha256(salt+password)）；角色已在 Load/normalize 校验。
-func panelUsersFromCfg(users []PanelUser) []panel.PanelUser {
-	if len(users) == 0 {
-		return nil
-	}
-	out := make([]panel.PanelUser, 0, len(users))
-	for _, u := range users {
-		out = append(out, panel.PanelUser{
-			Name:         u.Name,
-			Password:     u.Password,
-			PasswordHash: u.PasswordHash,
-			Role:         u.Role,
-		})
-	}
-	return out
 }
 
 func main() {
@@ -111,33 +91,6 @@ func main() {
 		log.Printf("WARN: panel.api_key 未配置，面板与网关共用同一把 api_key（建议分离；panel.api_key 变更需重启）")
 	case cfg.Security.AllowAnonymous:
 		log.Printf("WARN: api_key 与 panel.api_key 均为空且 security.allow_anonymous=true：网关与面板均无鉴权（仅限可信网络）")
-	}
-
-	// v2.4.0 #7 凭证静态加密装配：security.encrypt_auths=true 时必须在加载账号前
-	// 拿到 32 字节主密钥（WB2A_MASTER_KEY），否则 fail-fast——拿不到密钥既解不开已有
-	// 密文、也写不回新凭证，静默降级明文会直接破坏加密承诺。未开启时不干预（旧明文
-	// 目录零影响）。
-	if cfg.Security.EncryptAuths {
-		key, keyErr := auth.LoadMasterKeyFromEnv()
-		if keyErr != nil {
-			log.Fatalf("security.encrypt_auths=true 但 %s 非法: %v（密钥须为 32 字节的 base64 或 hex，可用 `openssl rand -base64 32` 生成）",
-				auth.EnvMasterKey, keyErr)
-		}
-		if len(key) == 0 {
-			log.Fatalf("security.encrypt_auths=true 但未设置 %s：请先提供主密钥（如 `openssl rand -base64 32` 并妥善单独备份），"+
-				"已有明文 auths 用 `authcrypt -encrypt -config %s` 迁移；主密钥丢失则加密凭证不可恢复",
-				auth.EnvMasterKey, *cfgPath)
-		}
-		if setErr := auth.SetMasterKey(key); setErr != nil {
-			log.Fatalf("设置 auths 主密钥失败: %v", setErr)
-		}
-		auth.EnableEncryption(true)
-		log.Printf("auths 静态加密已启用（AES-256-GCM；主密钥指纹 %s）", auth.MasterKeyFingerprint())
-	} else if key, keyErr := auth.LoadMasterKeyFromEnv(); keyErr != nil {
-		log.Printf("WARN: %s 非法（security.encrypt_auths=false，未启用加密）: %v", auth.EnvMasterKey, keyErr)
-	} else if len(key) > 0 {
-		log.Printf("WARN: %s 已配置但 security.encrypt_auths=false：auths 仍以明文读写（如需加密请置 true 并用 authcrypt 迁移）",
-			auth.EnvMasterKey)
 	}
 
 	// v2.2 #13 启动自检（warn 而非 fatal）：auth_dir / state 目录可写性 + 磁盘水位。
@@ -438,9 +391,6 @@ func main() {
 		// panel.api_key 变更需重启；轮询间隔经上面的 live 快照热生效。
 		PanelAPIKey:     cfg.Panel.APIKey,
 		PollIntervalSec: cfg.Panel.PollIntervalSec,
-		// v2.4.0 #6 多用户/RBAC 与会话（空 users = 单密钥模式，行为不变）。
-		Users:      panelUsersFromCfg(cfg.Panel.Users),
-		SessionTTL: cfg.PanelSessionTTLDur,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile: stateSibling(cfg.StateFile, "output_probes.json"),
