@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.4.1-pro`**。
+> **WorkBuddy2API Pro（本仓库）**：基于上游 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**最终版**（2026-10-21 已停止维护，commit `73a7560`）继续开发的自用分支，当前版本 **`2.5.0-pro`**。
 >
 > 相对上游最终版的 Pro 改动（详见 [CHANGELOG.md](CHANGELOG.md)）：
 > 1. **项目更名 `workbuddy2api-pro`**：Go module · GHCR 镜像 · 容器名 · 面板品牌 · 发布产物同步；
@@ -32,6 +32,7 @@
 > 8. **v2.3.0 运维效能批次**：全池批量任务 **Job Runner**（异步/进度/取消/持久化/单飞）、**Webhook 事件通知**（job_done/account_disabled/checkin_failed）、**账号备注/标签服务端化**（data/account-meta.json，替代 localStorage）、面板 Job 进度条与备注迁移。
 > 9. **v2.3.1 调度与体验批次**：签到并发（`schedule.checkin_concurrency` 默认 3）+ **跳过当日已签** + 429 瞬态重试分层；**按族解耦调度**（慢签到不再阻塞旅行/活跃）；定时/补跑批次进入 Job 历史；账号池**标签筛选**（`tag=` + `GET meta/tags`）；通知渠道扩展 **企业微信 / Telegram / Bark**；`scripts/panel_frontend_check.mjs` 前端工程化检查接入 CI。
 > 10. **v2.4.0/v2.4.1 实时批次**：**SSE 事件推送**（`GET /panel/api/events`，snapshot/jobs/accounts + 心跳，替代轮询，断线自动回落）；前端 `#rtBadge` 实时徽标。v2.4.1 按用户要求移除了 v2.4.0 试做的「多用户/RBAC」与「凭证静态加密」，保持单密钥与明文 auths 行为。
+> 11. **v2.5.0 性能专项**：针对 1k–10k+ 账号重构热路径——Pool 快照/摘要缓存（`Snapshot`/`Summary`/`Version`/模型锁 O(1)）、面板 overview/metrics/accounts/ETag 304 缓存、启动 LoadDir 并行 + Realm 记忆化。**10k 账号：启动 1.6s→0.6s、RSS 214→92MB、混合读吞吐 327→4132 req/s、p95 69→5.9ms**（详见 [PERF.md](PERF.md)）。
 >
 > 上游停止维护的三条原因（反代收紧 / 个人精力 / 非法转卖）依然成立：**本仓库不承诺长期跟进上游协议变化，请自行评估风控与合规风险**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
@@ -816,11 +817,12 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview`（默认全量；`?lite=1` 无 accounts、约 1–2 KB）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview`（默认全量；`?lite=1` 或 `?accounts=0` 无 accounts、约 1–2 KB，10k 约 0.5ms）· **`GET accounts`**（`page` / `page_size`（0=全部，上限 2000）/ `q` / `state=healthy|cooling|paused|disabled` / `realm=cn|global` / `enterprise=1|0` / `sort=uid|credits|last_success|cool_remaining` / `fields=light|full`；响应 `{ok,now,total,filtered,page,page_size,pages,rows}` + ETag/304）· `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 可观测（v2.2.0） | `GET readyz`（就绪探测：config/auth_dir/state_dir 可写 + pool_loaded，失败 503）· `GET metrics`（Prometheus text v0.0.4：池计数/在途/积分合计/模型锁/面板请求计数）· `GET audit?limit=200`（面板操作审计 JSONL，新的在前）· `GET task_runs?limit=100`（任务执行历史 JSONL） |
 | 任务调度（v2.3.0/v2.3.1） | `GET jobs?limit=20`（Job 列表，新→旧；**v2.3.1 起含定时/补跑批次 trigger=schedule/catch_up**）· `GET jobs/{id}` · `POST jobs/{kind}/run`（kind=checkin/travel/activity/keepalive/balance；同类在跑 409）· `POST jobs/{id}/cancel`（只停后续账号）；旧批量端点保留 `ok/started` 并新增 `job_id` |
 | 备注/标签（v2.3.0/v2.3.1） | `GET meta`（全部账号备注/标签）· **`GET meta/tags`（标签及计数，count 降序）** · `GET accounts/{uid}/meta` · `PUT accounts/{uid}/meta`（body `{note,tags}`；note≤500 字符、tags≤10×32 字符）· `DELETE accounts/{uid}/meta`；`GET accounts?tag=<标签>` 服务端筛选 |
 | 事件推送（v2.4.0） | `GET events`（SSE：`snapshot`/`jobs`/`accounts` 事件 + 15s 心跳；Bearer 鉴权；`panel.events_enabled=false` → 404；单实例进程内推送） |
+| 性能 | accounts 分页支持 `sort`/`tag`/`fields=light` 且 304 快速路径；轻量汇总用 `overview?accounts=0`（见 [PERF.md](PERF.md)） |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all` · **`run`（单账号一键做任务，返回逐项结果 + `summary{total,done,skipped,error,claimed}`）**；`POST tasks/scan_all` · `tasks/run_queue` |
 
@@ -926,6 +928,15 @@ http://127.0.0.1:7863/panel/
 | `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长 |
 
 **敏感度**：日志不含任何 token 明文（详见[安全与合规](#安全与合规)），无落盘日志文件。
+
+### 性能与容量（v2.5.0）
+
+10k+ 账号的实测数据、优化点、容量建议与复现方式见 **[PERF.md](PERF.md)**。要点：
+
+- 面板默认即最优路径：账号池轮询 = `overview?lite=1`（10k 约 **0.5ms**）+ 当前页 `accounts`（light 100 行约 **3ms**，ETag 304 约 **0.6ms**）；`metrics` 约 **0.6ms**
+- 脚本/监控：用 `GET /panel/api/overview?accounts=0`（或 `?lite=1`）取汇总；全量 overview（含 accounts）在 10k 约 7MB，属兼容接口，面板不再使用
+- 启动：10k auths 启动约 **0.6s**（LoadDir 并行 + Realm 记忆化）；日志有 `startup: load auths took …` / `startup: pool load+sync took …` / `startup: ready took …` 三段计时
+- 容量：1k–10k 默认配置即可；>10k 建议开启 SSE 事件（`panel.events_enabled` 默认 true）减少轮询
 
 ## 部署运维
 

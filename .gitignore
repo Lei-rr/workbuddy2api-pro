@@ -37,6 +37,7 @@ docs/
 !CHANGELOG.md
 !MAINTAINERS.md
 !UPGRADE_PROPOSALS.md
+!PERF.md
 
 # Windows binaries
 /wb2api.exe

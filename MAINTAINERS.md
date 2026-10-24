@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.4.1-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.5.0-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -59,6 +59,7 @@ node --check internal/panel/mobile.js
 9. **v2.3.0 运维效能**（2026-10-24）：`internal/jobs` Job Runner（异步/进度/取消/data/jobs.json/单飞/Job 级并发闸门）；`internal/notify` Webhook 通知（job_done/account_disabled/checkin_failed）；备注/标签服务端化 `data/account-meta.json` + 前端迁移；旧批量端点新增 job_id 兼容。**Job Runner 的并发闸门是「同时执行的 Job 数」，账号级并行度仍由各任务控制**。
 10. **v2.3.1 调度器完整优化**（2026-10-24）：签到 worker pool 并发（`schedule.checkin_concurrency` 默认 3）+ 跳过当日已签（进程内，重启重打）+ 429 重试分层 + 按族解耦（慢签到不阻塞其它族）；定时/补跑批次进入 Job 历史（trigger=schedule/catch_up，可取消）；标签服务端筛选（accounts tag + meta/tags 索引）；通知渠道 wecom/telegram/bark；`scripts/panel_frontend_check.mjs` 入 CI。**改调度语义时先看 checkin11_test.go 的分层/跳过/并发断言**。
 11. **v2.4.0/v2.4.1 实时与清理**（2026-10-24）：v2.4.0 实现 SSE 事件推送（`GET /panel/api/events` + 前端 fetch/ReadableStream + 断线回落轮询）；**v2.4.1 按用户要求移除 v2.4.0 试做的多用户/RBAC 与凭证静态加密**（auth 路由/`panel.users`/`encrypt_auths`/authcrypt 全部删除），保留 SSE。**不要再引入多用户或 auths 加密，除非用户明确要求**。
+12. **v2.5.0 性能专项**（2026-10-24）：Pool 快照/摘要缓存（`Snapshot`/`Version`/`Summary`/`AvailableUIDsSorted`，`List` 保持拷贝语义）、`ModelLockView` 空锁 O(1)、面板 overview/metrics/accounts 热路径与 ETag/304 LRU 缓存、gzip 池、启动 LoadDir 并行 + Realm 记忆化 + 启动分段日志、`?accounts=0` 轻量 overview、tools/perfbench 基准。**改热路径先读 PERF.md 与 pool/cache.go 注释：Snapshot 返回切片只读；Version 不覆盖 InFlight 瞬时变化；面板 ETag 缓存 TTL 10s 兜底**。
 
 ## 部署链路
 
@@ -139,6 +140,11 @@ services:
 - v2.3.1 标签筛选匹配大小写不敏感；`GET meta/tags` 展示拼写=uid 序首个出现的原始拼写（稳定但非最近编辑值）；暂不支持「无标签」筛选（`tag=`=不筛选）。
 - v2.3.1 CI 前端门禁脚本 `scripts/panel_frontend_check.mjs`：改 app.js/index.html 后本地先跑，失败会指出缺失 id/超预算/非法路径。
 - v2.4.x SSE：单实例进程内推送；心跳固定 15s（反代空闲超时需 >15s）；慢客户端断开由重连 snapshot 自愈；`panel.events_enabled=false` 时前端回落 5s 轮询。
+- v2.5.0 `Pool.Snapshot()` 返回的切片**只读**（缓存复用，不得排序/append/改元素）；需要可变副本用 `List()` 或显式拷贝。
+- v2.5.0 `Pool.Version()` 不因在途请求计数（Acquire/Release）递增（有意，避免 chat 流量打穿面板缓存）；面板 ETag/缓存的新鲜度由 TTL 兜底。
+- v2.5.0 面板 ETag 缓存：键=归一化 accountsQuery，失效=pool 代际/accountMetaSeq/TTL 10s；304 快速路径不读快照不构 rows；200 仍按当前时间重算 rows（now/in_flight/cool_remaining 新鲜）。
+- v2.5.0 启动日志新增 3 行 `startup: …`；10k 冷启动若明显偏慢先看 load auths / ready 分段。
+- v2.5.0 全量 `overview`（默认含 accounts）仍是重接口（10k ~123ms/7.1MB），新脚本/监控用 `?lite=1` 或 `?accounts=0`。
 - v2.4.1 起面板回到**单密钥模式**：`api_key`/`panel.api_key` Bearer 即 admin；v2.4.0 的 auth 端点已删除（旧脚本调用会 404）。
 - v2.4.1 起 auths **恢复明文**：曾用 v2.4.0 authcrypt 加密过 auths 的部署，升级前必须先用 v2.4.0 的 authcrypt `-decrypt` 恢复明文。
 - v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。

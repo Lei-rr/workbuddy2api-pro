@@ -8,6 +8,37 @@
 
 ---
 
+## v2.5.0-pro（2026-10-24）
+
+性能专项：针对 1k–10k+ 账号规模重构热路径（用户要求）。完整数据见 [PERF.md](PERF.md)。
+
+### 10k 账号实测（同机，详见 PERF.md）
+
+- 进程启动 **1,600ms → 600ms**；负载后 RSS **214MB → 92MB**；混合读吞吐 **327 → 4,132 req/s**；p95 **69ms → 5.9ms**
+- `overview?lite=1` **12.5ms → 0.54ms**；`metrics` **38ms → 0.57ms**；`accounts` 分页 100 行 **31ms → 2.9ms**；ETag 304 **31ms → 0.57ms**；`accounts` 全部（2000 上限）**73ms → 24ms**
+- 1k/5k：启动 296→~300ms / 881→416ms；吞吐 1,637→4,635 / 583→4,826 req/s
+
+### 改动
+
+- **internal/pool**：新增 `Snapshot() []Status`（缓存只读快照，uid 升序，命中 0 alloc）、`Summary()`（一次遍历聚合计数/积分/在途/模型锁，version+TTL 500ms 缓存）、`Version()`（内容代际，InFlight 例外）、`AvailableUIDsSorted()`；`List()` 保持旧拷贝语义；`ModelLockView` 空锁原子计数 O(1)；`statusOf` 共用 now/today 与模型台账单条目快路径
+- **internal/panel**：overview/metrics/SSE 改用 `Summary()`（删除多次全池扫描）；accounts 改 `Snapshot()` + 索引过滤/排序/分页（默认 uid 零排序）；**ETag/304 LRU 缓存**（归一化 query→etag，pool/meta 代际失效 + 10s TTL 兜底，304 不构 rows）；gzip 缓冲 `sync.Pool`；新增 `overview?accounts=0` 轻量模式
+- **internal/auth**：`LoadDir` worker pool 并行加载（结果稳定排序，语义不变）；`Realm()` 记忆化（atomic 快路径 + 写回自动失效）；auth 文件 Parse 去掉双重 Unmarshal
+- **cmd/server**：启动分段计时日志（load auths / pool load+sync / ready）
+- **工具**：新增 `tools/perfbench`（1k/5k/10k 可复现基准）+ pool/panel/auth 微基准
+
+### 兼容性
+
+- API 契约不变：accounts/overview/metrics 响应字段与 ETag 值保持兼容（ETag 值与优化前逐字节一致）；新增可选 `overview?accounts=0`
+- 无配置变更；启动日志新增 3 行 `startup: …` 便于观测
+- 已知剩余瓶颈（PERF.md 第 5 节）：全量 overview（默认含 accounts，10k 123ms/7.1MB，兼容保留）、`page_size=0` 上限 2000、`List()` 低频调用点、ModelLockView 有锁明细
+
+### 测试与验证
+
+- 新增测试：pool 缓存/版本语义 8 用例 + panel 优化 13 用例 + auth 并行/Realm/Parse 6 用例 + 3 组基准；`go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）
+- 独立性能对比：tools/perfbench 1k/5k/10k（前后数据见 PERF.md）；QA 回归见交付报告（`D:\\dsh\\tmp\\verify-final-v250.md`）
+
+---
+
 ## v2.4.1-pro（2026-10-24）
 
 按用户要求移除 v2.4.0 试做的两个功能，保留 SSE 实时事件。
