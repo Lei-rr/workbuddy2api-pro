@@ -8,6 +8,45 @@
 
 ---
 
+## v2.6.1-pro（2026-10-24）
+
+架构重构批次（审计后续）：巨型文件按职责拆分，**纯移动、零契约/行为变化**。
+
+### panel 包
+
+- `panel.go` 2335 → **294 行**（保留 Config/Panel/New/ServeHTTP/withAuth 等核心）；拆出 `routes.go`/`overview.go`/`accounts.go`/`accounts_ops.go`/`models.go`/`logs.go`/`usage.go`/`httpjson.go`/`gzip.go`/`ratelimit.go`/`helpers.go`（60 路由数量不变）
+- `autotask.go` 1437 → 252 + `autotask_actions.go`/`autotask_runner.go`/`autotask_http.go`；`taskcenter.go` 587 → 46 + `taskqueue.go`/`taskcenter_http.go`
+- 响应出口统一到 `httpjson.go`（`writeJSON`/`writeErr`/`writeJSONStatus`/`readJSONBody`）；错误形状/状态码/文案不变
+
+### upstream / scheduler
+
+- `internal/upstream/client.go` 2497 → `client.go`(359)/`errors.go`(650)/`chat.go`(105)/`refresh.go`(193)/`models.go`(699)/`billing.go`(549)；chunk 级逐字节等价校验（120/120 顶层 chunk 一致）
+- `internal/scheduler/scheduler.go` 1757 → `scheduler.go`(572)/`batch.go`(207)/`tasks.go`(399)/`catchup.go`(206)/`hooks.go`(151)/`balance.go`(210)/`sweep.go`(72)；89/89 顶层 chunk 一致
+
+### 前端源码模块化
+
+- `internal/panel/app.js`（275KB/5471 行）拆为 `internal/panel/web/*.js` 14 个模块（00-core/10-sse/20-accounts/30-overview-jobs/40-models/50-logs/60-config/70-polling/75-tasks/80-usage/90-packages/92-expiry/95-package-detail/97-remarks）
+- `internal/panel/index.go` 改为 `//go:embed web/*.js` 按文件名字典序拼接，**仍以单文件 `/panel/app.js` 提供**（URL/缓存/CSP/浏览器行为零变化；拼接结果与 v2.6.0 产物字节级相等，sha256 一致、ETag 不变）
+- `frontend_test.go`/`scripts/panel_frontend_check.mjs` 改为读拼接结果（逐模块语法检查 + 拼接后 DOM/API/体积预算）；新增 `TestPanelAppJSModulesReconstruct`
+
+### 工程化
+
+- 巨型测试文件按域拆分：server 8 文件 / pool 12 文件 / cmd-server 9 文件（测试名集合与拆分前完全一致）
+- CI 新增 **race job**（CGO_ENABLED=1，`go test -race` pool/session/scheduler/server/cmd-server；race 红则 Release 不发布）+ coverage 摘要（非门禁）；`-trimpath`/gofmt 门禁沿用
+
+### 兼容性
+
+- 无 API/配置/持久化/日志格式变化；无行为变化（纯拆分 + 测试/工具链）
+- 前端服务产物 `/panel/app.js` 内容与 v2.6.0 字节一致；后续新增模块须保持「行首切分 + 字典序」约定
+
+### 验证
+
+- 拆分等价性：upstream 120/120、scheduler 89/89 顶层 chunk 逐字节一致；前端拼接 sha256 与旧产物一致（curl 实测 ETag 不变）
+- `go build` / `go vet` / `go test -count=1 ./...` 全绿（21 包）；gofmt 0；前端检查脚本 exit 0
+- QA 独立验证：见交付报告（`D:\\dsh\\tmp\\verify-final-v261.md`）
+
+---
+
 ## v2.6.0-pro（2026-10-24）
 
 生产化审计批次：用户要求「审计全部项目代码、优化升级、允许架构重构、清理垃圾文件、符合线上标准」。四路并行审计（Go 核心 / panel / 运维配置与仓库卫生 / 前端）共发现 **P0 6 项、P1 50+ 项**，本版修复全部 P0 与主要 P1。

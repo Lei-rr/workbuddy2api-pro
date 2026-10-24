@@ -9,7 +9,9 @@
 >
 > **补充（v2.5.0，非本清单条目）**：按用户要求做了 1k–10k+ 账号专项性能优化——Pool 快照/摘要缓存、面板热路径与 ETag 304 缓存、启动 LoadDir 并行/Realm 记忆化、perfbench 基准；10k 账号启动 1.6s→0.6s、RSS 214→92MB、混合读吞吐 327→4132 req/s（详见 PERF.md）。
 >
-> **补充（v2.6.0，非本清单条目）**：用户要求全项目代码审计 + 重构 + 清理 + 线上标准。四路审计修复 P0 6 项（弱密钥守卫/请求体上限/session O(1)/pool 落盘锁外/停机竞态/有界扇出）与主要 P1（writeJSON/审计/no-store/import 守卫/XSS/超时/竞态/gofmt+CI 门禁/文档漂移）；架构拆分（panel.go/app.js/upstream client）列入 v2.6.x。
+> **补充（v2.6.0，非本清单条目）**：用户要求全项目代码审计 + 重构 + 清理 + 线上标准。四路审计修复 P0 6 项（弱密钥守卫/请求体上限/session O(1)/pool 落盘锁外/停机竞态/有界扇出）与主要 P1（writeJSON/审计/no-store/import 守卫/XSS/超时/竞态/gofmt+CI 门禁/文档漂移）。
+>
+> **补充（v2.6.1，非本清单条目）**：架构重构完成——panel.go 2335→294 + 按域拆分；autotask/taskcenter/upstream client/scheduler 拆分（纯移动、chunk 级等价）；前端源码 14 模块 + Go 拼接单文件服务（字节级等价）；巨型测试文件拆分；CI race job + coverage（详见 CHANGELOG v2.6.1）。
 
 ---
 

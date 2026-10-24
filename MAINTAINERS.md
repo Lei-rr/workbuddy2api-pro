@@ -8,7 +8,7 @@
 - 原始项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）
 - 上游最终版：[`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，基线 commit **`73a7560`**（2026-10-21 发布「停止维护声明」后停更）
 - 本仓库起点 = 上游最终版 + 原 fork 面板定制合并（合并提交 `f9e654c`），已验证：`git diff 73a7560 f9e654c` 只差 8 个文件，**上游最终版 60 个提交零丢失**
-- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.6.0-pro`**
+- 本仓库：**`Lei-rr/workbuddy2api-pro`**，版本 **`2.6.1-pro`**
 - 原则：**只做增量**；上游停更后演进以本仓库为准
 
 ## 目录速览
@@ -20,7 +20,7 @@ internal/server     转发核心：handler、日志、模型解析、搜索端�
 internal/upstream   上游协议客户端（chat/billing/growth/tasks/desktop…）
 internal/pool       账号池：选号、权重、冷却、熔断、持久化
 internal/scheduler  定时任务：签到 / 旅行 / 夜猫子 / 连登 / 成长任务
-internal/panel      管理面板（Go 后端 + go:embed 前端 app.js/index.html/mobile.*）
+internal/panel      管理面板（Go 后端 + go:embed `web/*.js` 拼接为 app.js、index.html/mobile.*）
 internal/reqlog     请求 JSONL 归档
 internal/credithist 积分历史
 internal/httpauth   Bearer 鉴权（常量时间比较）
@@ -40,7 +40,7 @@ $env:GOPATH="D:\dsh\tmp\gopath"; $env:GOCACHE="D:\dsh\tmp\gocache"; $env:GOFLAGS
 go build ./...
 go vet ./...
 go test -count=1 ./...          # 含前端 node harness（panel 包约 30s）
-node --check internal/panel/app.js
+node --check internal/panel/web/*.js   # 或 node scripts/panel_frontend_check.mjs
 node --check internal/panel/mobile.js
 ```
 
@@ -61,6 +61,7 @@ node --check internal/panel/mobile.js
 11. **v2.4.0/v2.4.1 实时与清理**（2026-10-24）：v2.4.0 实现 SSE 事件推送（`GET /panel/api/events` + 前端 fetch/ReadableStream + 断线回落轮询）；**v2.4.1 按用户要求移除 v2.4.0 试做的多用户/RBAC 与凭证静态加密**（auth 路由/`panel.users`/`encrypt_auths`/authcrypt 全部删除），保留 SSE。**不要再引入多用户或 auths 加密，除非用户明确要求**。
 12. **v2.5.0 性能专项**（2026-10-24）：Pool 快照/摘要缓存（`Snapshot`/`Version`/`Summary`/`AvailableUIDsSorted`，`List` 保持拷贝语义）、`ModelLockView` 空锁 O(1)、面板 overview/metrics/accounts 热路径与 ETag/304 LRU 缓存、gzip 池、启动 LoadDir 并行 + Realm 记忆化 + 启动分段日志、`?accounts=0` 轻量 overview、tools/perfbench 基准。**改热路径先读 PERF.md 与 pool/cache.go 注释：Snapshot 返回切片只读；Version 不覆盖 InFlight 瞬时变化；面板 ETag 缓存 TTL 10s 兜底**。
 13. **v2.6.0 生产化审计**（2026-10-24）：四路审计（core/panel/ops/frontend）修复 P0 6 项——弱密钥启动守卫（非回环 fail-fast）、`/v1` body 上限（`server.max_body_mb`）、session `AvailabilityView` O(1)、pool 落盘锁外、停机 WaitBackground、账号级有界扇出（`schedule.task_sweep_concurrency`）；另修 writeJSON/审计覆盖/no-store/import 守卫/XSS 兜底/请求超时/竞态、gofmt+CI 门禁、文档漂移。**新增安全默认：镜像无配置直接启动会 fail-fast（必须随机 api_key）；弱密钥+非回环启动失败是预期行为**。
+14. **v2.6.1 架构重构**（2026-10-24）：panel.go 2335→294 + 按域拆分；autotask/taskcenter/upstream client/scheduler 拆分（纯移动，chunk 级等价校验）；前端源码 14 模块 + Go 拼接仍单文件服务（字节级等价）；巨型测试文件拆分；CI race job + coverage。**前端新增模块必须行首切分+字典序拼接；panel 新逻辑按域进对应文件，不要回堆 panel.go**。
 
 ## 部署链路
 
@@ -152,6 +153,9 @@ services:
 - v2.6.0 停机顺序：cancel → HTTP Shutdown → scheduler `WaitBackground` → **最后** pool Flush；新增后台循环必须纳入 shutdown 等待组（`shutdownDeps.WaitExtra`/scheduler bgWG）。
 - v2.6.0 面板响应默认 `Cache-Control: no-store`；accounts 的 ETag/304 响应需覆盖为 `private, no-cache`，新增可缓存 GET 时确认缓存头。
 - v2.6.0 CI 已有 gofmt 门禁（`gofmt -l` 非空失败）：本地提交前跑 `gofmt -w`；仓库工作区为 CRLF（autocrlf=true），不要手改行尾。
+- v2.6.1 前端源码在 `internal/panel/web/*.js`（14 模块，Go 按文件名字典序拼接为 `/panel/app.js`）；改前端时改对应模块，不要新建根 `app.js`；新增模块必须整行切分（拼接=服务产物，ETag 随内容变化）。
+- v2.6.1 panel 包按域拆分：`panel.go` 只放 Config/Panel/New/ServeHTTP/withAuth；handler 按域进 `accounts.go`/`accounts_ops.go`/`overview.go`/`models.go`/`logs.go`/`usage.go`/`routes.go`；响应统一用 `httpjson.go` helper。
+- v2.6.1 CI 有 race job（pool/session/scheduler/server/cmd-server，CGO=1；本地 Windows 无 cgo 跑不了 race，合并前看 CI 结果）；publish 依赖 [build, race]。
 - v2.4.1 起面板回到**单密钥模式**：`api_key`/`panel.api_key` Bearer 即 admin；v2.4.0 的 auth 端点已删除（旧脚本调用会 404）。
 - v2.4.1 起 auths **恢复明文**：曾用 v2.4.0 authcrypt 加密过 auths 的部署，升级前必须先用 v2.4.0 的 authcrypt `-decrypt` 恢复明文。
 - v2.3.1 `accounts?tag=` 的 ETag = 归一化查询 + 命中行快照：新增一个「不影响当前命中集」的 tag 不会改变该查询的 ETag（预期行为；命中集变化才会变）。
