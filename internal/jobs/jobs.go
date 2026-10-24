@@ -205,7 +205,8 @@ func (r *Registry) newIDLocked(kind Kind) string {
 	return fmt.Sprintf("%s-%d-%d", kind, r.now().UnixMilli(), r.seq.Add(1))
 }
 
-// Run 异步启动一个 Job：立即返回 pending/running 前的快照（通常是 pending）。
+// Run 异步启动一个 Job：立即返回启动前的 **pending 快照**（深拷贝，调用方可安全
+// 读取/丢弃；Registry 内部 Job 字段的后续变化不会竞争性地写这份副本）。
 //
 //   - 同 kind 已有 Job 在跑/排队 → ErrRunning（panel 映射 409）；
 //   - Registry 已关闭或根 ctx 已取消 → ErrClosed；
@@ -213,6 +214,9 @@ func (r *Registry) newIDLocked(kind Kind) string {
 //
 // 执行槽（MaxConcurrency）在后台 goroutine 里获取：超限 Job 保持 pending 直到
 // 有槽位释放（进度 API 可见 pending → running 的迁移）。
+//
+// v2.6.2（CI race job）：快照在 r.mu 内生成——此前在后台 goroutine 启动后无锁
+// cloneJob(job) 返回，与 execute() 的字段写入构成数据竞争（audit CI 首跑抓到）。
 func (r *Registry) Run(kind Kind, trigger Trigger, total int, fn TaskFunc) (*Job, error) {
 	if !kind.Valid() {
 		return nil, fmt.Errorf("jobs: 未知任务类型 %q", kind)
@@ -249,6 +253,9 @@ func (r *Registry) Run(kind Kind, trigger Trigger, total int, fn TaskFunc) (*Job
 	if r.extWG != nil {
 		r.extWG.Add(1)
 	}
+	// 快照必须在锁内生成（v2.6.2）：后台 execute() 会以 r.mu 保护地改写 Job 字段，
+	// 锁外 cloneJob 读到半更新状态既是数据竞争，也可能返回撕裂快照。
+	snap := cloneJob(job)
 	r.mu.Unlock()
 	r.persist()
 	go func() {
@@ -258,7 +265,7 @@ func (r *Registry) Run(kind Kind, trigger Trigger, total int, fn TaskFunc) (*Job
 		}
 		r.execute(job, fn)
 	}()
-	return cloneJob(job), nil
+	return snap, nil
 }
 
 // Wait 等待所有已启动 Job 收敛；ctx 取消返回 false（有上限——停机不能无限卡住）。
@@ -303,6 +310,17 @@ func (r *Registry) execute(job *Job, fn TaskFunc) {
 	job.State = StateRunning
 	job.StartedAt = r.now()
 	r.cancels[job.ID] = cancel
+	// v2.6.2：登记 cancel 后复检 closed/base（Close 可能在本 goroutine 通过上方
+	// closed 检查之后、登记之前发生——那只复制了已有 cancels，会漏掉本 Job）。
+	// 命中则清登记并走终态 canceled，避免 Close 后仍有 Job 在跑（与上方检查同语义）。
+	if r.closed || r.base.Err() != nil {
+		delete(r.cancels, job.ID)
+		delete(r.runningKinds, job.Kind)
+		r.mu.Unlock()
+		cancel()
+		r.finish(job, StateCanceled, "")
+		return
+	}
 	r.mu.Unlock()
 	defer cancel()
 	r.persist()
@@ -549,6 +567,11 @@ func appendLogTail(job *Job, msg string) {
 }
 
 // cloneJob 深拷贝 Job（LogTail 独立底层数组），避免把内部可变状态泄漏给调用方。
+//
+// 并发契约（v2.6.2）：**读取共享 Job（r.jobs / r.byID 中的内部指针）时必须持有
+// r.mu**；本函数不做加锁，因为所有生产调用点（Run/finish/Record/persist/Get/List）
+// 都在 r.mu 内调用。唯一例外是 Record 传入的未共享局部副本（&job）。若将来新增
+// 锁外调用点，必须改为在 r.mu 内读取后再拷贝。
 func cloneJob(j *Job) *Job {
 	if j == nil {
 		return nil
