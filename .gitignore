@@ -15,6 +15,9 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+# 面板保存配置时自动生成的上一版备份（含 api_key；compose 部署时就在仓库根目录）
+/config.json.bak
+/config.json.*.bak
 
 # Build artifacts
 *.tmp

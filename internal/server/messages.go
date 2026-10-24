@@ -19,8 +19,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -145,8 +145,8 @@ type messagesCitation struct {
 
 // messagesTextBlock 承载 citations 的文本块。
 type messagesTextBlock struct {
-	Type      string            `json:"type"`
-	Text      string            `json:"text"`
+	Type      string             `json:"type"`
+	Text      string             `json:"text"`
 	Citations []messagesCitation `json:"citations,omitempty"`
 }
 
@@ -158,13 +158,13 @@ type messagesUsage struct {
 
 // messagesResponse Anthropic Messages 响应。
 type messagesResponse struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"`
-	Role         string `json:"role"`
-	Model        string `json:"model"`
-	Content      []any  `json:"content"`
-	StopReason   string `json:"stop_reason"`
-	StopSequence any    `json:"stop_sequence"`
+	ID           string        `json:"id"`
+	Type         string        `json:"type"`
+	Role         string        `json:"role"`
+	Model        string        `json:"model"`
+	Content      []any         `json:"content"`
+	StopReason   string        `json:"stop_reason"`
+	StopSequence any           `json:"stop_sequence"`
 	Usage        messagesUsage `json:"usage"`
 }
 
@@ -251,8 +251,15 @@ func writeMessagesError(w http.ResponseWriter, status int, errType, msg string) 
 
 // messages 处理 POST /v1/search/messages（Anthropic Messages 兼容搜索端点）。
 func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, messagesBodyLimit))
+	// v2.6.0 P0-1：与 chat 共用限长读取（MaxBytesReader），超限 413 而非静默截断后
+	// 报 JSON 解析失败。messages 只需 query 与工具声明，1MiB 上限保持不变。
+	raw, err := readBodyLimited(w, r, messagesBodyLimit)
 	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			writeMessagesError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				fmt.Sprintf("request body exceeds the limit of %d bytes", messagesBodyLimit))
+			return
+		}
 		writeMessagesError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
 		return
 	}

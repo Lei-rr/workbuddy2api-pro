@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,6 +80,9 @@ type Config struct {
 		//（越界 clamp；0/负值/非法时长启动报错——停机必须有上限，立即退出用二次信号）。
 		// 启动时读取一次，改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout"` // "30s"
+		// MaxBodyMB /v1 请求体上限（MiB，v2.6.0 审计 P0：恢复网关侧 body 上限）。
+		// 缺省 64；clamp 1..1024；<=0 回落默认。超限由 handler 返回 413。
+		MaxBodyMB int `json:"max_body_mb"` // 64
 	} `json:"server"`
 
 	Cooldown struct {
@@ -157,6 +161,10 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// TaskSweepConcurrency 补领清扫/任务扫描的账号级扇出并发上限（v2.6.0 审计 P0）：
+		// 默认 8，clamp 1..64。此前每账号一个 goroutine，10k 池会瞬时产生上万 goroutine。
+		TaskSweepConcurrency int `json:"task_sweep_concurrency"`
 
 		// CheckinConcurrency 签到批次的账号级并发度（v2.3.1 #11）：默认 3，clamp 1..16。
 		// 1146 号池下单号签到约 2-3s，串行需 1 小时级；并发 3-5 可压到十几分钟，
@@ -356,6 +364,7 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.ShutdownTimeout = "30s"
+	c.Server.MaxBodyMB = 64
 	// v2.3 #10/#19：Job Runner 与通知渠道默认值。
 	c.Jobs.MaxConcurrency = 4
 	c.Jobs.Retain = 50
@@ -396,6 +405,7 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.TaskSweepConcurrency = 8
 	c.Schedule.CheckinConcurrency = 3
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
@@ -524,6 +534,12 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SHUTDOWN_TIMEOUT"); v != "" {
 		c.Server.ShutdownTimeout = v
 	}
+	// v2.6.0 审计 P0：/v1 请求体上限（MiB；<=0/越界由 normalize clamp）。
+	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.MaxBodyMB = n
+		}
+	}
 	// v2.0.1 配置基座（面板分离密钥 / 轮询间隔 / 匿名逃生门 / 调度器参数）。
 	if v := os.Getenv("WB2A_PANEL_KEY"); v != "" {
 		c.Panel.APIKey = v
@@ -572,6 +588,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_NOTIFY_TIMEOUT"); v != "" {
 		c.Notify.Timeout = v
+	}
+	if v := os.Getenv("WB2A_TASK_SWEEP_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.TaskSweepConcurrency = n
+		}
 	}
 	if v := os.Getenv("WB2A_CHECKIN_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -722,6 +743,17 @@ func (c *Config) normalize() error {
 		c.Server.ShutdownTimeout = "120s"
 		c.ShutdownTimeoutDur = 120 * time.Second
 	}
+	// /v1 请求体上限（v2.6.0 审计 P0：此前 max_body_mb 移除后网关无上限，改由配置恢复）：
+	// <=0 回落默认 64；越界 clamp [1,1024]（0 会把限制关死、超大值等价不限制）。
+	if c.Server.MaxBodyMB <= 0 {
+		c.Server.MaxBodyMB = 64
+	}
+	if c.Server.MaxBodyMB < 1 {
+		c.Server.MaxBodyMB = 1
+	}
+	if c.Server.MaxBodyMB > 1024 {
+		c.Server.MaxBodyMB = 1024
+	}
 	// v2.3 #10 Job Runner：并发与保留条数 clamp（0/负值回落默认，避免误配成 0 并发死锁）。
 	if c.Jobs.MaxConcurrency <= 0 {
 		c.Jobs.MaxConcurrency = 4
@@ -754,6 +786,12 @@ func (c *Config) normalize() error {
 	case c.NotifyTimeoutDur > 60*time.Second:
 		c.Notify.Timeout = "60s"
 		c.NotifyTimeoutDur = 60 * time.Second
+	}
+	if c.Schedule.TaskSweepConcurrency <= 0 {
+		c.Schedule.TaskSweepConcurrency = 8
+	}
+	if c.Schedule.TaskSweepConcurrency > 64 {
+		c.Schedule.TaskSweepConcurrency = 64
 	}
 	if c.Schedule.CheckinConcurrency <= 0 {
 		c.Schedule.CheckinConcurrency = 3
@@ -886,6 +924,12 @@ func (c *Config) normalize() error {
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
+	// v2.6.0 审计 P0：弱/示例密钥守卫（config.example.json 默认值曾是 test_key，Docker
+	// 镜像直接把它复制为 /app/config.json，照文档部署即等于公网已知密钥）。放在 listen
+	// 归一化之后，才能准确区分回环（WARN 放行）与非回环（拒绝启动/保存）。
+	if err := weakAPIKeyGuard(c); err != nil {
+		return err
+	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
 	if len(c.Schedule.CheckinHours) == 0 {
@@ -947,6 +991,81 @@ func (c *Config) normalize() error {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// weakAPIKeyNames 已知弱/示例密钥名单（v2.6.0 审计 P0）。
+//
+// 背景：config.example.json 长期以 test_key 作为占位值，而 Dockerfile 会把 example
+// 原样复制成 /app/config.json、README 快速开始也让人 cp 后"可选"改 key——于是「照文档
+// 部署」等于把网关暴露在公网且密钥人人可知。示例值已改为空字符串（非回环 + 空 key 由
+// validateListenSecurity 在启动时 fail-fast），本名单再兜底历史配置/手工填写的弱值。
+//
+// 名单大小写不敏感；命中时：非回环监听 → 拒绝启动/保存；回环监听 → 仅 WARN 放行
+// （本机自用无横向风险）。空值不在此拦截（空 = 不鉴权，由启动安全校验统一处理）。
+var weakAPIKeyNames = map[string]struct{}{
+	"test_key":    {},
+	"testkey":     {},
+	"test-key":    {},
+	"test":        {},
+	"changeme":    {},
+	"change_me":   {},
+	"change-me":   {},
+	"password":    {},
+	"passwd":      {},
+	"pwd":         {},
+	"123456":      {},
+	"12345678":    {},
+	"123456789":   {},
+	"1234567890":  {},
+	"qwerty":      {},
+	"letmein":     {},
+	"abc123":      {},
+	"example":     {},
+	"examplekey":  {},
+	"example_key": {},
+	"example-key": {},
+	"secret":      {},
+	"admin":       {},
+	"root":        {},
+	"api_key":     {},
+	"apikey":      {},
+	"api-key":     {},
+	"sk-test":     {},
+	"demo":        {},
+	"token":       {},
+	"default":     {},
+	"key":         {},
+}
+
+// weakAPIKeyGuard 弱密钥启动守卫（v2.6.0 审计 P0）：api_key / panel.api_key 命中
+// 已知弱值名单时，非回环监听拒绝启动（返回 error），回环监听仅打 WARN 放行。
+// 在 normalize 里、listen 归一化之后调用（两分支判断依赖归一化后的监听地址）。
+func weakAPIKeyGuard(c *Config) error {
+	if c == nil {
+		return nil
+	}
+	loopback := isLoopbackListen(c.Listen)
+	for _, f := range []struct {
+		name string
+		key  string
+	}{
+		{"api_key", c.APIKey},
+		{"panel.api_key", c.Panel.APIKey},
+	} {
+		key := strings.TrimSpace(f.key)
+		if key == "" {
+			continue
+		}
+		if _, weak := weakAPIKeyNames[strings.ToLower(key)]; !weak {
+			continue
+		}
+		if loopback {
+			log.Printf("WARN: %s 使用了示例/弱密钥（回环监听，仅本机可用；公网部署必须改为随机密钥：openssl rand -hex 24）", f.name)
+			continue
+		}
+		return fmt.Errorf("%s 使用了示例/弱密钥：listen=%q 绑定非回环地址时会把网关暴露给网络（建议 `openssl rand -hex 24` 生成随机密钥写入 config.json，或删除 config.json 让程序自动生成随机 api_key；本机自用可把 listen 改为 127.0.0.1:7863）", f.name, c.Listen)
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

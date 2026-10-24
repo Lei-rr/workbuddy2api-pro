@@ -44,8 +44,8 @@ var (
 )
 
 // sseEventsOn 全局面板 SSE 开关（默认 true；main 按 panel.events_enabled 注入）。
-// 用包级原子量而非 panel.Config 字段：panel.Config 定义在 panel.go（本 Wave 由
-// backend-c 并行修改 RBAC，本任务约定不碰 panel.go）；见文件末尾装配注释。
+// 用包级原子量而非 panel.Config 字段：handler 运行期只读，main 启动时 Set 一次即可
+// （与 v2.4.1 移除 RBAC 后的单密钥装配一致）；见文件末尾装配注释。
 var sseEventsOn atomic.Bool
 
 func init() { sseEventsOn.Store(true) }

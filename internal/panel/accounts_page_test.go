@@ -616,24 +616,34 @@ func TestAccountsETagVolatileNormalization(t *testing.T) {
 // TestAccountsETagMarshalFailureSkipsConditional 稳定投影不可序列化（极端脏数据：
 // NaN 成本观测）时不得发出 ETag/304——否则恒定 ETag 会让后续轮询永久命中 304，
 // 比没有缓存更糟。这里用 NoteModelCost 注入 NaN per-1k 成本构造该形态。
+//
+// v2.6.0：writeJSON 不再吞序列化错误——此类响应现在回 500 + {"ok":false,...}
+// （而不是 200 + 空 body），HTTP 语义上让客户端/监控能直接看到编码失败。
 func TestAccountsETagMarshalFailureSkipsConditional(t *testing.T) {
 	p, pl := newAccountsTestPanel()
 	pl.Add(&auth.Auth{UID: "u1", Nickname: "One"})
 	pl.NoteModelCost("u1", "cn:dirty", math.NaN(), 100) // per1k = NaN → json.Marshal 失败
 
 	rec := panelRequest(p, http.MethodGet, "/panel/api/accounts", accountsTestKey, "", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d want 200", rec.Code)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d want 500（不可序列化响应由 writeJSON 统一转 500）", rec.Code)
 	}
 	if got := rec.Header().Get("ETag"); got != "" {
 		t.Fatalf("不可序列化数据不应发 ETag（会变成恒定值导致永久 304），got %q", got)
 	}
-	// 即使客户端带任意 If-None-Match 也必须回 200（不能凭空 304）。
+	var errResp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil || errResp.OK || errResp.Error == "" {
+		t.Fatalf("500 响应应为 {ok:false,error}: %s", rec.Body.String())
+	}
+	// 即使客户端带任意 If-None-Match 也必须是 500（不能凭空 304）。
 	rec2 := panelRequest(p, http.MethodGet, "/panel/api/accounts", accountsTestKey, "", map[string]string{
 		"If-None-Match": `W/"acct-` + strings.Repeat("0", 64) + `"`,
 	})
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("无 ETag 时 If-None-Match status=%d want 200", rec2.Code)
+	if rec2.Code != http.StatusInternalServerError {
+		t.Fatalf("无 ETag 时 If-None-Match status=%d want 500", rec2.Code)
 	}
 }
 

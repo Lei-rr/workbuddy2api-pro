@@ -9,6 +9,7 @@
 //  2. srv.Shutdown(ctx) —— 关监听（拒绝新请求）+ 等在途 HTTP（含 SSE 长流）
 //     自然结束，上限 server.shutdown_timeout（默认 30s）；
 //  3. 等待后台任务 goroutine 收敛（同一时间预算；超时只 WARN，不阻塞退出）；
+//     3b. 等待 scheduler 包内独立周期循环（余额刷新/任务清扫）退出（v2.6.0 P0-4）；
 //  4. 最终落盘（pool.Flush）—— **必须在 HTTP 停机之后**：在途请求成功计数还在
 //     写池状态，先 flush 后停机会让最后一次变更丢在「已 flush 但 flusher 已停」
 //     的缝隙里（旧实现 5s 硬编码 + flush 在 Shutdown 之前的缺陷）。
@@ -42,6 +43,11 @@ type shutdownDeps struct {
 	// Background 后台任务 goroutine 的 WaitGroup（scheduler.Run / warmModelRates）。
 	// nil = 无需等待。
 	Background *sync.WaitGroup
+	// WaitExtra 可选：等待不在 Background 里的其他后台循环收敛（v2.6.0 Audit-1 P0-4：
+	// scheduler 的余额刷新 / 任务补领清扫等周期 goroutine）。在 Flush **之前**调用，
+	// 保证「停止新任务 → 等所有会写池的后台 goroutine 退出 → Flush」的顺序。
+	// 返回 true = 预算内收敛；false = 预算到期（只 WARN，不阻塞退出）。
+	WaitExtra func(ctx context.Context) bool
 	// Flush 最终落盘（pool.Flush）。nil = 跳过。
 	Flush func()
 	// Timeout 整体停机时间预算（<=0 回落默认 30s）。
@@ -112,12 +118,22 @@ func gracefulShutdown(d shutdownDeps) shutdownResult {
 		}
 	}
 
+	// 3b) 等待 scheduler 等包内的独立周期循环（v2.6.0 Audit-1 P0-4）：它们不在
+	// Background 里，但余额刷新/任务清扫会写池（credits/冷却/到期快照）。必须赶在
+	// Flush 之前确认它们已退出，否则会出现「Flush 之后仍有 goroutine 写池」的竞态。
+	if d.WaitExtra != nil {
+		if d.WaitExtra(shutdownCtx) {
+			logf("shutdown: 调度器后台循环已收敛")
+		} else {
+			logf("WARN: shutdown: 调度器后台循环未在时限内收敛（%v），继续收尾", shutdownCtx.Err())
+		}
+	}
+
 	// 4) 最终落盘：必须在 HTTP/后台停机之后（避免 flush 后又被在途请求写脏）。
 	if d.Flush != nil {
 		logf("shutdown: 最终落盘 pool state")
 		d.Flush()
 	}
-
 	res.Elapsed = time.Since(start)
 	return res
 }

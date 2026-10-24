@@ -128,7 +128,8 @@ func accountMetaStoreFor(dataDir string) *accountMetaStore {
 	return s
 }
 
-// resetAccountMetaStores 清空包级注册表（仅测试用：模拟进程重启，验证磁盘持久化）。
+// resetAccountMetaStores 清空包级注册表（**仅测试用**：模拟进程重启，验证磁盘
+// 持久化；生产代码不要调用）。
 func resetAccountMetaStores() {
 	accountMetaStoresMu.Lock()
 	accountMetaStores = map[string]*accountMetaStore{}
@@ -496,8 +497,8 @@ type accountMetaTagCount struct {
 }
 
 // accountMetaMatchesTag 单个账号是否带指定标签（大小写不敏感、TrimSpace；O(tags)）。
-// 未装配存储/空标签/未知账号 → false。批量筛选（1146 号）请用 accountMetaUIDsForTag：
-// 一次加锁查反向索引，避免逐号加锁遍历。
+// 未装配存储/空标签/未知账号 → false。上千~上万账号批量筛选请用
+// accountMetaUIDsForTag：一次加锁查反向索引，避免逐号加锁遍历。
 func (p *Panel) accountMetaMatchesTag(uid, tag string) bool {
 	key := strings.ToLower(strings.TrimSpace(tag))
 	if uid == "" || key == "" {
@@ -519,7 +520,7 @@ func (p *Panel) accountMetaMatchesTag(uid, tag string) bool {
 }
 
 // accountMetaUIDsForTag 返回带指定标签的账号 uid 集合（只读副本；一次加锁 + 索引查表）。
-// 供 accounts?tag= 服务端筛选使用：1146 账号场景下避免逐号加锁/遍历元数据。
+// 供 accounts?tag= 服务端筛选使用：上万账号场景下避免逐号加锁/遍历元数据。
 // 未装配存储或空标签 → nil（调用方按「不筛选」语义处理）；标签无匹配 → 空 map。
 func (p *Panel) accountMetaUIDsForTag(tag string) map[string]struct{} {
 	key := strings.ToLower(strings.TrimSpace(tag))

@@ -626,11 +626,11 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 汇报结果。
 func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
+	uid := a.UID
 	// 企业上下文门控（企业版 / 企业切换会话）：行为事件会被上游静默丢弃或
 	// 直接 403，执行任何成长任务都是零收益白跑（含真实对话配额）——直接拒绝
 	// 并给出修复路径，不再让用户对着「已上报但进度 0/x」猜原因
@@ -643,7 +643,10 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	if !readJSONBody(w, r, panelJSONBodyMax, &body) {
+		return
+	}
+	if body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
@@ -1269,11 +1272,11 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
 func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
+	uid := a.UID
 	// 企业上下文门控：与 accountTaskAuto 同口径（企业版 / 企业切换会话下成长任务
 	// 行为事件被上游静默丢弃，跑全量只会白耗真实对话配额）。「一键完成全部」与
 	// 单任务入口共用同一套动作，必须一并挡上（下游 fork 吸收本 PR 时发现的缺口）。
@@ -1368,7 +1371,7 @@ func summarizeTaskRun(results []map[string]any) taskRunSummary {
 // 门控与状态码（tasks_run_test.go 钉住）：
 //   - 未知 uid → 404 {"ok":false,"error":"account not found"}；
 //   - 企业版 / 企业切换会话（无个人成长体系，行为事件会被上游忽略）→ **200 + ok:false
-//     + message**，不发起任何上游请求（与前端「跳过并提示」的交互约定一致）；
+//   - message**，不发起任何上游请求（与前端「跳过并提示」的交互约定一致）；
 //   - 无凭证 → 同 200 + ok:false + message；
 //   - 同账号已有任务动作在跑（per-account 锁被占）→ 409；
 //   - 执行超时 → 504（后台流水线继续跑，锁由 goroutine 释放）。
@@ -1376,11 +1379,11 @@ func summarizeTaskRun(results []map[string]any) taskRunSummary {
 // 两个 ok:false 分支也返回 results:[] 与 summary 零值，保持响应形状稳定，前端可以
 // 无条件读 .results/.summary，只看 .ok 决定成功还是展示 .message。
 func (p *Panel) accountTasksRun(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
+	uid := a.UID
 	// 门控拒绝统一回 200 + ok:false（不是 4xx）：前端 api() 只看 HTTP 状态码，
 	// 4xx 会被当成请求失败弹通用错误，拿不到这里的可读原因。
 	reject := func(msg string) {

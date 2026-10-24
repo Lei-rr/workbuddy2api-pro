@@ -5,32 +5,18 @@
 package panel
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/lei-rr/workbuddy2api-pro/internal/auth"
 )
 
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
 var acceptBatchGap = 1050 * time.Millisecond
 
-// accountByUID 取账号凭证；不存在时写 404 并返回 nil。
-func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return nil
-	}
-	return a
-}
-
 // accountTasks 查询单账号全量任务（进度/状态/可领取）。
 func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
@@ -57,15 +43,17 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskAccept 接受任务（报名；幂等）。
 func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
 	var body struct {
 		TaskCodes []string `json:"task_codes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskCodes) == 0 {
+	if !readJSONBody(w, r, panelJSONBodyMax, &body) {
+		return
+	}
+	if len(body.TaskCodes) == 0 {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
@@ -73,7 +61,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
-	log.Printf("panel: 接受任务 uid=%s codes=%v", uid, body.TaskCodes)
+	log.Printf("panel: 接受任务 uid=%s codes=%v", a.UID, body.TaskCodes)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -84,11 +72,11 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 上游 scripts 的注释同样建议"先 accept"。
 // 批量提交会分片（上游对 task_codes 数组长度无公开上限，保守每批 20 个）。
 func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
+	uid := a.UID
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -151,15 +139,17 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
-	if a == nil {
+	a, ok := p.accountForRequest(w, r)
+	if !ok {
 		return
 	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	if !readJSONBody(w, r, panelJSONBodyMax, &body) {
+		return
+	}
+	if body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
@@ -176,10 +166,10 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if credit == 0 && energy == 0 {
-		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", uid, body.TaskCode)
+		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", a.UID, body.TaskCode)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"})
 		return
 	}
-	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
+	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", a.UID, body.TaskCode, credit, energy)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy})
 }

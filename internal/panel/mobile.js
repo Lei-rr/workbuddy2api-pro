@@ -110,16 +110,62 @@ function shortenActLabels() {
     b.textContent = short || t.slice(0, 2);
   }
 }
-/* 一次重渲染会连发多条 mutation（整段 tbody 换掉），合并成一次批处理。 */
+/* 只在窄屏（≤760px）观察新增节点并做增量标注（v2.6.0）：
+   - 桌面端不观察（data-l 只服务卡片模式），避免每次轮询重渲染做无用功；
+   - 只处理 mutation 里新增的表格/行所在表，而不是每批 mutation 全文档重扫；
+   - 断点切换时重建/断开观察器，进入窄屏先补齐现有行。 */
+const pendingTables = new Set();
 let labelPending = false;
-function queueLabels() {
+/* tablesFromNode 从新增节点收集受影响的表格（DOM 结构：整表替换/整段 tbody 替换
+   都只标一次；纯文本/行节点则回溯最近的 table）。 */
+function tablesFromNode(node) {
+  const out = [];
+  if (!node || node.nodeType !== 1) return out;
+  if (node.tagName === 'TABLE') { out.push(node); return out; }
+  if (node.querySelectorAll) node.querySelectorAll('table').forEach(function (t) { out.push(t); });
+  if (!out.length && node.closest) {
+    const table = node.closest('table');
+    if (table) out.push(table);
+  }
+  return out;
+}
+function queueLabels(muts) {
+  if (!MOBILE_MQ.matches) return;
+  if (muts) {
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        for (const t of tablesFromNode(n)) pendingTables.add(t);
+      }
+    }
+  }
   if (labelPending) return;
   labelPending = true;
-  setTimeout(() => { labelPending = false; labelTables(); shortenActLabels(); }, 0);
+  setTimeout(() => {
+    labelPending = false;
+    if (!MOBILE_MQ.matches) { pendingTables.clear(); return; }
+    const tables = Array.from(pendingTables);
+    pendingTables.clear();
+    tables.forEach(labelTable);
+    shortenActLabels();
+  }, 0);
 }
-labelTables(); // 首屏：把已存在的行先标好
-shortenActLabels();
-new MutationObserver(queueLabels).observe(document.body, { childList: true, subtree: true });
+let labelObserver = null;
+function syncLabelObserver() {
+  if (!MOBILE_MQ.matches) {
+    if (labelObserver) { labelObserver.disconnect(); labelObserver = null; }
+    pendingTables.clear();
+    return;
+  }
+  if (!labelObserver && typeof MutationObserver === 'function') {
+    labelObserver = new MutationObserver(queueLabels);
+    labelObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  labelTables();       // 进入窄屏：现有行先补齐
+  shortenActLabels();
+}
+if (MOBILE_MQ.addEventListener) MOBILE_MQ.addEventListener('change', syncLabelObserver);
+else if (MOBILE_MQ.addListener) MOBILE_MQ.addListener(syncLabelObserver);
+syncLabelObserver();
 
 /* ── 用量「Token 时序」：窄屏另画一张 ─────────────────────────────────
    上游那张图是固定 viewBox 1200×200 的 SVG，靠 width:100% 整体缩放：360px 宽的手机上

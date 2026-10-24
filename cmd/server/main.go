@@ -36,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.5.0-pro"
+const appVersion = "2.6.0-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -185,10 +185,9 @@ func main() {
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
-			Available:  p.AvailableUIDs,
-			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: realmAwareAvailableForModel(p),
+			// v2.6.0 P0-2：按 (model, realm) 的可用视图由 pool 缓存（Contains O(1)、
+			// UIDs 复用权重槽），session 热路径不再每请求全池遍历/排序/建 map。
+			AvailableViewForModel: realmAwareAvailableViewForModel(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -421,6 +420,8 @@ func main() {
 		CreditHistory: creditHist,
 		// v2.3.0 #10 Job Runner：批量端点起 Job（job_id/进度/取消/jobs.json 持久化）。
 		Jobs: jobReg,
+		// v2.6.0 审计 P0：账号级扇出并发上限（补领清扫/任务扫描/成长队列/昵称同步等）。
+		TaskSweepConcurrency: cfg.Schedule.TaskSweepConcurrency,
 		// v2.3.0 #19 通知器：accountDisable 成功时 Emit account_disabled（关闭时 no-op）。
 		Notify: notifier,
 	})
@@ -458,6 +459,8 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// v2.6.0 P0-1：/v1 请求体上限（config server.max_body_mb，默认 64MiB）。
+		MaxBodyMB: cfg.Server.MaxBodyMB,
 	})
 
 	// v2.2 #14 优雅停机：显式信号通道（不用 signal.NotifyContext——需要两级语义：
@@ -465,9 +468,9 @@ func main() {
 	// 前部创建（Job Registry/通知器共享），这里只挂后台任务与 HTTP 服务。
 	// 后台任务登记：停机时先 cancel 让它们不再取新任务，再等待收敛
 	//（收敛上限由 server.shutdown_timeout 的同一时间预算兜底）。
-	// 注：sch.StartBalanceRefresh/StartTaskSweep 在 scheduler 包内部另起 goroutine，
-	// 随 ctx 取消退出但不纳入本 WaitGroup（scheduler 包不在本任务改动范围）；
-	// 其手头若有正在跑的上游请求，最坏被进程退出截断，最终 state 仍会在停机时落盘。
+	// v2.6.0 Audit-1 P0-4：scheduler 的余额刷新/任务补领循环不再游离于停机顺序之外——
+	// 它们由 sch.WaitBackground 收敛，并作为 shutdownDeps.WaitExtra 在 Flush 之前等待，
+	// 保证「停新任务 → 等所有会写池的后台 goroutine 退出 → Flush」。
 	// Job Registry 的运行中 Job 由 main 尾部 jobReg.Close()+Wait 单独等待收敛。
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
@@ -475,6 +478,7 @@ func main() {
 	go func() { defer bgWG.Done(); warmModelRates(ctx, up, p) }()
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	waitSchedBackground := func(wctx context.Context) bool { return sch.WaitBackground(wctx) }
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -488,9 +492,10 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
-		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
-		// 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端收到
-		// 400 "read body: ... i/o timeout"）；server.read_timeout="0" 显式关闭。
+		// 请求体大小由 server.max_body_mb（默认 64MiB）在 handler 层用 MaxBytesReader
+		// 限制（v2.6.0 P0-1：超限 413，不把超大 body 读进内存）。缺省 300s
+		//（issue #100：旧固定 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端
+		// 收到 400 "read body: ... i/o timeout"）；server.read_timeout="0" 显式关闭。
 		// 改动需重启进程。
 		ReadTimeout: cfg.ServerReadTimeoutDur,
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
@@ -528,6 +533,7 @@ func main() {
 			Shutter:    srv,
 			Cancel:     cancel,
 			Background: &bgWG,
+			WaitExtra:  waitSchedBackground,
 			Flush:      p.Flush,
 			Timeout:    cfg.ShutdownTimeoutDur,
 		})
@@ -544,6 +550,7 @@ func main() {
 			Shutter:    srv,
 			Cancel:     cancel,
 			Background: &bgWG,
+			WaitExtra:  waitSchedBackground,
 			Flush:      p.Flush,
 			Timeout:    cfg.ShutdownTimeoutDur,
 		})
@@ -730,7 +737,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用（与 rollbackConfig 共用 config_backup.go 的 applyConfigRuntime，
 	//    保存/回滚的热生效范围保证一致）。
-	return applyConfigRuntime(newCfg, live, p, up, sch), nil
+	restart := applyConfigRuntime(newCfg, live, p, up, sch)
+	// v2.6.0 audit P1: upstash connection / scheduler ticker startup condition are assembly-time
+	// state; compare against the pre-save raw config and append fields that need a restart.
+	return append(restart, startupOnlyChanges(oldRaw, newCfg)...), nil
 }
 
 // rejectClearingAPIKey 拦截「把网关 api_key 保存为空」（v2.0.1 #4-2）。
@@ -788,9 +798,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "upstream.user_agent")
 	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
 	out = append(out, "cn.chat_base")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
+	// v2.6.0 audit P1: upstash connection object is created at assembly time; any url/token
+	// set/modify/clear requires restart. saveConfig/rollbackConfig append "upstash" by comparing
+	// the pre-save config raw via startupOnlyChanges() (covers the clearing case).
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
@@ -805,6 +815,23 @@ func restartRequiredFields(c *Config) []string {
 	// 运行期热改无效（改后需重启才按新策略决定首刷），故列入重启清单。
 	// schedule.balance_refresh_concurrency / catch_up_minutes 走 setter 热生效，不在此列。
 	out = append(out, "schedule.balance_refresh_startup_delay", "schedule.balance_refresh_startup_force")
+	// v2.6.0 audit P1: all fields below are captured by assembly-time objects (handler/notifier/
+	// jobs/upstream client/auth switch). Panel saves would silently not take effect -> list them.
+	out = append(out, "upstream.client_version", "upstream.cli_version", "upstream.client_name",
+		"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip")
+	out = append(out, "global.enabled", "global.chat_base", "global.billing_base")
+	out = append(out, "dns_servers")
+	out = append(out, "session_sticky.enabled")
+	out = append(out, "panel.events_enabled")
+	out = append(out, "jobs.max_concurrency", "jobs.retain")
+	out = append(out, "notify.webhook_url", "notify.timeout", "notify.events", "notify.channel",
+		"notify.telegram_chat_id", "notify.title")
+	out = append(out, "prompt.mode", "prompt.file")
+	out = append(out, "security.allow_anonymous")
+	out = append(out, "server.max_body_mb")
+	// schedule.balance_refresh_enabled / task_sweep_enabled: if disabled at startup no ticker
+	// goroutine is created; enabling at runtime needs a restart (disable / interval changes are hot).
+	out = append(out, "schedule.balance_refresh_enabled", "schedule.task_sweep_enabled")
 	return out
 }
 

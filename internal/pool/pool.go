@@ -85,6 +85,9 @@ type Pool struct {
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
+	// flusherDone 在 flusher goroutine 退出时 close：Close 等待它后才做最终 Flush，
+	// 避免 Close 返回后 flusher 仍写盘（v2.6.0 停机/持久化顺序加固）。
+	flusherDone chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
 
@@ -104,6 +107,21 @@ type Pool struct {
 	availCache    atomic.Pointer[availCacheEntry]
 	// snapshotBuildMu Snapshot 重建单飞（防并发缓存击穿）。
 	snapshotBuildMu sync.Mutex
+
+	// ---- v2.6.0 持久化锁外 IO（P0-3）----
+	// persistMu 串行化所有 state.json 写盘者（flusher/Flush/Remove/SyncToDir/构造期回写）；
+	// p.mu 在 marshal/写盘期间不持有（见 persistState）。
+	persistMu sync.Mutex
+	// persistedVer 已写盘快照对应的池版本号：persistState 跳过更旧快照，防止
+	// 「先快照后写盘」的并发乱序用旧内容覆盖新内容。
+	persistedVer atomic.Uint64
+	// persistFailMu 保护 persistFails（失败节流计数）：v2.6.0 起失败记录发生在
+	// p.mu 之外，不能再用 p.mu 保护。
+	persistFailMu sync.Mutex
+
+	// ---- v2.6.0 会话粘性可用视图缓存（P0-2，实现见 availability.go）----
+	availVMu   sync.Mutex
+	availViews map[availViewKey]*availViewEntry
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -125,6 +143,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		availViews:          map[availViewKey]*availViewEntry{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -136,12 +155,17 @@ func New(stateFp string) *Pool {
 // Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
 // 进程退出前调用，消除 startFlusher 的 goroutine 泄漏；不调用也不影响正确性
 // （进程退出即回收），仅是生命周期卫生。
+// v2.6.0：先等 flusher goroutine 退出（flusherDone），再做最终 Flush，保证 Close
+// 返回后不会再有后台 goroutine 写 state.json。
 func (p *Pool) Close() {
 	if p.stopCh == nil {
 		return
 	}
 	p.closeOnce.Do(func() {
 		close(p.stopCh)
+		if p.flusherDone != nil {
+			<-p.flusherDone
+		}
 	})
 	p.Flush()
 }
@@ -388,7 +412,6 @@ func (p *Pool) Add(a *auth.Auth) {
 // v2.5.0：集合有增删 → Version++/Membership++（一次操作只递增一次）。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	changedMembership := false
 	for _, a := range auths {
@@ -409,8 +432,15 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	if changedMembership {
 		p.bumpMembershipLocked()
 	}
-	if changed {
-		p.saveLocked()
+	if !changed {
+		p.mu.Unlock()
+		return
+	}
+	// v2.6.0：锁内快照、锁外写盘（persistState 用 persistMu 串行，避免持 p.mu 做 IO）。
+	sf, ver, doSave := p.snapshotForPersistLocked()
+	p.mu.Unlock()
+	if doSave {
+		p.persistState(sf, ver)
 	}
 }
 
@@ -419,16 +449,21 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
 		return nil
 	}
 	delete(p.byUID, uid)
 	p.bumpMembershipLocked()
 	p.bumpVersionLocked()
 	p.dirty.Store(true)
-	p.saveLocked()
+	// v2.6.0：锁内快照、锁外写盘（不持 p.mu 做磁盘 IO）。
+	sf, ver, doSave := p.snapshotForPersistLocked()
+	p.mu.Unlock()
+	if doSave {
+		p.persistState(sf, ver)
+	}
 	return e.a
 }
 

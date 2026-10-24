@@ -126,7 +126,8 @@ func dirWritable(dir string) bool {
 	return true
 }
 
-// metrics 输出 Prometheus 文本指标（每次抓取实时计算；1146 账号池 O(n) 毫秒级）。
+// metrics 输出 Prometheus 文本指标（v2.5.0 起走 pool.Summary() O(1) 缓存，
+// 10k 账号抓取亚毫秒级，不再做全池 List/扫描）。
 // 标签只出现固定低基数（state）；uid/model 等不建标签，避免标签基数爆炸。
 func (p *Panel) metrics(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()

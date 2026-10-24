@@ -142,7 +142,7 @@ func TestAppJSCreditDimensionFormatting(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 	const start = src.indexOf('function trimFixed');
-const end = src.indexOf('function usStat');
+const end = src.indexOf('function usKpi');
 if (start < 0 || end < 0) throw new Error('credit helpers not found');
 const ctx = { Number, String, RegExp };
 vm.createContext(ctx);
@@ -236,7 +236,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const fmtStart = src.indexOf('function fmtTok(');
-const fmtEnd = src.indexOf('function usStat(');
+const fmtEnd = src.indexOf('function usKpi(');
 const reqStart = src.indexOf('function requestLogText');
 const reqEnd = src.indexOf('function fmtBytes');
 if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
@@ -293,13 +293,23 @@ const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
 vm.runInContext(
   src.slice(start, end) +
-  '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
+  '\nthis.creditNum=creditNum;this.creditDeltaText=creditDeltaText;this.creditTimeText=creditTimeText;' +
+  'this.creditAccountText=creditAccountText;this.creditBalanceText=creditBalanceText;' +
+  'this.creditDescText=creditDescText;this.creditHistoryNote=creditHistoryNote;',
   ctx
 );
 const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+const gain = { time, uid: '89374120', account: '小明', delta: 100, before: 1300, after: 1400 };
+const loss = { time, uid: '89374120', account: '', delta: -30, before: 1400, after: 1370 };
 process.stdout.write(JSON.stringify({
-  gain: ctx.creditEntryText({ time, uid: '89374120', account: '小明', delta: 100, before: 1300, after: 1400 }),
-  loss: ctx.creditEntryText({ time, uid: '89374120', account: '', delta: -30, before: 1400, after: 1370 }),
+  time: ctx.creditTimeText(gain),
+  account: ctx.creditAccountText(gain),
+  uidFallback: ctx.creditAccountText(loss),
+  deltaGain: ctx.creditDeltaText(100),
+  deltaLoss: ctx.creditDeltaText(-30),
+  deltaZero: ctx.creditDeltaText(0),
+  balance: ctx.creditBalanceText(gain),
+  desc: ctx.creditDescText(gain),
   note: ctx.creditHistoryNote([{ delta: 1300 }, { delta: -60 }]),
   empty: ctx.creditHistoryNote([]),
 }));`
@@ -315,16 +325,12 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
 	}
-	gain := "14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
-	loss := "14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
-	want := `{"gain":` + strconv.Quote(gain) + `,"loss":` + strconv.Quote(loss) +
-		`,"note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
+	want := `{"time":"14:05:06","account":"小明","uidFallback":"89374120","deltaGain":"+100","deltaLoss":"−30","deltaZero":"0","balance":"1,400","desc":"余额 1,300 → 1,400","note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("credit history formatting=%s want %s", out, want)
 	}
 }
 
-// 请求记录筛选：IP / UA / 模型 / 账号 / 请求 ID 的包含匹配（空格分词 AND）+ 结果精确匹配。
 func TestAppJSRequestMatch(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -515,11 +521,11 @@ func TestAppJSUsageChartBarClass(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function parsePointTime');
-const end = src.indexOf('function fmtTokTip');
+const end = src.indexOf('\nlet usageRateWarmAt');
 const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const fmtStart = src.indexOf('function fmtTok(');
-const fmtEnd = src.indexOf('function usStat(');
+const fmtEnd = src.indexOf('function usKpi(');
 if ([start, end, escStart, escEnd, fmtStart, fmtEnd].some(v => v < 0)) throw new Error('usage chart helpers not found');
 const host = { innerHTML: '', textContent: '' };
 const ctx = {
@@ -1222,7 +1228,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function parsePointTime');
 const chartStart = src.indexOf('function renderUsageChart');
 if (start < 0 || chartStart < 0) throw new Error('chart functions not found');
-let end = src.indexOf('\nfunction ', chartStart + 10);
+let end = src.indexOf('\nlet usageRateWarmAt', chartStart + 10);
 if (end < 0) end = src.length;
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
@@ -1534,17 +1540,22 @@ process.stdout.write(JSON.stringify({
 // feNode 用 node 执行一段前端「切片」脚本：脚本以 app.js 为 process.argv[2]，工作目录
 // 为 internal/panel。无 node 环境时跳过（与既有前端测试同口径）。新增用例较多，把
 // 「写临时脚本 + 跑 node + 失败打印输出」收敛到一处，避免每处重复十行样板。
-func feNode(t *testing.T, script string) string {
+// 可选 files[0] 指定被读取的资源（默认 app.js；mobile.js 用例传 "mobile.js"）。
+func feNode(t *testing.T, script string, files ...string) string {
 	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed; frontend slice test skipped")
 	}
+	target := "app.js"
+	if len(files) > 0 && files[0] != "" {
+		target = files[0]
+	}
 	fp := filepath.Join(t.TempDir(), "fe-slice.cjs")
 	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(node, fp, "app.js").CombinedOutput()
+	out, err := exec.Command(node, fp, target).CombinedOutput()
 	if err != nil {
 		t.Fatalf("frontend slice node test failed: %v\n%s", err, out)
 	}
@@ -2897,6 +2908,10 @@ const ctx = {
   localStorage: { getItem: () => 'sk-test' },
   keyPrompted: true,
   authCalls: 0,
+  // v2.6.0：apiCached 改走 fetchTimed 超时封装，切片不含 helpers → 直通桩
+  fetchTimed: (url, opts) => ctx.fetch(url, opts),
+  isRequestAbort: () => false,
+  apiTimeoutError: () => new Error('timeout'),
   onAuthRequired: () => { ctx.authCalls++; },
   fetch: async (url, opts) => {
     calls.push({ url: String(url), headers: (opts && opts.headers) || {} });
@@ -3761,6 +3776,7 @@ const ctx = {
   renderAccounts: () => { state.renders++; },
   renderUsage: () => {},
   loadAccTags: () => {},   // v2.3.1：loadMeta 成功后会刷新标签下拉
+  reqSeqNext: () => 1, reqSeqStale: () => false,   // v2.6.0：loadMeta 请求序号（切片外）
   usageData: null, accAll: [], accPageMeta: null,
   Date, Number, String, Object, Array, Math, JSON, Promise,
 };
@@ -3891,6 +3907,7 @@ const ctx = {
   renderUsage: () => { state.usageRenders++; },
   // v2.3.1：保存备注/标签后要刷新标签下拉与当前页（这里只计数，行为在标签用例里测）
   loadAccTags: () => { state.tagsLoads++; },
+  reqSeqNext: () => 1, reqSeqStale: () => false,   // v2.6.0：loadMeta 请求序号（切片外）
   refreshAccountPool: () => { state.poolRefreshes++; },
   usageData: null, accAll: [], accPageMeta: null,
   Date, Number, String, Object, Array, Math, JSON, Promise,
@@ -4525,5 +4542,606 @@ func TestPanelV241NoMultiUser(t *testing.T) {
 	}
 	if strings.Contains(c, "'auth/'") {
 		t.Error("检查脚本白名单仍残留 'auth/'（多用户已移除）")
+	}
+}
+
+// TestAppJSRendererEscaping v2.6.0：XSS 兜底回归——未知频道/未知锁池状态/未知队列状态
+// 与数值字段都被安全格式化；构造 `<img onerror>` 等载荷断言输出无未转义 HTML。
+func TestAppJSRendererEscaping(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const qrowStart = src.indexOf('function qrowHTML');
+const qrowEnd = src.indexOf('\nfunction renderQueue(');
+const logStart = src.indexOf('function renderLogBox');
+const logEnd = src.indexOf('\nlet logQTimer', logStart);
+const mlStart = src.indexOf('function renderModelLocksView');
+const mlEnd = src.indexOf('\nlet mlQTimer');
+const numStart = src.indexOf('function numOr0');
+const numEnd = src.indexOf('\n', numStart);
+const trStart = src.indexOf('function taskRunRowHtml');
+const trEnd = src.indexOf('\nfunction renderTaskRuns');
+if ([escStart, escEnd, qrowStart, qrowEnd, logStart, logEnd, mlStart, mlEnd, numStart, trStart, trEnd].some(v => v < 0)) {
+  throw new Error('renderer slices not found');
+}
+const sinks = {};
+const mk = id => (sinks[id] = { id, innerHTML: '', textContent: '' });
+const page = (rows) => ({ rows: rows, page: 1, pages: 1, total: rows.length });
+const escFn = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const ctx = {
+  esc: escFn, String, Number, JSON,
+  $: id => (sinks[id] || mk(id)),
+  pageSlice: (rows) => page(rows || []),
+  updatePagerUI: () => {},
+  hitCountLabel: (a, b) => a + '/' + b,
+  filterLogs: (entries) => entries || [],
+  GROWTH_TITLES: {},
+  ST_WORDS: { done: '完成', running: '执行中' },
+  logAll: [], logCh: 'all', logFilters: { q: '' }, logPage: 1, logPageSize: 100, logPin: false,
+  mlAll: [], mlFilters: { q: '', state: '', realm: '' }, mlPage: 1, mlPageSize: 100,
+  mlMatch: () => true,
+  mlSortList: rows => rows,
+  parseAPITime: () => 0,
+  dur: s => s + 's',
+  Date,
+  fmtRunTime: v => String(v || '—'),
+  taskKindText: k => 'k:' + k,
+  taskTriggerText: k => 't:' + k,
+};
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + '\n' + src.slice(qrowStart, qrowEnd) + '\n' +
+  src.slice(logStart, logEnd) + '\n' + src.slice(mlStart, mlEnd) + '\n' +
+  src.slice(numStart, numEnd) + '\n' + src.slice(trStart, trEnd) +
+  '\nthis.qrowHTML=qrowHTML;this.renderLogBox=renderLogBox;this.renderModelLocksView=renderModelLocksView;' +
+  'this.numOr0=numOr0;this.taskRunRowHtml=taskRunRowHtml;',
+  ctx
+);
+const xss = '<img src=x onerror=alert(1)>';
+const q = ctx.qrowHTML({ kind: 'growth', code: 'code-1', status: xss, message: 'm' });
+ctx.logAll = [{ ch: xss, text: 'hello', ts: null }];
+ctx.renderLogBox(false);
+const l = sinks.logBox.innerHTML;
+ctx.mlAll = [{ model: 'm', state: xss, realm: 'cn', servable: 1, total: 1 }];
+ctx.renderModelLocksView();
+const ml = sinks.mlBody.innerHTML;
+const tr = ctx.taskRunRowHtml({ total: xss, done: '1', fail: xss, skip: 2, error: null });
+process.stdout.write(JSON.stringify({
+  qrowNoTag: q.indexOf('<img') < 0 && q.indexOf('&lt;img') >= 0,
+  qrowUnknownWord: q.indexOf('未知状态') >= 0,
+  logNoTag: l.indexOf('<img') < 0,
+  logSysFallback: l.indexOf('系统') >= 0,
+  lockNoTag: ml.indexOf('<img') < 0 && ml.indexOf('&lt;img') >= 0,
+  lockUnknownHint: ml.indexOf('未知状态') >= 0,
+  numPayload: ctx.numOr0(xss),
+  numOk: ctx.numOr0('12'),
+  taskNoTag: tr.indexOf('<img') < 0,
+  taskNumbers: (tr.match(/class="num">[^<]*<\/td>/g) || []).length,
+}));`
+	want := `{"qrowNoTag":true,"qrowUnknownWord":true,"logNoTag":true,"logSysFallback":true,` +
+		`"lockNoTag":true,"lockUnknownHint":true,"numPayload":0,"numOk":12,` +
+		`"taskNoTag":true,"taskNumbers":4}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("渲染转义=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSFetchTimeoutAndSeq v2.6.0：api() 15s 超时（AbortController）与请求序号 helper。
+func TestAppJSFetchTimeoutAndSeq(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const API_TIMEOUT_MS');
+const end = src.indexOf('function toast(');
+if (start < 0 || end < 0 || end < start) throw new Error('request helpers not found');
+const timers = [];
+const cleared = [];
+const pendingRejects = [];
+let authCalls = 0;
+class FakeAC {
+  constructor() {
+    const handlers = [];
+    this.signal = { aborted: false, handlers: handlers,
+      addEventListener: (ev, fn) => { if (ev === 'abort') handlers.push(fn); } };
+  }
+  abort() {
+    if (this.signal.aborted) return;
+    this.signal.aborted = true;
+    this.signal.handlers.forEach(fn => fn());
+  }
+}
+const ctx = {
+  AbortController: FakeAC,
+  setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+  clearTimeout: id => { cleared.push(id); },
+  localStorage: { getItem: () => 'k' },
+  LS_KEY: 'wb2api.key',
+  keyPrompted: false,
+  onAuthRequired: () => { authCalls++; },
+  fetch: (url, opts) => {
+    if (ctx.__mode === 'timeout') {
+      return new Promise((resolve, reject) => {
+        const sig = (opts || {}).signal;
+        if (sig && sig.addEventListener) sig.addEventListener('abort', () => {
+          const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+        });
+      });
+    }
+    if (ctx.__mode === '401') {
+      return Promise.resolve({ status: 401, ok: false, json: async () => ({}) });
+    }
+    return Promise.resolve({ status: 200, ok: true, json: async () => ({ ok: true }) });
+  },
+  __mode: 'ok',
+  __timers: timers, __cleared: cleared, __auth: () => authCalls,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.api=api;this.fetchTimed=fetchTimed;this.isRequestAbort=isRequestAbort;' +
+  'this.reqSeqNext=reqSeqNext;this.reqSeqStale=reqSeqStale;this.API_TIMEOUT_MS=API_TIMEOUT_MS;', ctx);
+(async () => {
+  const out = {};
+  out.timeoutMs = ctx.API_TIMEOUT_MS;
+  // ① 永不返回的请求：定时器 15s 后 abort → api 抛出「请求超时」
+  ctx.__mode = 'timeout';
+  const p = ctx.api('slow/path');
+  await Promise.resolve(); await Promise.resolve();
+  out.timerDelays = ctx.__timers.map(t => t.ms);
+  ctx.__timers[0].fn();
+  let msg = '';
+  try { await p; } catch (e) { msg = e.message; }
+  out.timeout = { msg: msg.indexOf('请求超时') >= 0, cleared: ctx.__cleared.length > 0 };
+  // ② 正常 200：返回 body 且定时器被清理
+  ctx.__mode = 'ok';
+  const d = await ctx.api('ok/path');
+  out.ok = { got: d.ok === true, cleared: ctx.__cleared.length > 1 };
+  // ③ 401：交给 onAuthRequired（登录层）
+  ctx.__mode = '401';
+  let authMsg = '';
+  try { await ctx.api('auth-need'); } catch (e) { authMsg = e.message; }
+  out.unauth = { calls: ctx.__auth(), msg: authMsg };
+  // ④ 请求序号：后发优先
+  const k = 'seq-spec';
+  const s1 = ctx.reqSeqNext(k), s2 = ctx.reqSeqNext(k);
+  out.seq = { first: s1, second: s2, staleFirst: ctx.reqSeqStale(k, s1), currentSecond: ctx.reqSeqStale(k, s2) };
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"timeoutMs":15000,"timerDelays":[15000],"timeout":{"msg":true,"cleared":true},` +
+		`"ok":{"got":true,"cleared":true},"unauth":{"calls":1,"msg":"密钥无效或未填写"},` +
+		`"seq":{"first":1,"second":2,"staleFirst":true,"currentSecond":false}}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("超时/序号=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSLogsPollingStagger v2.6.0：运行日志页重数据（metrics/归档/积分历史）30s 一次，
+// 轻量 /logs 每轮都拉；用户操作 force=true 强制重拉。请求数 4 → 1 → 4。
+func TestAppJSLogsPollingStagger(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const LOGS_HEAVY_TTL_MS');
+const end = src.indexOf('\nfunction renderRequestMetrics');
+if (start < 0 || end < 0) throw new Error('loadLogs not found');
+let nowMs = 1000000;
+const calls = [];
+const sinks = {
+  logBox: { scrollTop: 0, clientHeight: 100, scrollHeight: 100 },
+  reqLimit: { value: '100' },
+};
+const ctx = {
+  Date: { now: () => nowMs },
+  Number, String, Object, Array, JSON, Math,
+  $: id => (sinks[id] || null),
+  reqSeqNext: () => 1,
+  reqSeqStale: () => false,
+  trangeQuery: () => ({ set: () => {}, toString: () => '' }),
+  creditHistoryQuery: () => 'credit_history?limit=100',
+  syncCreditAccounts: () => {},
+  filterLogs: () => [],
+  api: async path => { calls.push(path); if (path === 'logs') return { entries: [] }; return {}; },
+  renderLogBox: () => {},
+  renderRequestMetrics: () => {},
+  renderCreditHistory: () => {},
+  logAll: [], logCh: 'all', logFilters: { q: '' }, logPage: 1, logPageSize: 100, logPin: false,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.loadLogs=loadLogs;', ctx);
+(async () => {
+  const out = {};
+  const count = () => calls.length;
+  await ctx.loadLogs();            // 首次：重数据
+  out.first = count();
+  nowMs += 5000; calls.length = 0;
+  await ctx.loadLogs();            // 5s 后轮询：只 /logs
+  out.poll = calls.slice();
+  nowMs += 31000; calls.length = 0;
+  await ctx.loadLogs();            // TTL 过期：重数据
+  out.afterTtl = count();
+  nowMs += 1000; calls.length = 0;
+  await ctx.loadLogs(true);        // 用户操作 force：立即重数据
+  out.forced = count();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"first":4,"poll":["logs"],"afterTtl":4,"forced":4}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("日志降频=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSStaleResponseGuards v2.6.0：loadPackageDetail 旧账号/旧请求响应必须丢弃。
+func TestAppJSStaleResponseGuards(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const helpersStart = src.indexOf('const REQ_SEQ = Object.create(null)');
+const helpersEnd = src.indexOf('\nasync function api(');
+const start = src.indexOf('async function loadPackageDetail');
+const end = src.indexOf('\nfunction packageDetailHtml');
+if ([helpersStart, helpersEnd, start, end].some(v => v < 0)) throw new Error('guards not found');
+const sinks = { pkState: { hidden: false, className: '' }, pkBody: { innerHTML: '' } };
+let pending = {};
+let pkUID = 'A';
+const ctx = {
+  Number, String, Object, Array, JSON, Promise, encodeURIComponent,
+  $: id => (sinks[id] || null),
+  api: path => new Promise(resolve => {
+    (pending[path] = pending[path] || []).push(resolve);
+  }),
+  packageDetailHtml: a => 'detail:' + a.uid,
+  pkDetailLimit: () => 5,
+  get pkUID() { return pkUID; },
+  set pkUID(v) { pkUID = v; },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(helpersStart, helpersEnd) + src.slice(start, end) +
+  '\nthis.loadPackageDetail=loadPackageDetail;this.setUID=v=>{pkUID=v;};', ctx);
+const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+const pendingFor = p => pending[p].shift() || null;
+(async () => {
+  const out = {};
+  const pA = ctx.loadPackageDetail().then(() => 'A-done');
+  ctx.setUID('B');
+  const pB = ctx.loadPackageDetail().then(() => 'B-done');
+  await flush();
+  // 先 B（新）后 A（旧）：两次 config 请求都先放行，避免 Promise.all 互相等待。
+  const cfgA = pendingFor('config');
+  const cfgB = pendingFor('config');
+  cfgA({ config: {} });
+  cfgB({ config: {} });
+  pendingFor('packages?uid=B')({ accounts: [{ uid: 'B' }] });
+  await pB;
+  out.afterB = sinks.pkBody.innerHTML;
+  pendingFor('packages?uid=A')({ accounts: [{ uid: 'A' }] });
+  await pA;
+  out.afterA = sinks.pkBody.innerHTML;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"afterB":"detail:B","afterA":"detail:B"}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("过期响应=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSA11yFocusTrap v2.6.0：Tab 循环纯函数 / 焦点元素收集 / Esc 关闭语义（data-lock 除外）。
+func TestAppJSA11yFocusTrap(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const FOCUSABLE_SEL');
+const end = src.indexOf('/* veils 的 class 变化');
+if (start < 0 || end < 0) throw new Error('a11y helpers not found');
+const removed = [];
+const closed = [];
+const focused = [];
+const makeBtn = id => ({ id, hidden: false, focus() { focused.push(id); } });
+const top = { id: 'vcVeil', dataset: {}, getAttribute: () => null, classList: { remove: c => removed.push('vc') } };
+const locked = { id: 'keyVeil', dataset: {}, getAttribute: k => (k === 'data-lock' ? '1' : null), classList: { remove: () => removed.push('key') } };
+const dialog = { querySelectorAll: () => [makeBtn('btn1'), makeBtn('btn2')] };
+top.querySelector = sel => (sel === '.dlg' ? dialog : null);
+locked.querySelector = sel => (sel === '.dlg' ? dialog : null);
+const ctx = {
+  document: {
+    activeElement: null,
+    addEventListener: () => {},
+    querySelectorAll: sel => (sel === '.veil.on' ? ctx.__veils : []),
+  },
+  MutationObserver: class { observe() {} disconnect() {} },
+  Array, Number, String, Object,
+  __veils: [],
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.trapNextIndex=trapNextIndex;this.veilFocusables=veilFocusables;' +
+  'this.veilOnKeydown=veilOnKeydown;this.__sets=o=>{ctx=o;};', ctx);
+const trap = ctx.trapNextIndex;
+const out = {
+  forward: [trap(3, 0, false), trap(3, 1, false), trap(3, 2, false)],
+  backward: [trap(3, 0, true), trap(3, 1, true), trap(3, 2, true)],
+  fromBackground: [trap(3, -1, false), trap(3, -1, true)],
+  empty: trap(0, 0, false),
+  focusables: ctx.veilFocusables({ querySelectorAll: () => [{ hidden: false }, { hidden: true }] }).length,
+  noRoot: ctx.veilFocusables(null).length,
+};
+// Esc 关闭一般弹层；data-lock 登录层不关
+ctx.__veils = [top];
+ctx.veilOnKeydown({ key: 'Escape', preventDefault: () => {} });
+// Tab 在弹窗内循环：当前焦点 btn2（最后一个）→ 前向回到 btn1
+ctx.document.activeElement = { id: 'btn2' };
+let prevented = false;
+ctx.veilOnKeydown({ key: 'Tab', shiftKey: false, preventDefault: () => { prevented = true; } });
+out.escClosed = removed.indexOf('vc') >= 0;
+out.lockedSkipped = (() => { ctx.__veils = [locked]; ctx.veilOnKeydown({ key: 'Escape', preventDefault: () => {} }); return removed.indexOf('key') < 0; })();
+out.tabTrapped = prevented && focused[focused.length - 1] === 'btn1';
+process.stdout.write(JSON.stringify(out));`
+	want := `{"forward":[1,2,0],"backward":[2,0,1],"fromBackground":[0,2],"empty":-1,` +
+		`"focusables":1,"noRoot":0,"escClosed":true,"lockedSkipped":true,"tabTrapped":true}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("焦点陷阱=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSMobileIncrementalLabels v2.6.0：mobile.js 只在断点匹配时观察，且只标注新增表格。
+func TestAppJSMobileIncrementalLabels(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const MOBILE_MQ');
+const end = src.indexOf('/* ── 用量');
+if (start < 0 || end < 0) throw new Error('mobile labels not found');
+const mqListeners = [];
+const ctx = {
+  MOBILE_MQ: null,
+  document: { body: {}, querySelector: () => null, querySelectorAll: () => [] },
+  $: () => null,
+  addEventListener: () => {},
+  setTimeout: (fn) => { ctx.__timer = fn; return 1; },
+  Array, String, Number, Object,
+  matchMedia: () => {
+    const mq = { matches: false, addEventListener: (ev, fn) => { if (ev === 'change') mqListeners.push(fn); } };
+    ctx.MOBILE_MQ = mq;
+    return mq;
+  },
+  MutationObserver: class {
+    constructor(fn) { ctx.__obsFn = fn; this.observed = 0; this.disconnected = 0; }
+    observe() { this.observed++; }
+    disconnect() { this.disconnected++; }
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.syncLabelObserver=syncLabelObserver;this.tablesFromNode=tablesFromNode;this.queueLabels=queueLabels;' +
+  'this.__state=()=>({ observer: labelObserver, pending: pendingTables.size });', ctx);
+const M = ctx;
+const out = {};
+out.desktopObserver = M.__state().observer;
+// 切到窄屏：change 监听触发 → 建立观察器、首屏补标
+M.MOBILE_MQ.matches = true;
+mqListeners.forEach(fn => fn());
+out.mobileObserver = !!M.__state().observer;
+out.observed = M.__state().observer ? M.__state().observer.observed : 0;
+// 纯函数：新增节点里含 table → 只收集该 table
+const table = { nodeType: 1, tagName: 'TABLE' };
+const holder = { nodeType: 1, tagName: 'DIV', querySelectorAll: () => [table] };
+out.tables = M.tablesFromNode(holder).length;
+out.tablesText = M.tablesFromNode({ nodeType: 3, nodeValue: 'x' }).length;
+// 增量标注：queueLabels 只处理新增 table，并给 td 打 data-l
+const th = { childNodes: [{ nodeType: 3, nodeValue: '名称' }] };
+const td = { colSpan: 1, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute() {} };
+const fakeTable = {
+  nodeType: 1, tagName: 'TABLE',
+  tHead: { rows: [{ cells: [th] }] },
+  tBodies: [{ rows: [{ cells: [td] }] }],
+};
+M.queueLabels([{ addedNodes: [fakeTable] }]);
+out.pendingBeforeFlush = M.__state().pending;
+M.__timer();
+out.afterFlush = { pending: M.__state().pending, label: td.attrs['data-l'] || '' };
+// 切回桌面：断开观察器
+M.MOBILE_MQ.matches = false;
+M.syncLabelObserver();
+out.disconnected = M.__state().observer === null;
+process.stdout.write(JSON.stringify(out));`
+	want := `{"desktopObserver":null,"mobileObserver":true,"observed":1,"tables":1,"tablesText":0,` +
+		`"pendingBeforeFlush":1,"afterFlush":{"pending":0,"label":"名称"},"disconnected":true}`
+	if got := feNode(t, script, "mobile.js"); got != want {
+		t.Fatalf("移动端增量标注=%s\nwant %s", got, want)
+	}
+}
+
+// TestPanelV260Wiring v2.6.0：修复接线与清理结果（XSS/超时/序号/降频/可访问性/死代码）。
+func TestPanelV260Wiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(js)
+	for _, want := range []string{
+		// 超时 + 请求序号
+		"const API_TIMEOUT_MS = 15000;",
+		"function fetchTimed(",
+		"function reqSeqNext(",
+		"reqSeqNext('usage')", "reqSeqNext('logs')", "reqSeqNext('packageDetail')", "reqSeqNext('meta')",
+		"function apiTimeoutError(",
+		// 日志页分级
+		"const LOGS_HEAVY_TTL_MS = 30000;",
+		"const heavyDue = forceHeavy === true",
+		// XSS 兜底
+		"const chSafe = /^(task|chat|sys)$/",
+		"未知状态：",
+		"const creditsNum = numOr0(creditsRaw);",
+		"numOr0(r.total)",
+		// 可访问性
+		"const FOCUSABLE_SEL",
+		"function trapNextIndex(",
+		"data-lock') === '1'",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("app.js 缺少 v2.6.0 接线 %q", want)
+		}
+	}
+	// 死代码/重复格式化器必须移除（creditEntryText 保留：对抗测试直接引用它的脏时间回退）
+	for _, gone := range []string{
+		"function staskHTML(", "function usStat(", "function fmtTokTip(",
+		"const LUCK_SVG", "const SCHOOL_TITLES", "let reqRangeState",
+		"function formatTokenCount(", "function formatLatency(", "function formatRate(",
+	} {
+		if strings.Contains(j, gone) {
+			t.Errorf("app.js 仍残留已清理符号 %q", gone)
+		}
+	}
+	if n := strings.Count(j, "<th scope=\"col\""); n < 30 {
+		t.Errorf("app.js 动态表格表头 scope 只有 %d 处（应 ≥30）", n)
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{
+		`id="toasts" role="status" aria-live="polite"`,
+		`id="remarkVeil"`, `aria-labelledby="remarkVeilTitle"`,
+		`id="keyVeil"`, `aria-labelledby="keyVeilTitle"`,
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺少 v2.6.0 可访问性标记 %q", want)
+		}
+	}
+	if n := strings.Count(h, `role="dialog"`); n < 6 {
+		t.Errorf("index.html 弹层 role=dialog 只有 %d 处（应 6）", n)
+	}
+	if strings.Contains(h, "curUser") || strings.Contains(h, "btnLogout") {
+		t.Error("index.html 仍残留已移除的多用户控件")
+	}
+	mob, err := os.ReadFile("mobile.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := string(mob)
+	for _, want := range []string{"function tablesFromNode(", "if (!MOBILE_MQ.matches)", "addedNodes", "function syncLabelObserver("} {
+		if !strings.Contains(m, want) {
+			t.Errorf("mobile.js 缺少增量观察接线 %q", want)
+		}
+	}
+	if strings.Contains(m, "new MutationObserver(queueLabels).observe") {
+		t.Error("mobile.js 仍是旧的无条件全表观察器")
+	}
+	chk, err := os.ReadFile("../../scripts/panel_frontend_check.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`role="dialog"`, "aria-live", "scope=\"col\""} {
+		if !strings.Contains(string(chk), want) {
+			t.Errorf("前端检查脚本缺少可访问性门禁 %q", want)
+		}
+	}
+}
+
+// TestAppJSStaleUsageGuard v2.6.0：loadUsage 并发时只允许最后一次请求渲染/清空。
+func TestAppJSStaleUsageGuard(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const helpersStart = src.indexOf('const REQ_SEQ = Object.create(null)');
+const helpersEnd = src.indexOf('\nasync function api(');
+const start = src.indexOf('async function loadUsage()');
+const end = src.indexOf('\nif ($(\'btnUsage\'))', start);
+if ([helpersStart, helpersEnd, start, end].some(v => v < 0)) throw new Error('loadUsage guards not found');
+let seq = 0;
+const pending = [];
+const rendered = [];
+const ctx = {
+  Number, String, Object, Array, Promise, Date, Math,
+  trangeQuery: () => ({ toString: () => 'range=24h' }),
+  warmUsageModelRates: async () => {},
+  api: path => new Promise((resolve, reject) => pending.push({ path, resolve, reject })),
+  renderUsage: d => rendered.push(d && d.tag),
+  usageData: 'keep',
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(helpersStart, helpersEnd) + src.slice(start, end) +
+  '\nthis.loadUsage=loadUsage;', ctx);
+const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+(async () => {
+  const out = {};
+  const p1 = ctx.loadUsage();
+  await flush();
+  const p2 = ctx.loadUsage();
+  await flush();
+  // 后发先到：只有 new 被渲染
+  pending[1].resolve({ tag: 'new' });
+  await p2;
+  out.renderedAfterNew = rendered.slice();
+  // 先发后到：old 必须被丢弃（不渲染、不清 usageData）
+  pending[0].resolve({ tag: 'old' });
+  await p1;
+  out.renderedAfterOld = rendered.slice();
+  // 旧请求失败也不得清空新数据
+  const p3 = ctx.loadUsage();
+  await flush();
+  const p4 = ctx.loadUsage();
+  await flush();
+  pending[3].resolve({ tag: 'newer' });
+  await p4;
+  pending[2].reject(new Error('old fails late'));
+  await p3;
+  out.renderedFinal = rendered.slice();
+  out.usageData = ctx.usageData;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"renderedAfterNew":["new"],"renderedAfterOld":["new"],"renderedFinal":["new","newer"],"usageData":"keep"}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("过期用量响应=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSStaleMetaGuard v2.6.0：loadMeta 并发（打开备注弹窗与保存/迁移重叠）只允许最后请求写回。
+func TestAppJSStaleMetaGuard(t *testing.T) {
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const helpersStart = src.indexOf('const REQ_SEQ = Object.create(null)');
+const helpersEnd = src.indexOf('\nasync function api(');
+const start = src.indexOf('async function loadMeta(quiet)');
+const end = src.indexOf('\nfunction maybeMigrateRemarks(');
+if ([helpersStart, helpersEnd, start, end].some(v => v < 0)) throw new Error('loadMeta guards not found');
+const pending = [];
+const ctx = {
+  Number, String, Object, Array, Promise,
+  api: path => new Promise((resolve, reject) => pending.push({ path, resolve, reject })),
+  normalizeMeta: d => d.meta,
+  mergeServerNotesToLocal: () => {},
+  maybeMigrateRemarks: () => {},
+  loadAccTags: () => {},
+  toast: () => {},
+  metaAll: null,
+  metaLoaded: false,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(helpersStart, helpersEnd) + src.slice(start, end) +
+  '\nthis.loadMeta=loadMeta;this.getMeta=()=>metaAll;', ctx);
+const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+(async () => {
+  const p1 = ctx.loadMeta(true);
+  await flush();
+  const p2 = ctx.loadMeta(true);
+  await flush();
+  pending[1].resolve({ meta: { v: 2 } });
+  await p2;
+  const afterNew = ctx.getMeta() && ctx.getMeta().v;
+  pending[0].resolve({ meta: { v: 1 } });
+  await p1;
+  process.stdout.write(JSON.stringify({
+    afterNew: afterNew,
+    afterOld: ctx.getMeta() && ctx.getMeta().v,
+    calls: pending.length,
+  }));
+})().catch(e => { console.error(e); process.exit(1); });`
+	want := `{"afterNew":2,"afterOld":2,"calls":2}`
+	if got := feNode(t, script); got != want {
+		t.Fatalf("过期 meta 响应=%s\nwant %s", got, want)
 	}
 }

@@ -98,7 +98,7 @@ func (p *Panel) recordTaskRun(tr TaskRun) {
 
 // taskRunsHandler 返回最近 N 条任务执行历史（新的在前）；文件不存在 → []。
 func (p *Panel) taskRunsHandler(w http.ResponseWriter, r *http.Request) {
-	limit := tailLimit(r, taskRunsDefaultLimit, taskRunsMaxLimit)
+	limit := parseLimit(r, taskRunsDefaultLimit, taskRunsMaxLimit)
 	runs, err := p.taskRunsLog.readLast(limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read task runs: "+err.Error())

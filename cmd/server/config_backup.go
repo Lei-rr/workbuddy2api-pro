@@ -185,11 +185,65 @@ func rollbackConfig(path string, live *livecfg.Holder, p *pool.Pool, up *upstrea
 	if err := validateListenSecurity(newCfg); err != nil {
 		return nil, fmt.Errorf("备份配置未通过启动安全校验（未回滚）: %w", err)
 	}
+	curRaw, _ := os.ReadFile(path) // current config before rollback (may be absent; diff only)
 	if err := writeConfigAtomic(path, raw); err != nil {
 		return nil, fmt.Errorf("回滚写盘失败: %w", err)
 	}
 	log.Printf("panel: 配置已从备份回滚 %s → %s", configBackupPath(path), path)
-	return applyConfigRuntime(newCfg, live, p, up, sch), nil
+	restart := applyConfigRuntime(newCfg, live, p, up, sch)
+	return append(restart, startupOnlyChanges(curRaw, newCfg)...), nil
+}
+
+// startupOnlyChanges compares the pre-save/pre-rollback config.json raw with the next config and
+// returns fields that are hot-editable in the config model but only read at assembly time, so the
+// transition needs a restart (v2.6.0 audit P1; fills the gap where restartRequiredFields cannot
+// know the old value):
+//   - upstash: connection/Noop mode is created at startup; set/modify/clear all need restart;
+//   - schedule.balance_refresh_enabled / task_sweep_enabled: disabled at startup means no ticker
+//     goroutine; enabling at runtime needs a restart (disable / interval changes are hot).
+func startupOnlyChanges(oldRaw []byte, next *Config) []string {
+	if len(oldRaw) == 0 || next == nil {
+		return nil
+	}
+	var old map[string]any
+	if err := json.Unmarshal(oldRaw, &old); err != nil {
+		return nil
+	}
+	var out []string
+	var oldUpstash map[string]any
+	if m, ok := old["upstash"].(map[string]any); ok {
+		oldUpstash = m
+	}
+	oldURL, _ := oldUpstash["url"].(string)
+	oldToken, _ := oldUpstash["token"].(string)
+	if oldURL != next.Upstash.URL || oldToken != next.Upstash.Token {
+		out = append(out, "upstash")
+	}
+	var oldSched map[string]any
+	if m, ok := old["schedule"].(map[string]any); ok {
+		oldSched = m
+	}
+	// Same defaults as Config: balance_refresh_enabled / task_sweep_enabled default true.
+	if !boolField(oldSched, "balance_refresh_enabled", true) && next.Schedule.BalanceRefreshEnabled {
+		out = append(out, "schedule.balance_refresh_enabled")
+	}
+	if !boolField(oldSched, "task_sweep_enabled", true) && next.Schedule.TaskSweepEnabled {
+		out = append(out, "schedule.task_sweep_enabled")
+	}
+	return out
+}
+
+// boolField reads a bool from a JSON map; missing/mistyped key returns def.
+func boolField(m map[string]any, key string, def bool) bool {
+	if m == nil {
+		return def
+	}
+	if v, ok := m[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return def
 }
 
 // verifyDangerousConfigValues 危险值拦截（v2.2.0 #15-3）：保存/回滚都拒绝会导致进程

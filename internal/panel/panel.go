@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,8 +56,12 @@ type Config struct {
 	// PollIntervalSec 前端轮询间隔（秒），经 /panel/api/overview 的 poll_interval_sec
 	// 下发；Live 快照有值时以快照为准（保存配置热生效），否则用本静态值，<=0 回落 5。
 	PollIntervalSec int
-	RedisMode       string // "upstash" / "noop"，仅观测透出
-	Version         string // 面板版本号（展示用）
+	// TaskSweepConcurrency 账号级扇出并发上限（v2.6.0 P0）：补领清扫/任务扫描/
+	// 队列扫描/昵称同步/券码查询共用同一 worker 池大小；<=0 用默认 8，上限 64。
+	// main 可接 schedule.task_sweep_concurrency；未接线时默认值即安全兜底。
+	TaskSweepConcurrency int
+	RedisMode            string // "upstash" / "noop"，仅观测透出
+	Version              string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -293,11 +298,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.withAudit(auditActionBalanceAll, p.balanceAll)))
 	// v2.3.0 #10 Job Runner：触发（/jobs/{kind}/run，返回 job_id）与取消。
 	// 触发走与旧端点相同的同 kind 单飞 gate：409 语义不变。
-	p.mux.HandleFunc("POST /panel/api/jobs/{kind}/run", p.withAuth(p.jobsRun))
-	p.mux.HandleFunc("POST /panel/api/jobs/{id}/cancel", p.withAuth(p.jobsCancel))
+	// v2.6.0：与旧批量端点（checkin_all 等）对齐补 withAudit（job_run/job_cancel）。
+	p.mux.HandleFunc("POST /panel/api/jobs/{kind}/run", p.withAuth(p.withAudit(auditActionJobRun, p.jobsRun)))
+	p.mux.HandleFunc("POST /panel/api/jobs/{id}/cancel", p.withAuth(p.withAudit(auditActionJobCancel, p.jobsCancel)))
 	// v2.3.0 #12 账号备注/标签写操作（PUT 覆盖保存；DELETE 幂等删除）。
-	p.mux.HandleFunc("PUT /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaPut))
-	p.mux.HandleFunc("DELETE /panel/api/accounts/{uid}/meta", p.withAuth(p.accountMetaDelete))
+	// v2.6.0：补 withAudit（account_meta_update/account_meta_delete）。
+	p.mux.HandleFunc("PUT /panel/api/accounts/{uid}/meta", p.withAuth(p.withAudit(auditActionAccountMetaUpdate, p.accountMetaPut)))
+	p.mux.HandleFunc("DELETE /panel/api/accounts/{uid}/meta", p.withAuth(p.withAudit(auditActionAccountMetaDelete, p.accountMetaDelete)))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.withAudit(auditActionUsageSave, p.usageSave)))
@@ -315,6 +322,13 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	// 压缩能力声明对所有面板响应生效（含未压缩的小响应与 304），便于反代/CDN 正确分桶缓存。
 	w.Header().Set("Vary", "Accept-Encoding")
+	// v2.6.0 P1：面板 API 默认 no-store。部分响应含密钥/口令/审计等敏感信息
+	// （如 GET /panel/api/config 回显 api_key、panel.api_key、webhook/device_token），
+	// 不应进入浏览器或中间缓存。accounts（private, no-cache + ETag）与 metrics/
+	// events 会在各自 handler 内覆盖为更精确的值，304/ETag 缓存语义不变。
+	if isPanelAPIPath(r.URL.Path) {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	// v2.2.0 #8：面板 API 请求计数（/metrics 展示；含 401/429，反映真实到达量）。
 	if isPanelAPIPath(r.URL.Path) {
 		p.apiRequests.Add(1)
@@ -548,8 +562,8 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 // ---------------------------------------------------------------------------
 
 const (
-	// accountsDefaultPageSize 默认页大小（1146 账号全量约 689 KB；100 行 light 约
-	// 数十 KB，配合 gzip 后 8-15 KB 量级）。
+	// accountsDefaultPageSize 默认页大小：100 行 light 约 54KB（gzip 后约 5KB）；
+	// 10k 账号池全量 light 约 5-6MB，故默认分页 + ETag/304 是前端主路径。
 	accountsDefaultPageSize = 100
 	// accountsMaxPageSize 服务端页大小上限：page_size=0（「全部」）与 >上限 的请求
 	// 都按它截断，防止单个响应无限大。
@@ -711,6 +725,10 @@ func accountsState(st pool.Status, now time.Time) string {
 //   - credits：降序（余额多的在前），同额按 uid 升序；
 //   - last_success：降序（最近成功在前），从未成功的零值恒排最后，同刻按 uid 升序；
 //   - cool_remaining：升序（剩余冷却秒数少的在前；未冷却为 0 排最前），同值按 uid 升序。
+//
+// v2.5.0 Perf-3 起生产 accounts handler 改用 sortAccountIndexes（只排索引，不再
+// 拷贝/移动 527B 的 Status）；本函数**仅测试用**（作为等价性 oracle，见
+// perf_optim_test.go TestSortAccountIndexesEquivalent），勿在 handler 新调用。
 func sortAccounts(rows []pool.Status, sortBy string) {
 	switch sortBy {
 	case "credits":
@@ -755,6 +773,10 @@ func sortAccounts(rows []pool.Status, sortBy string) {
 // 普通模式下超界 page 自动钳到最后一页（响应 page 为钳后值，前端以响应为准）：
 // 数据随状态变化减少页数时，轮询不会停在一个永远空白的页码上；空结果 pages=0、
 // page=1。空切片保持非 nil，JSON 输出 [] 而不是 null。
+//
+// v2.5.0 Perf-3 起生产 accounts handler 改用 pageSliceIndexes（对索引切片分页，
+// 不再整页拷贝 Status）；本函数**仅测试用**（等价性 oracle，见
+// perf_optim_test.go TestPageSliceIndexesEquivalent）。
 func pageAccounts(rows []pool.Status, page, pageSize int) (pageRows []pool.Status, effPage, pages int) {
 	if page < 1 {
 		page = 1
@@ -816,20 +838,6 @@ func stableStatusForETag(st pool.Status) pool.Status {
 	st.BreakerFails = 0
 	st.TokenUsage.LastUsedAt = time.Time{}
 	return st
-}
-
-// accountsProjection 返回响应体行（light 省略两个字段；full 完整 Status）。
-// 始终返回非 nil 切片：空页 JSON 输出 [] 而不是 null。
-func accountsProjection(pageRows []pool.Status, fields string) []pool.Status {
-	rows := make([]pool.Status, len(pageRows))
-	if fields == accountsFieldsFull {
-		copy(rows, pageRows)
-		return rows
-	}
-	for i, st := range pageRows {
-		rows[i] = lightStatus(st)
-	}
-	return rows
 }
 
 // accountsStableProjection 返回 ETag hash 输入行：在响应投影基础上再把易变字段
@@ -1215,15 +1223,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "request logger not available")
 		return
 	}
-	limit := 200
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
+	limit := parseLimit(r, 200, 1000)
 	q := r.URL.Query()
 	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
 		Outcome:   q.Get("outcome"),
@@ -1255,15 +1255,7 @@ func (p *Panel) creditHistory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "credit history not available")
 		return
 	}
-	limit := 200
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
+	limit := parseLimit(r, 200, 1000)
 	uid := r.URL.Query().Get("uid")
 	nicks := p.nicknames()
 	// 有 uid 过滤时必须先全量取回（账本上限默认 2000 条）：先截断再过滤会让
@@ -1703,7 +1695,7 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // （同类全池任务正在执行，手动双击或定时批次撞车）→ 409 + {"error":"…正在执行中"}。
 // 前端 api() 会把非 2xx 的 error 文案原样 toast（frontend2 已接 409 文案）。
 //
-// balance_all 过去是「同步等全池刷完再返回 + 随响应带回 accounts」——1146 号池
+// balance_all 过去是「同步等全池刷完再返回 + 随响应带回 accounts」——上万账号池
 // 会让反代 60s 超时（504），且与 #10 的并发闸门叠加时页面长时间无反馈。现改为
 // 异步：先占 gate → 立即返回 → 后台按有界并发跑完（含昵称同步），前端 2.5s 后
 // 补拉 overview 看到首批余额，其余交给常规轮询。旧响应字段 ok/started 保留。
@@ -1810,8 +1802,13 @@ func (p *Panel) syncNicknames() {
 		uid string
 		a   *auth.Auth
 	}
-	var jobs []job
-	for _, st := range p.cfg.Pool.List() {
+	if p.cfg.Pool == nil {
+		return
+	}
+	snapshot := p.poolSnapshot()
+	jobs := make([]job, 0, len(snapshot))
+	for i := range snapshot {
+		st := &snapshot[i]
 		if st.Disabled {
 			continue
 		}
@@ -1826,30 +1823,24 @@ func (p *Panel) syncNicknames() {
 		mu      sync.Mutex
 		updated int
 		failed  int
-		sem     = make(chan struct{}, 3)
-		wg      sync.WaitGroup
 	)
-	for _, j := range jobs {
-		wg.Add(1)
-		go func(j job) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
-			if err != nil {
-				mu.Lock()
-				failed++
-				mu.Unlock()
-				return
-			}
-			if p.cfg.Pool.SetNickname(j.uid, nick) {
-				mu.Lock()
-				updated++
-				mu.Unlock()
-			}
-		}(j)
-	}
-	wg.Wait()
+	// v2.6.0 P0：固定 3 并发 worker（不再每账号一个 goroutine，10k 账号不瞬时
+	// 创建 1 万 goroutine）；上游压力与历史 sem=3 完全一致。
+	fanOutAccounts(context.Background(), len(jobs), 3, func(_ context.Context, i int) {
+		j := jobs[i]
+		nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+		if err != nil {
+			mu.Lock()
+			failed++
+			mu.Unlock()
+			return
+		}
+		if p.cfg.Pool.SetNickname(j.uid, nick) {
+			mu.Lock()
+			updated++
+			mu.Unlock()
+		}
+	})
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
 	}
@@ -1982,7 +1973,14 @@ func (p *Panel) packagesOne(w http.ResponseWriter, uid string) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	raw, _ := json.Marshal(v)
+	raw, err := json.Marshal(v)
+	if err != nil {
+		// v2.6.0 P1：绝不写半截/空 body。序列化失败（如上游脏数据里的 NaN/Inf）
+		// 记日志后回 500 + 固定错误形状，前端能拿到可读原因、审计中间件也能解析。
+		log.Printf("WARN: [panel] 响应 JSON 序列化失败: %v", err)
+		raw = []byte(`{"ok":false,"error":"encode response failed"}`)
+		status = http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
@@ -2086,9 +2084,9 @@ func isCompressibleContentType(ct string) bool {
 // gzipResponseWriter 缓冲面板响应，在 close 时按内容类型/大小/Accept-Encoding
 // 决定是否 gzip 后一次性写给真实 ResponseWriter。
 //
-// 为什么缓冲而不是边写边压：面板没有流式接口，缓冲后才能在写响应头前知道
-// 完整长度（>1KB 阈值）并准确维护 Content-Length；流式响应（SSE）在 server 包、
-// 不经过本包装，故不受影响。
+// 为什么缓冲而不是边写边压：面板只有 /panel/api/events 一个流式接口（SSE），
+// 它在 ServeHTTP 中显式绕过本包装；其余响应都能在写头前拿到完整长度（>1KB
+// 阈值）并准确维护 Content-Length。
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	req    *http.Request

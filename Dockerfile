@@ -31,7 +31,9 @@ COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
+# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）。
+# v2.6.0 审计 P0：example 的 api_key 为空 → 直接用本镜像启动会因「非回环监听 + 空密钥」
+# 在启动安全校验处 fail-fast 并打印设置指引（不再有 test_key 之类的可预测默认密钥）。
 COPY config.example.json /app/config.json
 USER app
 EXPOSE 7863

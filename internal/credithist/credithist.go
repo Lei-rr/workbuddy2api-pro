@@ -59,7 +59,16 @@ type Ledger struct {
 	max      int
 	snapshot map[string]int64
 	entries  []Entry // 时间升序
+
+	// v2.6.0（Audit-1 P1）：落盘移到 mu 之外。writeMu 串行化并发写盘；seq/writtenSeq
+	// 保证「先快照后写盘」的乱序不会用旧内容覆盖新内容（与池持久化同一套模式）。
+	writeMu    sync.Mutex
+	seq        uint64
+	writtenSeq uint64
 }
+
+// writeFileHook 仅测试注入：write 真正写盘前调用（验证持锁期间不做磁盘 IO）。
+var writeFileHook func()
 
 // New 创建账本；path 非空且文件存在时加载既有快照与流水。加载失败只记日志、
 // 从空账本开始——丢历史好过让面板起不来。maxEntries <= 0 回落默认上限。
@@ -109,6 +118,8 @@ func (l *Ledger) load() {
 //   - 余额变化但 |Delta| > maxDelta：只更新基线（脏数据不留痕）。
 //
 // 同步落盘：留痕频率是"每次余额刷新"级（分钟级），文件很小，无需防抖队列。
+// v2.6.0（Audit-1 P1）：锁内只做内存更新 + 快照拷贝，marshal/写盘在锁外；
+// 并发 Observe 的写盘顺序由 seq 保护（旧快照不会覆盖新快照）。
 func (l *Ledger) Observe(uid string, credits int64) {
 	// 纯空白 uid 与空 uid 一样无效：放进去只会留下一个面板永远筛不到的幽灵基线
 	// （uid 过滤参数为空 = 不过滤，所以这种条目既无用也删不掉）。
@@ -137,22 +148,40 @@ func (l *Ledger) Observe(uid string, credits int64) {
 			}
 		}
 	}
+	// 锁内只拷贝快照（快照 map 必须拷贝：锁外 marshal 时其他 goroutine 可能继续写
+	// 这个 map，共享会构成数据竞争/序列化出撕裂内容）；流水切片同理。
+	l.seq++
+	seq := l.seq
+	entries := append([]Entry(nil), l.entries...)
+	snapshot := make(map[string]int64, len(l.snapshot))
+	for k, v := range l.snapshot {
+		snapshot[k] = v
+	}
+	l.mu.Unlock()
+
 	raw, err := json.Marshal(diskFile{
 		Version:  fileVersion,
 		Saved:    time.Now().Format(time.RFC3339),
-		Snapshot: l.snapshot,
-		Entries:  l.entries,
+		Snapshot: snapshot,
+		Entries:  entries,
 	})
 	if err != nil {
-		l.mu.Unlock()
 		log.Printf("[credithist] 序列化失败: %v", err)
 		return
 	}
-	// 落盘仍在锁内：多个账号并发刷新余额时，"快照+流水"必须按同一顺序写盘，
-	// 否则慢的那次会把新的文件内容覆盖成旧的（内存正确、重启后少一条）。
-	// 留痕频率是分钟级且仅在余额变化时触发，锁内小文件原子写无性能顾虑。
+	l.writeOrdered(raw, seq)
+}
+
+// writeOrdered 串行化写盘并跳过过期快照：seq 由 Observe 在锁内单调分配，
+// 若已有更新快照写盘（并发 Observe 后写先到），本次旧内容直接丢弃。
+func (l *Ledger) writeOrdered(raw []byte, seq uint64) {
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+	if seq < l.writtenSeq {
+		return
+	}
 	l.write(raw)
-	l.mu.Unlock()
+	l.writtenSeq = seq
 }
 
 // Read 返回最近 limit 条流水（新的在前）；limit <= 0 = 全部。
@@ -178,6 +207,9 @@ func (l *Ledger) Read(limit int) []Entry {
 func (l *Ledger) write(raw []byte) {
 	if l.path == "" {
 		return
+	}
+	if writeFileHook != nil {
+		writeFileHook()
 	}
 	if dir := filepath.Dir(l.path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {

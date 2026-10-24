@@ -32,4 +32,6 @@ services:
       # 缺失时 Docker 会把挂载点创建成目录 → 容器启动失败（程序会自动生成配置，
       # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
       # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      # v2.6.0 审计 P0：config.example.json 的 api_key 为空，cp 后必须先填随机 api_key
+      #（openssl rand -hex 24），否则非回环监听启动会 fail-fast 并给出指引。
       - ./config.json:/app/config.json

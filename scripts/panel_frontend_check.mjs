@@ -140,16 +140,44 @@ for (const m of indexHtml.matchAll(/\bid="([^"]+)"/g)) htmlIds.add(m[1]);
 const jsRefs = new Set();
 const jsAll = appJs + '\n' + mobileJs;
 for (const m of jsAll.matchAll(/\$\s*\(\s*(['"])([^'"]+)\1\s*\)/g)) jsRefs.add(m[2]);
+/* HTML 内部引用也算「有消费方」：aria-labelledby / aria-controls / aria-describedby
+   的 token 列表、<label for="…">。否则给弹层补 aria 语义会被误判为孤儿 id。 */
+const htmlInternalRefs = new Set();
+for (const attr of ['aria-labelledby', 'aria-controls', 'aria-describedby']) {
+  const re = new RegExp('\\b' + attr + '="([^"]+)"', 'g');
+  for (const m of indexHtml.matchAll(re)) {
+    for (const tok of m[1].trim().split(/\s+/)) if (tok) htmlInternalRefs.add(tok);
+  }
+}
+for (const m of indexHtml.matchAll(/<label[^>]*\bfor="([^"]+)"/g)) htmlInternalRefs.add(m[1]);
+const referencedIds = new Set([...jsRefs, ...htmlInternalRefs]);
 for (const id of jsRefs) {
   if (!htmlIds.has(id) && !APP_ONLY_ID_ALLOW.has(id)) {
     fail(`app.js 引用了 index.html 中不存在的 id="${id}"（DOM id 契约）`);
   }
 }
 for (const id of htmlIds) {
-  if (jsRefs.has(id) || HTML_ONLY_ID_ALLOW.has(id)) continue;
+  if (referencedIds.has(id) || HTML_ONLY_ID_ALLOW.has(id)) continue;
   if (HTML_ONLY_ID_PREFIX_ALLOW.some(p => id.startsWith(p))) continue;
-  fail(`index.html 的 id="${id}" 未被 app.js 引用（DOM id 契约；如为纯样式锚点请加入 HTML_ONLY_ID_ALLOW）`);
+  fail(`index.html 的 id="${id}" 未被 app.js/aria 引用（DOM id 契约；如为纯样式锚点请加入 HTML_ONLY_ID_ALLOW）`);
 }
+
+// ── 2b) 可访问性契约（v2.6.0）：弹层 dialog 语义 / toast 状态播报 ─────────
+const veilBlocks = [...indexHtml.matchAll(/<div class="veil" id="([^"]+)"([^>]*)>/g)];
+for (const m of veilBlocks) {
+  const id = m[1], attrs = m[2] || '';
+  if (!/\brole="dialog"/.test(attrs)) fail(`弹层 #${id} 缺少 role="dialog"`);
+  if (!/\baria-modal="true"/.test(attrs)) fail(`弹层 #${id} 缺少 aria-modal="true"`);
+  const labelled = (attrs.match(/aria-labelledby="([^"]+)"/) || [])[1] || '';
+  if (!labelled) fail(`弹层 #${id} 缺少 aria-labelledby`);
+  else if (!htmlIds.has(labelled.split(/\s+/)[0])) fail(`弹层 #${id} 的 aria-labelledby 指向不存在的 id`);
+}
+if (indexHtml.includes('id="toasts"') && !/id="toasts"[^>]*aria-live="polite"/.test(indexHtml)) {
+  fail('toast 容器 #toasts 缺少 aria-live="polite"（状态变化读屏不可感知）');
+}
+// 表头列语义：静态 <th> 必须带 scope（动态表格由 app.js 单独保证）
+const thNoScope = [...indexHtml.matchAll(/<th\b[^>]*>/g)].filter(m => !/\bscope=/.test(m[0])).length;
+if (thNoScope) fail(`index.html 有 ${thNoScope} 个 <th> 缺少 scope="col"（表头列语义）`);
 
 // ── 3) API 路径白名单 ───────────────────────────────────────────────────
 /* scanJs 极简词法扫描：返回 { strings, masked }。

@@ -1,12 +1,13 @@
 {
   "listen": ":7863",
-  "api_key": "test_key",
+  "api_key": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "dns_servers": [],
   "server": {
     "read_timeout": "300s",
-    "shutdown_timeout": "30s"
+    "shutdown_timeout": "30s",
+    "max_body_mb": 64
   },
   "panel": {
     "api_key": "",
@@ -59,6 +60,7 @@
     "balance_refresh_startup_force": false,
     "catch_up_minutes": 120,
     "include_disabled_in_tasks": false,
+    "task_sweep_concurrency": 8,
     "checkin_concurrency": 3
   },
   "global": {

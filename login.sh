@@ -138,7 +138,7 @@ WB2A_LOGIN_NICKNAME="$NICKNAME" \
 WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
 python3 - <<'PYEOF'
-import json, os
+import json, os, sys
 
 auth = {
     "account": {
@@ -153,9 +153,20 @@ auth = {
         "domain": os.environ["WB2A_LOGIN_DOMAIN"],
     },
 }
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
-    json.dump(auth, f, indent=1)
-print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
+auth_file = os.environ["WB2A_LOGIN_AUTH_FILE"]
+# v2.6.0 审计 P1：token 文件必须 0600（本脚本直接落盘、不走 auth.SaveAtomic）。
+# 先 umask 收紧创建权限，再显式 chmod 兜底（宿主机 umask 022 时旧实现会落成 0644）。
+old_umask = os.umask(0o077)
+try:
+    with open(auth_file, "w") as f:
+        json.dump(auth, f, indent=1)
+finally:
+    os.umask(old_umask)
+try:
+    os.chmod(auth_file, 0o600)
+except OSError as e:
+    print(f"WARN: chmod 0600 {auth_file} 失败: {e}", file=sys.stderr)
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
 PYEOF
 
 # ─── 重启服务 ────────────────────────────────────────────

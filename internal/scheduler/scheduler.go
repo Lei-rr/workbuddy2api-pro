@@ -205,6 +205,12 @@ type Scheduler struct {
 	// 循环）：Run 退出前在此收敛（ctx 已取消，各任务体会尽快收尾）。
 	batchWG sync.WaitGroup
 
+	// bgWG 独立周期循环 goroutine（StartBalanceRefresh / StartTaskSweep）的收敛用
+	//（v2.6.0 Audit-1 P0-4）：main 停机顺序必须是「停新任务 → 等所有会写池的后台
+	// goroutine 退出 → Flush」。这两个循环不在 Run 里，此前未被任何 WaitGroup 登记，
+	// 停机 Flush 之后仍可能写池（余额刷新会写 credits/冷却/到期快照）。
+	bgWG sync.WaitGroup
+
 	// jobsReg 可选 Job Registry（v2.3.1 #11）：定时/补跑批次写 Job 历史并支持取消。
 	// 由 schedMu 保护（SetJobsRegistry 可在运行期热挂载）。
 	jobsReg *jobs.Registry
@@ -775,6 +781,11 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 		wg.Add(1)
 		go func(k taskKind) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("ERROR: scheduler: 任务 goroutine panic: %v", r)
+				}
+			}()
 			s.executeTaskKind(ctx, k)
 		}(k)
 	}
@@ -790,6 +801,53 @@ func (s *Scheduler) dispatchBatch(ctx context.Context, kinds []taskKind) {
 			return
 		}
 		s.dispatchTaskKind(ctx, k, jobs.TriggerSchedule)
+	}
+}
+
+// goBatch 启动登记到 batchWG 的任务 goroutine，并 recover panic（v2.6.0 Audit-1）：
+// 定时/补跑任务在**后台 goroutine** 里跑，没有 net/http 的 per-request recover 保护，
+// 任务体或 hook 的意外 panic 会直接杀进程。这里统一兜底并记 ERROR（ctx 已取消时
+// 收尾路径仍会遍历剩余账号，panic 单族不扩散到其他族）。
+func (s *Scheduler) goBatch(fn func()) {
+	s.batchWG.Add(1)
+	go func() {
+		defer s.batchWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERROR: scheduler: 任务 goroutine panic: %v", r)
+			}
+		}()
+		fn()
+	}()
+}
+
+// safeHook 调用面板注入的 hook 并 recover panic（v2.6.0 Audit-1）：hooks
+// （GrowthHook/TaskSweepHook）由 panel 构造后注入，一次 panic 会杀进程；hook 是旁路
+// 触发，失败只应记日志、不应影响调度主循环。
+func (s *Scheduler) safeHook(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERROR: scheduler: %s hook panic: %v", name, r)
+		}
+	}()
+	fn()
+}
+
+// WaitBackground 等待 StartBalanceRefresh / StartTaskSweep 启动的周期循环退出
+// （v2.6.0 Audit-1 P0-4）。返回 true = 全部收敛；false = ctx 先到期（调用方 WARN 后
+// 继续停机，但不得在此之前认为「后台已停止」）。
+// 调用约定：先 cancel 根 ctx 再调用（循环只在 ctx 取消/服务结束才退出）。
+func (s *Scheduler) WaitBackground(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() {
+		s.bgWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -813,11 +871,7 @@ func (s *Scheduler) dispatchTaskKind(ctx context.Context, k taskKind, trigger jo
 	}
 	if !gated {
 		// 夜猫子/成长：没有 Job Kind/批量 gate，直接异步执行。
-		s.batchWG.Add(1)
-		go func() {
-			defer s.batchWG.Done()
-			s.runTaskBody(ctx, k, nil)
-		}()
+		s.goBatch(func() { s.runTaskBody(ctx, k, nil) })
 		return true
 	}
 	if reg := s.jobsRegistry(); reg != nil {
@@ -832,22 +886,16 @@ func (s *Scheduler) dispatchTaskKind(ctx context.Context, k taskKind, trigger jo
 			// 理论上 gate 已保证同类单飞；Registry 内部异常/关闭时不阻塞调度。
 			s.EndTask(gk)
 			log.Printf("scheduler: %s 批次 Job 创建失败，回退直接执行: %v", gk, err)
-			s.batchWG.Add(1)
-			go func() {
-				defer s.batchWG.Done()
-				s.runTaskBody(ctx, k, nil)
-			}()
+			s.goBatch(func() { s.runTaskBody(ctx, k, nil) })
 			return false
 		}
 		log.Printf("scheduler: %s 定时批次已启动 job=%s trigger=%s", gk, job.ID, trigger)
 		return true
 	}
-	s.batchWG.Add(1)
-	go func() {
-		defer s.batchWG.Done()
+	s.goBatch(func() {
 		defer s.EndTask(gk)
 		s.runTaskBody(ctx, k, nil)
-	}()
+	})
 	return true
 }
 
@@ -874,7 +922,7 @@ func (s *Scheduler) runTaskBody(ctx context.Context, k taskKind, progress Progre
 		if hook == nil {
 			return false
 		}
-		hook()
+		s.safeHook("growth", hook)
 		// 队列已启动（内部单飞）：标今天已跑，补跑窗口不再重复触发。
 		s.noteTaskDone(taskGrowth, s.now())
 	case taskBalance:
@@ -1523,7 +1571,14 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		return
 	}
 	s.balanceInterval.Store(int64(interval))
+	s.bgWG.Add(1)
 	go func() {
+		defer s.bgWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERROR: scheduler: 余额后台刷新循环 panic: %v", r)
+			}
+		}()
 		// 启动首刷保护（v2.0.1 #10）：不再「启动即全池无上限刷」。
 		// 1) 先按 schedule.balance_refresh_startup_delay 延迟（0=不延迟），让监听/
 		//    预热等启动动作先稳定，避免重启瞬间与其它启动流量叠加；
@@ -1609,7 +1664,14 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 		return
 	}
 	s.sweepInterval.Store(int64(interval))
+	s.bgWG.Add(1)
 	go func() {
+		defer s.bgWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERROR: scheduler: 任务补领清扫循环 panic: %v", r)
+			}
+		}()
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.sweepInterval.Load())
@@ -1638,7 +1700,7 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 				hook := s.cfg.TaskSweepHook
 				s.schedMu.Unlock()
 				if hook != nil {
-					hook()
+					s.safeHook("task_sweep", hook)
 				}
 			}
 		}
@@ -1651,7 +1713,7 @@ func (s *Scheduler) RunTaskSweepNow() {
 	hook := s.cfg.TaskSweepHook
 	s.schedMu.Unlock()
 	if hook != nil {
-		hook()
+		s.safeHook("task_sweep", hook)
 	}
 }
 

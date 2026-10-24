@@ -61,9 +61,14 @@ const (
 	auditActionBalanceAll     = "balance_all"
 	auditActionUsageSave      = "usage_save"
 	auditActionConfigSave     = "config_save"
-	// auditActionConfigRollback 预留：配置回滚端点（#15，由后续 wave/Lead 接入路由）
-	// 同样用 withAudit 包装即可自动落审计。
+	// auditActionConfigRollback 配置回滚端点（panel.go routes() 已接线，v2.2.0 #15）：
+	// 与 config_save 同一审计通道，动作名稳定。
 	auditActionConfigRollback = "config_rollback"
+	// v2.6.0 审计补覆盖：meta 写与 Job 触发/取消此前是缺口（旧批量端点已审计）。
+	auditActionAccountMetaUpdate = "account_meta_update"
+	auditActionAccountMetaDelete = "account_meta_delete"
+	auditActionJobRun            = "job_run"
+	auditActionJobCancel         = "job_cancel"
 )
 
 // AuditEntry 一条面板操作审计记录（JSONL 单行；GET /panel/api/audit 原样返回）。
@@ -210,7 +215,7 @@ func responseJSONBool(body []byte, key string) (value, found bool) {
 
 // auditHandler 返回最近 N 条面板操作审计（新的在前）；文件不存在 → []。
 func (p *Panel) auditHandler(w http.ResponseWriter, r *http.Request) {
-	limit := tailLimit(r, auditDefaultLimit, auditMaxLimit)
+	limit := parseLimit(r, auditDefaultLimit, auditMaxLimit)
 	entries, err := p.auditLog.readLast(limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read audit: "+err.Error())

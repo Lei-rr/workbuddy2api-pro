@@ -56,7 +56,6 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
 // rollbackConfig 一键回滚（v2.2.0 #15）：用 config.json.bak 恢复上一版配置。
 //
 // 校验/写盘/热应用由 main 注入的 RollbackConfig 闭包完成（与保存同一套流程：

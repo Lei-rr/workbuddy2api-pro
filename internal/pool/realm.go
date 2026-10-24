@@ -71,6 +71,10 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 //
 // 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
+//
+// v2.6.0（Audit-1 P0-2）：session sticky 热路径已改用 AvailableViewForRealm（按
+// (model, realm) 缓存、O(1) 命中）；本函数保留为**未缓存的老 API/测试对照基准**
+// （每次 O(n) 遍历+排序），新代码不要再在每请求路径调用它。
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

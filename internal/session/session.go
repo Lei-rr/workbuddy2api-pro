@@ -27,8 +27,22 @@ type entry struct {
 	lastActive time.Time
 }
 
-// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
-// 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
+// Availability 可用账号只读视图（v2.6.0 P0-2）：Contains 供快路径 O(1) 校验绑定号，
+// UIDs 返回按 uid 升序的「权重槽」列表（快过期账号重复出现，保留既有双段哈希分配的
+// 加权语义）。实现由 pool 提供（pool.AvailabilityView，按 (model, realm) 缓存）；
+// 本包只读、不持有、不修改。
+type Availability interface {
+	Contains(uid string) bool
+	UIDs() []string
+}
+
+// Config 路由依赖。Store 可为 redisstore.Noop（纯内存）。
+//
+// 可用账号来源有两个版本（新代码优先用 View，旧字段保留兼容嵌入式/测试）：
+//   - AvailableViewForModel（推荐）：pool 提供的缓存视图，Contains O(1)、UIDs 直接
+//     复用缓存权重槽——session 热路径不再每请求全池遍历/排序/建 map（v2.6.0 P0-2）；
+//   - Available/AvailableForModel（兼容）：每次调用返回新 uid 列表，本包会即时转成
+//     集合/切片使用（与引入 View 前行为一致）。
 type Config struct {
 	TTL        time.Duration
 	GCInterval time.Duration
@@ -41,6 +55,9 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// AvailableViewForModel 按请求模型返回可用账号视图（v2.6.0 P0-2，推荐）。
+	// 非 nil 时优先于 AvailableForModel/Available；返回 nil 视作当前无可用账号。
+	AvailableViewForModel func(model string) Availability
 }
 
 // Router 会话粘性路由器。
@@ -139,13 +156,13 @@ func (r *Router) Resolve(key string) (string, bool) {
 
 // LookupForModel 只复用已有有效绑定，不通过哈希为新会话分配账号。
 // 有序账号池策略用它保留粘性，未绑定会话由 Pool 选号并在成功后 Bind。
+// v2.6.0：可用性校验走 O(1) Contains（不再每请求构造全量 map）。
 func (r *Router) LookupForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, found := r.entries[key]
-	if !found || expired(e, now, r.cfg.TTL) || !available[e.uid] {
+	if !found || expired(e, now, r.cfg.TTL) || !r.availableContains(model, e.uid) {
 		return "", false
 	}
 	r.entries[key] = entry{uid: e.uid, lastActive: now}
@@ -162,18 +179,16 @@ func (r *Router) LookupForModel(key, model string) (string, bool) {
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
+	// v2.6.0 P0-2：先查绑定（O(1)），仅在命中时做一次 O(1) Contains 校验；
+	// 不再在快路径前构造全量可用集合（10k 账号下那是 ms 级 + 大量分配）。
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
-			return e.uid, true
-		}
-		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+	if found && !expired(e, now, r.cfg.TTL) && r.availableContains(model, e.uid) {
+		r.touch(key, e.uid, now)
+		return e.uid, true
 	}
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
@@ -181,21 +196,25 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	defer r.mu.Unlock()
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
-			return e2.uid, true
-		}
+	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) && r.availableContains(model, e2.uid) {
+		r.entries[key] = entry{uid: e2.uid, lastActive: now}
+		return e2.uid, true
+	} else if found2 {
 		delete(r.entries, key) // 失效：清掉再分配
 	}
 
-	uids := r.availableSlice(model)
+	// 只有慢路径（需要重新分配）才取可用权重槽（pool 缓存命中 O(1)，未命中一次 O(n)）。
+	view := r.availableView(model)
+	if view == nil {
+		return "", false
+	}
+	uids := view.UIDs()
 	if len(uids) == 0 {
 		return "", false
 	}
 
 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
-	bound := map[string]bool{}
+	bound := make(map[string]bool, len(r.entries))
 	for _, v := range r.entries {
 		bound[v.uid] = true
 	}
@@ -282,17 +301,29 @@ func (r *Router) gcOnce(now time.Time) int {
 	return len(expiredKeys)
 }
 
-// availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
-func (r *Router) availableSet(model string) map[string]bool {
-	uids := r.availableSlice(model)
-	set := make(map[string]bool, len(uids))
-	for _, u := range uids {
-		set[u] = true
+// availableView 取当前模型的可用账号视图：优先注入的缓存视图（pool），否则把旧式
+// 「每次返回新切片」的闭包适配成一次性视图（行为与 v2.5.0 一致，无缓存承诺）。
+func (r *Router) availableView(model string) Availability {
+	if r.cfg.AvailableViewForModel != nil {
+		if v := r.cfg.AvailableViewForModel(model); v != nil {
+			return v
+		}
+		return nil // 注入方明确返回 nil = 当前无可用账号（不再回落旧字段）
 	}
-	return set
+	if r.cfg.AvailableForModel == nil && r.cfg.Available == nil {
+		return nil
+	}
+	return newSliceAvailability(r.availableSlice(model))
+}
+
+// availableContains 报告 uid 在指定模型上当前是否可用（O(1)：缓存视图哈希命中）。
+func (r *Router) availableContains(model, uid string) bool {
+	v := r.availableView(model)
+	return v != nil && v.Contains(uid)
 }
 
 // availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
+// 仅供旧闭包适配使用；新代码走 availableView。
 func (r *Router) availableSlice(model string) []string {
 	if r.cfg.AvailableForModel != nil {
 		return r.cfg.AvailableForModel(model)
@@ -301,6 +332,39 @@ func (r *Router) availableSlice(model string) []string {
 		return nil
 	}
 	return r.cfg.Available()
+}
+
+// sliceAvailability 把「新切片」适配成 Availability（旧闭包兼容层）。集合在构造时
+// 一次性建立——与 v2.5.0 每次请求建 map 的开销相同，仅用于未迁移的注入方。
+type sliceAvailability struct {
+	uids []string
+	set  map[string]struct{}
+}
+
+// newSliceAvailability 由 uid 列表构造只读视图（去重进 set；uids 保持原序）。
+func newSliceAvailability(uids []string) *sliceAvailability {
+	set := make(map[string]struct{}, len(uids))
+	for _, u := range uids {
+		set[u] = struct{}{}
+	}
+	return &sliceAvailability{uids: uids, set: set}
+}
+
+// Contains 报告 uid 是否在集合内。
+func (s *sliceAvailability) Contains(uid string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.set[uid]
+	return ok
+}
+
+// UIDs 返回权重槽列表（原序；只读）。
+func (s *sliceAvailability) UIDs() []string {
+	if s == nil {
+		return nil
+	}
+	return s.uids
 }
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {

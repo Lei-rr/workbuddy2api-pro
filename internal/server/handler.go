@@ -62,6 +62,10 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// MaxBodyMB /v1 POST 请求体上限（MiB，v2.6.0 P0-1）；<=0 回落 defaultMaxBodyMB。
+	// 来自 config server.max_body_mb（backend-a 增加；env WB2A_MAX_BODY_MB）。
+	MaxBodyMB int
+
 	// ModelsHidden 模型黑名单原始条目（config models.hidden；Live 为 nil 的
 	// 裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsHidden []string
@@ -555,13 +559,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	// 请求体上限（v2.6.0 P0-1，Audit-1）：恢复网关侧 max_body_mb 上限（默认 64MiB），
+	// 超限 413 + OpenAI 错误体，不落 500、不把超大 body 读进内存。此前无上限的
+	// `io.ReadAll(r.Body)` 可被超大 body 直接放大成内存 DoS。
+	body, ok := h.readChatBody(w, r)
+	if !ok {
 		return
 	}
 	var peek struct {
@@ -1552,6 +1554,58 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// defaultMaxBodyMB /v1 请求体默认上限（MiB；与 config server.max_body_mb 缺省 64 对齐）。
+// cfg.MaxBodyMB<=0 时兜底，保证裸用 Handler（测试/嵌入）也有上限。
+const defaultMaxBodyMB = 64
+
+// maxBodyMBHardCap 上限保护（配置层已 clamp 1..1024；这里防御裸用 Handler 传错值）。
+const maxBodyMBHardCap = 1024
+
+// errRequestBodyTooLarge 请求体超过 MaxBytesReader 上限（调用方映射为 413）。
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+// maxBodyBytes 返回生效的请求体上限（字节）。
+func (h *Handler) maxBodyBytes() int64 {
+	mb := h.cfg.MaxBodyMB
+	if mb <= 0 {
+		mb = defaultMaxBodyMB
+	}
+	if mb > maxBodyMBHardCap {
+		mb = maxBodyMBHardCap
+	}
+	return int64(mb) << 20
+}
+
+// readBodyLimited 限长读取请求体（v2.6.0 P0-1）：用 http.MaxBytesReader 包装 r.Body，
+// 超限返回 errRequestBodyTooLarge（由调用方按各自错误形态回 413）。非超限读失败原样返回。
+func readBodyLimited(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return nil, errRequestBodyTooLarge
+		}
+		return nil, err
+	}
+	return body, nil
+}
+
+// readChatBody 读 /v1/chat/completions 请求体；超限/失败时已写好 OpenAI 错误体并返回 false。
+func (h *Handler) readChatBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := readBodyLimited(w, r, h.maxBodyBytes())
+	if err == nil {
+		return body, true
+	}
+	if errors.Is(err, errRequestBodyTooLarge) {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds the configured limit of %d MiB", h.maxBodyBytes()>>20))
+		return nil, false
+	}
+	writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	return nil, false
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

@@ -10,7 +10,7 @@ let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 /* 轮询状态（refTimer / refFailures / pollBaseSec / pageHidden …）集中在文件后段
    「轮询治理」区声明：只有该区的函数与 api()/loadOverview() 在**调用期**访问它们，
-   放后段不会踩 TDZ；同时便于 node harness 按注释锚点切片测试。 */
+   放后段不会踩 TDZ；保持该顺序可避免初始化前访问。 */
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
@@ -20,7 +20,6 @@ let reqEntries = [];
 let reqPage = 1, reqPageSize = 100;           // 客户端分页（0 = 全部）
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
-let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 
 const $ = id => document.getElementById(id);
 
@@ -46,12 +45,47 @@ $('btnTheme').onclick = () => {
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
+/* API_TIMEOUT_MS 常规 JSON API 的超时（15s）。SSE 是长连接，单独用 fetch+流读取，
+   不套这个超时。超时按普通请求失败处理：调用方 toast，轮询按退避继续。 */
+const API_TIMEOUT_MS = 15000;
+/* fetchTimed 给 fetch 加一次性超时（无 AbortController 的极简环境退化为原 fetch）。 */
+function fetchTimed(url, opts, timeoutMs) {
+  const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : API_TIMEOUT_MS;
+  if (typeof AbortController !== 'function' || typeof setTimeout !== 'function') {
+    return fetch(url, opts);
+  }
+  const ac = new AbortController();
+  const merged = Object.assign({}, opts || {}, { signal: ac.signal });
+  const timer = setTimeout(() => { try { ac.abort(); } catch (e) { /* 请求已结束 */ } }, ms);
+  return fetch(url, merged).then(
+    r => { clearTimeout(timer); return r; },
+    e => { clearTimeout(timer); throw e; });
+}
+function apiTimeoutError() {
+  const e = new Error('请求超时（' + Math.round(API_TIMEOUT_MS / 1000) + 's），请检查网络或反向代理');
+  e.name = 'TimeoutError';
+  return e;
+}
+function isRequestAbort(e) { return !!e && (e.name === 'AbortError' || e.name === 'TimeoutError'); }
+
+/* REQ_SEQ 同一资源的并发请求序号：只允许最后发出的请求写回 UI。
+   账号页历史上有专用的 accReqSeq；其余视图统一走这里，避免"先发后到"覆盖新数据。 */
+const REQ_SEQ = Object.create(null);
+function reqSeqNext(key) { REQ_SEQ[key] = (REQ_SEQ[key] || 0) + 1; return REQ_SEQ[key]; }
+function reqSeqStale(key, seq) { return REQ_SEQ[key] !== seq; }
+
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  let r;
+  try {
+    r = await fetchTimed('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  } catch (e) {
+    if (isRequestAbort(e)) throw apiTimeoutError();
+    throw e;
+  }
   // 401 = 面板密钥（panel.api_key，未单配时回落网关 api_key）无效。统一交给
   // onAuthRequired：停掉自动轮询（否则后台标签页每 5s 刷一次 401、反复抢焦点弹
   // 密钥框），并保证一次失败周期里密钥框只自动弹一次。
@@ -68,6 +102,84 @@ function toast(msg, cls) {
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), 3600);
 }
+
+/* ── 弹层可访问性（v2.6.0）──────────────────────────────────────────────
+   HTML 侧给 .veil 补 role=dialog/aria-modal/aria-labelledby；这里只做行为：
+   打开时焦点移入弹窗、Tab 在弹窗内循环、Esc 关闭（登录层 data-lock 除外）、
+   关闭后焦点归还触发元素。用属性观察器集中处理，避免改 6 个 open/close 函数。 */
+const FOCUSABLE_SEL = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+function veilFocusables(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return [];
+  return Array.prototype.slice.call(root.querySelectorAll(FOCUSABLE_SEL)).filter(el => el && !el.hidden);
+}
+/* trapNextIndex 纯函数：Tab/Shift+Tab 在 [0,len) 内循环（便于独立测试）。 */
+function trapNextIndex(len, index, shift) {
+  if (!(Number(len) > 0)) return -1;
+  const i = Number.isFinite(Number(index)) ? Number(index) : -1;
+  if (shift) return i <= 0 ? Number(len) - 1 : i - 1;
+  return i >= Number(len) - 1 ? 0 : i + 1;
+}
+function openVeilList() {
+  if (!document || typeof document.querySelectorAll !== 'function') return [];
+  return Array.prototype.slice.call(document.querySelectorAll('.veil.on'));
+}
+let veilFocusReturn = null;
+function veilOnKeydown(ev) {
+  if (!ev) return;
+  const veils = openVeilList();
+  if (!veils.length) return;
+  const top = veils[veils.length - 1];
+  if (ev.key === 'Tab') {
+    const dlg = top.querySelector ? top.querySelector('.dlg') : null;
+    const list = veilFocusables(dlg);
+    if (!list.length) return;
+    const active = (typeof document !== 'undefined' && document.activeElement) || null;
+    const idx = list.indexOf(active);
+    const from = idx >= 0 ? idx : (ev.shiftKey ? 0 : -1);
+    const next = trapNextIndex(list.length, from, !!ev.shiftKey);
+    if (next >= 0 && list[next] && list[next].focus) {
+      ev.preventDefault();
+      try { list[next].focus(); } catch (e) { /* 焦点目标已卸载 */ }
+    }
+    return;
+  }
+  if (ev.key !== 'Escape') return;
+  // 登录层（data-lock）必须输入密钥，Esc 不关闭。
+  if (top.getAttribute && top.getAttribute('data-lock') === '1') return;
+  ev.preventDefault();
+  if (top.id === 'remarkVeil') { closeRemarks(); return; }
+  if (top.id === 'addVeil') { closeAdd(); return; }
+  if (top.id === 'taskVeil') { closeTasks(); return; }
+  if (top.id === 'pkVeil') { closePackages(); return; }
+  top.classList.remove('on');   // vcVeil 等只有显隐的弹层
+}
+if (document && typeof document.addEventListener === 'function') document.addEventListener('keydown', veilOnKeydown);
+/* veils 的 class 变化 → 焦点进入/归还（只观察 6 个固定弹层，成本可忽略）。 */
+function veilFocusManage() {
+  if (!document || typeof document.querySelectorAll !== 'function' || typeof MutationObserver !== 'function') return;
+  const obs = new MutationObserver(muts => {
+    for (const m of muts) {
+      const el = m.target;
+      if (!el || !el.classList) continue;
+      const open = el.classList.contains('on');
+      if (open && el.dataset && el.dataset.a11yOpen !== '1') {
+        el.dataset.a11yOpen = '1';
+        veilFocusReturn = (typeof document !== 'undefined' && document.activeElement) || null;
+        const dlg = el.querySelector ? el.querySelector('.dlg') : null;
+        const list = veilFocusables(dlg);
+        const first = list[0] || (dlg && dlg.focus ? dlg : null);
+        if (first && first.focus) setTimeout(() => { try { first.focus(); } catch (e) { /* 已关闭 */ } }, 0);
+      } else if (!open && el.dataset && el.dataset.a11yOpen === '1') {
+        el.dataset.a11yOpen = '';
+        const back = veilFocusReturn;
+        veilFocusReturn = null;
+        if (back && back.focus) setTimeout(() => { try { back.focus(); } catch (e) { /* 已卸载 */ } }, 0);
+      }
+    }
+  });
+  document.querySelectorAll('.veil').forEach(v => obs.observe(v, { attributes: true, attributeFilter: ['class'] }));
+}
+veilFocusManage();
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
 // 显式替换 5 个字符：& < > " '（& 必须最先，避免二次转义）。
@@ -298,40 +410,7 @@ function rateLimitRowsHtml(rows, now) {
   }).join('') + '</div>';
 }
 
-function formatTokenCount(tokens) {
-  if (tokens == null || tokens === '') return '—';
-  const n = Number(tokens);
-  if (!Number.isFinite(n) || n < 0) return '—';
-  if (n < 1000) return String(Math.round(n));
-  const units = [['k', 1e3], ['m', 1e6], ['b', 1e9]];
-  let unit = units[0];
-  for (const candidate of units) {
-    if (n >= candidate[1]) unit = candidate;
-  }
-  let value = n / unit[1];
-  let rounded = Number(value.toFixed(1));
-  // 999999 → 1m，而不是 1000k；四舍五入后自动升级单位。
-  const next = units[units.indexOf(unit) + 1];
-  if (next && rounded >= 1000) {
-    unit = next;
-    value = n / unit[1];
-    rounded = Number(value.toFixed(1));
-  }
-  return rounded + unit[0];
-}
 
-function formatLatency(ms) {
-  if (ms == null || ms === '') return '—';
-  const n = Number(ms);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  return n < 1000 ? Math.round(n) + 'ms' : (n / 1000).toFixed(1).replace(/\.0$/, '') + 's';
-}
-function formatRate(rate) {
-  if (rate == null || rate === '') return '—';
-  const n = Number(rate);
-  if (!Number.isFinite(n) || n < 0) return '—';
-  return n.toFixed(1) + 'tok/s';
-}
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 /* 面板鉴权用的是「面板密钥」panel.api_key；未单配时后端回落到网关 api_key。
@@ -496,7 +575,7 @@ function handleSSEEvent(ev) {
   if (ev.event === 'snapshot' && Array.isArray(d.jobs)) renderJobBar(normalizeJobs(d));
   setRtBadge(rtBadgeState());
 }
-/* 环境兜底：老浏览器/极简 node harness 没有 AbortController/TextDecoder 时降级，
+/* 环境兜底：缺少 AbortController/TextDecoder 的极简环境下降级，
    保证面板主流程（轮询）不被 SSE 依赖阻断。 */
 function newAbortController() {
   if (typeof AbortController === 'function') return new AbortController();
@@ -609,7 +688,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
-  if (v === 'logs') loadLogs();
+  if (v === 'logs') loadLogs(true);   // 进入页面强制刷新重数据（指标/归档/积分历史）
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
@@ -663,7 +742,7 @@ expBoxShow();
 /* ── 账号池筛选 + 服务端分页（v2.1 #1）────────────────────────────────
    accFilters/accPage/accPageSize 是「请求参数」而非本地过滤条件：任何变化都重新
    请求 /panel/api/accounts（服务端 filter+分页），前端只持有当前页 rows。
-   兼容：renderAccounts(array) 仍走本地筛选+分页（node harness/旧调用）。 */
+   兼容：renderAccounts(array) 仍走本地筛选+分页（旧调用）。 */
 let expAll = [];                              // 到期快照（按最近到期升序，含无到期账号）
 let expPage = 1;
 let expPageSize = 100;                        // 0 = 全部
@@ -676,7 +755,7 @@ let accPage = 1;
 
 /* ── 分页纯函数（账号池 / 日志 / 请求记录 / 积分历史 / 模型锁池 / 任务队列共用）──
    pageSlice 只做「钳页码 + 切片」，不读写任何模块状态；updatePagerUI 把结果写回
-   一组分页控件。抽成纯函数是为了 node harness 能直接切片测试边界（空列表、页码
+   一组分页控件。抽成纯函数便于独立测试边界（空列表、页码
    越界、pageSize=0 表示全部）——这些分支在浏览器里很难手工复现。 */
 function pageSlice(list, pageSize, page) {
   const rows = list || [];
@@ -853,7 +932,13 @@ async function apiCached(path, cache) {
   const prev = cache && cache[path];
   if (prev && prev.etag) h['If-None-Match'] = prev.etag;
   // no-store：禁止浏览器 HTTP 缓存介入，确保条件请求真的到后端、304 能落到这里。
-  const r = await fetch('/panel/api/' + path, { headers: h, cache: 'no-store' });
+  let r;
+  try {
+    r = await fetchTimed('/panel/api/' + path, { headers: h, cache: 'no-store' });
+  } catch (e) {
+    if (isRequestAbort(e)) throw apiTimeoutError();
+    throw e;
+  }
   if (r.status === 401) { onAuthRequired(); throw new Error('密钥无效或未填写'); }
   if (r.status === 304) {
     keyPrompted = false;
@@ -890,7 +975,7 @@ const dotaskBusy = new Set();
 /* accDoTaskBtn 账号行「做任务」按钮：对单账号执行全部可自动任务（后端
    POST /accounts/{uid}/tasks/run，同步接口，约 1-2 分钟）。企业版没有个人成长
    体系（后端 200 + ok:false 拒绝），与「签到」「任务」按钮同口径不渲染。
-   抽成纯函数便于 node harness 直接钉住「企业版不出按钮 / 进行中不可重复点」的渲染条件。 */
+   抽成纯函数便于独立验证「企业版不出按钮 / 进行中不可重复点」的渲染条件。 */
 function accDoTaskBtn(s) {
   if (!s || s.enterprise) return '';
   const busy = dotaskBusy.has(s.uid);
@@ -939,7 +1024,7 @@ function accCoolKind(s, nowMs) {
 /* accNowMs 渲染倒计时用的「当前时间」：本地时钟 - 与服务端的偏差（skew）。
    skew 由最近一次 200 响应的 now 校准；304 命中时 meta 不更新，但这里每次都重新
    取 Date.now()，所以倒计时继续走——ETag 稳定（一直 304）不会把冷却倒计时冻结。
-   meta 无 skew/now 时直接用本地时钟（兼容旧调用与切片 harness）。 */
+   meta 无 skew/now 时直接用本地时钟（兼容旧调用）。 */
 function accNowMs(meta) {
   if (meta && Number.isFinite(Number(meta.skew))) return Date.now() - Number(meta.skew);
   if (meta && Number(meta.now) > 0) return Number(meta.now) * 1000;
@@ -1026,7 +1111,7 @@ function accCreditsMax(rows) {
       处理（/panel/api/accounts），meta = {total,filtered,page,pages,now}；
       本地只渲染，不再 filter/slice（这是 v2.1 #1 的核心：大池子不整包下发）。
    ② 兼容调用 renderAccounts(array)：无 meta 时退回 v2.0 的客户端筛选+分页
-      （node harness 与按数组直接调用的切片测试依赖它，行为保持不变）。 */
+      （按数组直接调用的旧路径依赖它，行为保持不变）。 */
 function renderAccounts(list, meta) {
   accAll = list || [];
   const server = !!(meta && typeof meta === 'object');
@@ -1087,20 +1172,28 @@ function renderAccounts(list, meta) {
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
-    const unlimited = s.credits_total === -1;
+    // 数值统一 Number() 兜底：后端正常给 JSON number，但旧数据/上游字符串不能原样
+    // 拼进 innerHTML（XSS 兜底），也避免显示 NaN。
+    const creditsRaw = (s.credits == null || s.credits === '') ? null : s.credits;
+    const creditsNum = numOr0(creditsRaw);
+    const creditsTotal = numOr0(s.credits_total);
+    const successCount = numOr0(s.success_count);
+    const errTotal = numOr0(s.err_total);
+    const inFlight = numOr0(s.in_flight);
+    const unlimited = creditsTotal === -1;
     const cred = unlimited ? '不限'
-      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+      : (creditsRaw == null ? '—' : (creditsTotal > 0 ? creditsNum + '<span class="of">/' + creditsTotal + '</span>' : String(creditsNum)));
     const pct = unlimited ? 100
-      : (s.credits_total > 0
-        ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-        : Math.round((s.credits || 0) / maxCred * 100));
+      : (creditsTotal > 0
+        ? Math.min(100, Math.round(creditsNum / creditsTotal * 100))
+        : Math.round(creditsNum / maxCred * 100));
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
     let credTip;
     if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
-    else if (s.credits_total > 0) {
+    else if (creditsTotal > 0) {
       credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
-        + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
+        + creditsNum + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + creditsTotal + '（' + pct + '%）';
     } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
@@ -1109,19 +1202,21 @@ function renderAccounts(list, meta) {
     }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
-    const req = tu.request_count || 0;
-    const totalTok = formatTokenCount(tu.total_tokens);
+    const req = numOr0(tu.request_count);
+    const tokRaw = tu.total_tokens;
+    const tokNum = Number(tokRaw);
+    const totalTok = (tokRaw == null || tokRaw === '' || !Number.isFinite(tokNum) || tokNum < 0) ? '—' : fmtTok(tokNum);
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
-    const latency = formatLatency(tu.last_latency_ms);
-    const rate = formatRate(tu.last_tokens_per_second);
+    const latency = fmtMs(tu.last_latency_ms);
+    const rate = fmtRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + accTagsHtml(s.uid) + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (s.in_flight || 0) + '</td>' +
+      '<td class="num">' + successCount + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + errTotal + '</span></td>' +
+      '<td class="num">' + inFlight + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
@@ -1254,12 +1349,15 @@ function renderModelLocksView() {
       return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
     };
     tb.innerHTML = pr.rows.map(r => {
-      const st = STATE[r.state] || ['mute', r.state || '—'];
+      const known = STATE[r.state];
+      const st = known || ['mute', '—'];
+      // 未知 state 只作为转义后的 title 提示，标签 class/文案走白名单（XSS 兜底）。
+      const stTitle = known ? '' : ' title="未知状态：' + esc(r.state || '') + '"';
       const realm = r.realm === 'global' ? '国际版' : '国内版';
       return '<tr>' +
         '<td>' + esc(r.model) + '</td>' +
         '<td><span class="realm-tag">' + realm + '</span></td>' +
-        '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
+        '<td><span class="tag ' + st[0] + '"' + stTitle + '>' + esc(st[1]) + '</span></td>' +
         '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
         '<td class="num">' + (r.locked || 0) + '</td>' +
         '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
@@ -2046,7 +2144,12 @@ function renderLogBox(scrollToEnd) {
     ? pr.rows.map(e => {
       const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
       const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-      const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
+      // 频道来自后端枚举；未知值只接受白名单 class，显示文案回退「系统」，
+      // 不让异常频道名进入 innerHTML 文本位置（XSS 兜底）。
+      const chKey = String((e && e.ch) || '');
+      const chSafe = /^(task|chat|sys)$/.test(chKey) ? chKey : 'sys';
+      const chName = { task: '任务', chat: '对话', sys: '系统' }[chSafe];
+      const ch = logCh === 'all' ? '<i class="lch c-' + esc(chSafe) + '">' + esc(chName) + '</i>' : '';
       return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
     }).join('')
     : '<span style="color:var(--ink-3)">' + (logAll.length ? '没有匹配的日志' : '暂无日志') + '</span>';
@@ -2070,7 +2173,16 @@ if ($('logNext')) $('logNext').onclick = () => {
   if (logPage < pages) { logPage++; renderLogBox(false); }
 };
 
-async function loadLogs() {
+/* LOGS_HEAVY_TTL_MS 运行日志页「重数据」刷新间隔（v2.6.0）：
+   请求指标 / 请求归档 / 积分历史属于大响应（JSONL 扫描、数百 KB），不再跟随 5s
+   轮询——首次进入、用户点刷新/改时间范围立即拉；其余时间最多 30s 一次。
+   轻量 /logs（内存日志环）仍每轮刷新，日志框与计数不会空。 */
+const LOGS_HEAVY_TTL_MS = 30000;
+let logsHeavyAt = 0;
+
+/* loadLogs(forceHeavy)：forceHeavy=true 强制重拉重数据（用户操作/进入页面）。 */
+async function loadLogs(forceHeavy) {
+  const seq = reqSeqNext('logs');
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   const limit = ($('reqLimit') && $('reqLimit').value) || 100;
@@ -2080,19 +2192,27 @@ async function loadLogs() {
   rq.set('limit', limit);
   // 积分历史账号下拉的候选来自账号池；这里同步一次（只在账号集合变化时重建 DOM）。
   syncCreditAccounts();
+  const heavyDue = forceHeavy === true || !logsHeavyAt || (Date.now() - logsHeavyAt) >= LOGS_HEAVY_TTL_MS;
   try {
-    const [d, metrics, requestRows, credit] = await Promise.all([
-      api('logs'),
-      api('request_metrics').catch(() => ({})),
-      api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
-      api(creditHistoryQuery()).catch(() => null),
-    ]);
-    // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
-    // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
-    // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求。
-    const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
-    const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
-    renderRequestMetrics(metrics, recent);
+    const d = await api('logs');
+    if (reqSeqStale('logs', seq)) return true;
+    let metrics = null, requestRows = { entries: [] }, credit = null;
+    if (heavyDue) {
+      [metrics, requestRows, credit] = await Promise.all([
+        api('request_metrics').catch(() => ({})),
+        api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
+        api(creditHistoryQuery()).catch(() => null),
+      ]);
+      if (reqSeqStale('logs', seq)) return true;
+      logsHeavyAt = Date.now();
+      // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
+      // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
+      // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求。
+      const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
+      const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
+      renderRequestMetrics(metrics, recent);
+      renderCreditHistory(credit);
+    }
     logAll = d.entries || [];
     renderLogBox(logPin && atEnd);
     const counts = {};
@@ -2100,9 +2220,11 @@ async function loadLogs() {
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + filterLogs(logAll, logCh, '').length + ' 行';
-    renderCreditHistory(credit);
     return true;   // 轮询据此判断本轮成功/失败（失败才退避）
-  } catch (e) { /* 概览已提示 */ return false; }
+  } catch (e) {
+    if (reqSeqStale('logs', seq)) return true;
+    return false;
+  }
 }
 
 function renderRequestMetrics(m, entries) {
@@ -2153,6 +2275,8 @@ function creditBalanceText(e) {
 function creditDescText(e) {
   return '余额 ' + creditNum(e && e.before) + ' → ' + creditNum(e && e.after);
 }
+/* creditEntryText 组合文本（渲染链路与对抗测试共享）：时间 | 账号 | 变动 | 余额 | 描述。
+   保留独立函数是有意的对外契约（credit_frontend_adversarial_test.go 直接断言脏时间回退）。 */
 function creditEntryText(e) {
   return creditTimeText(e) + ' | ' + creditAccountText(e) + ' | ' + creditDeltaText(e && e.delta) +
     ' | ' + creditBalanceText(e) + ' | ' + creditDescText(e);
@@ -2192,7 +2316,7 @@ function renderCreditHistory(d) {
     return;
   }
   const raw = d.entries || [];
-  // 切片环境（node harness 的对抗测试直接调本函数）可能没有模块级分页状态 /
+  // 直接调用本函数的环境可能没有模块级分页状态 /
   // pageSlice：此时退化为「全部渲染」，与加筛选前的行为一致，不得抛异常。
   const uid = (typeof creditFilter === 'object' && creditFilter) ? creditFilter.uid : '';
   const filtered = raw.filter(e => creditMatch(e, uid));
@@ -2247,7 +2371,7 @@ async function loadCreditHistory() {
      GET /panel/api/audit?limit=200     → {ok, entries:[{ts,ip,action,uid,ok,detail}]}
      GET /panel/api/task_runs?limit=100 → {ok, runs:[{id,kind,trigger,started_at,
                                              finished_at,total,done,fail,skip,error}]}
-   渲染函数是纯函数（只吃数组 + 写固定 DOM 节点），便于 node harness 切片测试。 */
+   渲染函数是纯函数（只吃数组 + 写固定 DOM 节点），便于独立测试。 */
 const AUDIT_LIMIT = 200;
 const TASK_RUNS_LIMIT = 100;
 let auditData = [], taskRunsData = [];
@@ -2382,15 +2506,16 @@ function taskTriggerText(trigger) {
 }
 /* taskRunRowHtml 单行渲染（纯函数）：开始/结束/类型/触发/总数/完成/失败/跳过/错误 */
 function taskRunRowHtml(r) {
+  // 计数统一 Number() 兜底：后端正常给 number；旧数据/上游字符串不能原样拼 HTML。
   return '<tr>' +
     '<td>' + esc(fmtRunTime(r.started_at)) + '</td>' +
     '<td>' + esc(fmtRunTime(r.finished_at)) + '</td>' +
     '<td title="' + esc(r.kind || '') + '">' + esc(taskKindText(r.kind)) + '</td>' +
     '<td title="' + esc(r.trigger || '') + '">' + esc(taskTriggerText(r.trigger)) + '</td>' +
-    '<td class="num">' + r.total + '</td>' +
-    '<td class="num">' + r.done + '</td>' +
-    '<td class="num">' + r.fail + '</td>' +
-    '<td class="num">' + r.skip + '</td>' +
+    '<td class="num">' + numOr0(r.total) + '</td>' +
+    '<td class="num">' + numOr0(r.done) + '</td>' +
+    '<td class="num">' + numOr0(r.fail) + '</td>' +
+    '<td class="num">' + numOr0(r.skip) + '</td>' +
     '<td title="' + esc(r.error || '') + '">' + esc(r.error || '—') + '</td>' +
     '</tr>';
 }
@@ -2577,11 +2702,11 @@ if ($('reqNext')) $('reqNext').onclick = () => {
   const pages = pageSlice(filterReqEntries(reqEntries, reqFilter), reqPageSize, reqPage).pages;
   if (reqPage < pages) { reqPage++; renderRequestTable(); }
 };
-if ($('reqLimit')) $('reqLimit').onchange = () => { reqPage = 1; loadLogs(); };
-if ($('btnReqReload')) $('btnReqReload').onclick = () => { reqPage = 1; loadLogs(); };
+if ($('reqLimit')) $('reqLimit').onchange = () => { reqPage = 1; loadLogs(true); };
+if ($('btnReqReload')) $('btnReqReload').onclick = () => { reqPage = 1; loadLogs(true); };
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。换区间 → 回第 1 页。
-if ($('reqRange')) trangeBind('reqRange', () => { reqPage = 1; loadLogs(); }, '0');
+if ($('reqRange')) trangeBind('reqRange', () => { reqPage = 1; loadLogs(true); }, '0');
 if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
 if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
 // 积分历史：账号筛选 / 每页条数 / 翻页。账号筛选走服务端 uid 过滤（loadCreditHistory
@@ -2942,7 +3067,7 @@ $('btnRefresh').onclick = async () => {
     setTimeout(() => refreshAccountPool(true), 2500);
   } catch (e) { toast('刷新失败：' + e.message, 'err'); }
   finally { b.disabled = false; b.textContent = label; }
-  if (view === 'logs') loadLogs();
+  if (view === 'logs') loadLogs(true);   // 刷新余额成功后强制刷新重数据
 };
 
 /* ── 轮询治理（v2.0.1 #2）─────────────────────────────────────────────
@@ -2958,7 +3083,7 @@ $('btnRefresh').onclick = async () => {
        密钥（btnKey）后 start() 恢复；
      - 每次排期在退避间隔上 ±20% 抖动，避免多标签页同频打后端。
    纯函数（pollIntervalSec / pollBackoffSec / nextPollDelay /
-   pollVisibilityAction）集中在本段前部，node harness 可按锚点切片断言。 */
+   pollVisibilityAction）集中在段前，便于纯函数单测。 */
 
 let refTimer = null;          // 下一次轮询的 setTimeout 句柄（不是 setInterval）
 let refFailures = 0;          // 连续轮询失败次数（成功清零，驱动退避）
@@ -3050,7 +3175,7 @@ function onAuthRequired() {
 }
 
 /* handleVisibilityChange 可见性切换：隐藏只清定时器（不请求）；恢复立即跑
-   一轮（pollTick 会顺带重新排期）。返回 Promise 便于 node harness 等待。 */
+   一轮（pollTick 会顺带重新排期）。返回 Promise 便于调用方等待。 */
 function handleVisibilityChange() {
   const hiddenNow = !!(document && document.visibilityState === 'hidden');
   const action = pollVisibilityAction(hiddenNow, pageHidden);
@@ -3266,24 +3391,6 @@ $('taskBody').addEventListener('click', async ev => {
 });
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
-// 开学季任务单元：✓ 已领（绿）｜◐ x/y 进行中（琥珀）｜○ 未做（灰）
-function staskHTML(t) {
-  if (!t) return '<span class="stask todo"><span class="mark">·</span>—</span>';
-  if (t.status === 'claimed') return '<span class="stask ok"><span class="mark">✓</span>已领</span>';
-  if (t.status === 'completed') return '<span class="stask warn"><span class="mark">◆</span>可领</span>';
-  if (t.status === 'in_progress') {
-    const fr = t.target_count ? '<span class="fr">' + t.progress + '/' + t.target_count + '</span>' : '';
-    return '<span class="stask warn"><span class="mark">◐</span>' + fr + '</span>';
-  }
-  return '<span class="stask todo"><span class="mark">○</span>未做</span>';
-}
-const LUCK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.2 5.2 5 1.8l3 2.4 3-2.4 1.8 3.4-1.4 2.6 1.4 2.6-3.4 2.2H6l-3.4-2.2 1.4-2.6z" opacity=".9"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/></svg>';
-const SCHOOL_TITLES = {
-  share_invite: '分享活动 +100c', desktop_chat_1_time: '桌面端体验 +100c（单次）',
-  chat_3_times: '和 AI 对话 3 次 +50c', expert_use: '召唤开学季专家 +50c',
-  task_student_verify: '学生认证 +100c（需真实认证，不做）',
-};
-
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
    完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
@@ -3560,7 +3667,7 @@ function queueMatchRow(item, f) {
   return true;
 }
 
-// filterQueueRows 分组 → 过滤后的扁平行（纯函数，node harness 可直接钉计数）。
+// filterQueueRows 分组 → 过滤后的扁平行（纯函数，便于直接验计数）。
 function filterQueueRows(groups, f) {
   return queueFlatten(groups).filter(item => queueMatchRow(item, f));
 }
@@ -3642,12 +3749,15 @@ function qrowHTML(it) {
   const isSchool = it.kind === 'school';
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
-  const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
+  // 未知状态：文案回退「—」，原始值只进转义后的 title（XSS 兜底）。
+  const knownStatus = it.status === 'scan' ? '待执行' : ST_WORDS[it.status];
+  const stWord = knownStatus || '—';
+  const stTitle = knownStatus ? '' : ' title="未知状态：' + esc(it.status || '') + '"';
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
     '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
-    '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
+    '<span class="st"' + stTitle + '><span class="qdot ' + dotCls + '"></span>' + esc(stWord) + '</span>' +
     '<span class="msg">' + esc(it.message || '') + '</span>' +
     '</div>';
 }
@@ -3790,10 +3900,6 @@ function fmtModelRate(rate) {
   return s ? 'x' + s : '—';
 }
 
-function usStat(v, k, cls) {
-  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
-         '</div><div class="k">' + esc(k) + '</div></div>';
-}
 
 /* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
    放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
@@ -3871,11 +3977,11 @@ function usSortRows(rows, sort) {
 
 function usDimHead(dim) {
   const m = US_DIMS[dim] || US_DIMS.account;
-  return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
-    (m.withRealm ? '<th>域</th>' : '') +
-    '<th class="num">请求</th><th class="num">失败</th>' +
-    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
-    (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
+  return '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">' + esc(m.title) + '</th>' +
+    (m.withRealm ? '<th scope="col">域</th>' : '') +
+    '<th scope="col" class="num">请求</th><th scope="col" class="num">失败</th>' +
+    '<th scope="col" class="num">Prompt</th><th scope="col" class="num">Completion</th><th scope="col" class="num">合计</th>' +
+    (m.withPerf ? '<th scope="col" class="num">均延迟</th><th scope="col" class="num">均速率</th>' : '') +
     '</tr>';
 }
 
@@ -3917,12 +4023,12 @@ function renderUsageDim() {
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
 function usCreditHead(dim) {
   return dim === 'model'
-    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+    ? '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">模型</th><th scope="col">积分倍率</th>' +
+      '<th scope="col" class="num">请求</th><th scope="col" class="num">扣除积分</th>' +
+      '<th scope="col" class="num">有效样本 Token</th><th scope="col" class="num">积分 / 1M Token</th><th scope="col" class="num">缓存命中率</th></tr>'
+    : '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">账号</th>' +
+      '<th scope="col" class="num">请求</th><th scope="col" class="num">扣除积分</th>' +
+      '<th scope="col" class="num">有效样本 Token</th><th scope="col" class="num">积分 / 1M Token</th><th scope="col" class="num">缓存命中率</th></tr>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -4247,7 +4353,6 @@ function renderUsageChart(series) {
   host.innerHTML = out;
 }
 
-function fmtTokTip(v) { return fmtTok(v); }
 
 let usageRateWarmAt = 0;
 async function warmUsageModelRates() {
@@ -4261,12 +4366,17 @@ async function warmUsageModelRates() {
 }
 
 async function loadUsage() {
+  // 请求序号：快速切换时间范围时，晚到的旧响应不能覆盖新窗口。
+  const seq = reqSeqNext('usage');
   const q = trangeQuery('usRange', true);
   try {
     await warmUsageModelRates();
+    if (reqSeqStale('usage', seq)) return;
     const d = await api('usage?' + q.toString());
+    if (reqSeqStale('usage', seq)) return;
     renderUsage(d);
   } catch (e) {
+    if (reqSeqStale('usage', seq)) return;
     // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
     usageData = null;
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
@@ -4368,7 +4478,7 @@ function pkExpiryMs(p) {
 // pkDetailCompare 只服务单账号逐包明细：正余额包先按到期时间挑选默认展示项，
 // 其余正余额包与已用完包分别折叠；同一到期时间按面额降序。主键跟随视图排序
 // 模式（pkSortMode，声明在本区块末尾的绑定块）：end_asc 到期升序、size_desc
-// 面额降序（同面额按到期升序）。typeof 守卫：前端 harness 的区域切片求值里
+// 面额降序（同面额按到期升序）。typeof 守卫：直接调用/区域片段求值时
 // 没有该全局，回落 end_asc（= 上游原有语义，切片测试的期望序不受影响）。
 function pkDetailCompare(a, b) {
   const sizeOf = p => {
@@ -4645,9 +4755,9 @@ function renderPackages(d, detailLimit) {
       ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条（' +
       esc(PK_SORT_LABELS[pkSortMode] || '') + '）</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
-      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">发放</th><th class="num">到期</th>' +
+      '<th scope="col" class="mark" aria-hidden="true"></th><th scope="col">包名 / 来源</th>' +
+      '<th scope="col" class="num">面额</th><th scope="col" class="num">剩余</th><th scope="col" class="num">已用</th>' +
+      '<th scope="col" class="num">发放</th><th scope="col" class="num">到期</th>' +
       '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
   }).join('');
 }
@@ -4683,7 +4793,7 @@ if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
    size_desc 面额降序——原来的展示口径，看「钱从哪来」。
    行序统一由 pkDetailCompare 实现（明细折叠分组共用同一比较器，切换模式时
    折叠组内行序同步跟随）。本块整体放在 renderPackages / renderExpiryDistribution
-   之后：前端 harness 按区域切片求值（[PK_ACCOUNT_COLORS, renderExpiryDistribution)
+   之后：区域片段独立求值（[PK_ACCOUNT_COLORS, renderExpiryDistribution)
    与 [PK_DEFAULT_DETAIL_LIMIT, renderPackages)），顶层 localStorage/$ 语句落进
    切片区会让无 DOM 桩的求值环境 ReferenceError——上游测试的切片边界不动。 */
 const LS_PK_SORT = 'pkSortMode';
@@ -4697,7 +4807,7 @@ if ($('pkSort')) {
   $('pkSort').value = pkSortMode;
   if ($('pkSort').value !== pkSortMode) {        // localStorage 里存了废弃值：回落默认
     pkSortMode = 'end_asc';
-    localStorage.setItem(LS_PK_SORT, pkSortMode);   // 不用 removeItem：harness 桩无此方法
+    localStorage.setItem(LS_PK_SORT, pkSortMode);   // 不用 removeItem：与旧实现保持同一存储写法（兼容极简桩）
   }
   $('pkSort').onchange = () => {
     pkSortMode = $('pkSort').value;
@@ -4838,14 +4948,14 @@ function expiryRowsOf(keyed, today) {
   }).join('');
 }
 
-// expiryRowsHtml 全量渲染入口（保留原签名，上游与前端 harness 都可能直接调用）。
+// expiryRowsHtml 全量渲染入口（保留原签名，直接调用方仍可复用）。
 function expiryRowsHtml(list) {
   const { keyed, today } = expiryKeyed(list);
   return expiryRowsOf(keyed, today);
 }
 
 // expSlice 按当前分页状态切出要渲染的账号，并把页码/总数回写到筛选栏。
-// 前端 harness 的切片环境没有模块级分页状态（expAll/expPage/expPageSize），
+// 直接调用方可能没有模块级分页状态（expAll/expPage/expPageSize），
 // 此时原样返回全量，输出与不分页时逐字节一致。
 function expSlice(keyed) {
   if (typeof expAll === 'undefined' || typeof expPage !== 'number' ||
@@ -4979,7 +5089,7 @@ function renderExpirySnapshot(d) {
 
 // snapshotNoteText 快照卡片的数据新鲜度标注。界面本身 5 秒轮询一次，但卡片数据
 // 只随余额后台刷新更新（默认每 5 分钟）——不标出来的话，5 秒级的界面刷新会让人
-// 误以为数据也是 5 秒级新鲜。放在 renderExpirySnapshot 之后：前端 harness 按
+// 误以为数据也是 5 秒级新鲜。放在 renderExpirySnapshot 之后：区域片段独立求值按
 // 「renderExpirySnapshot 起」切片求值，函数声明提升让它在同一切片内可用。
 function snapshotNoteText(count, d) {
   const iv = Number(d && d.balance_refresh_sec) || 0;
@@ -5035,6 +5145,9 @@ if ($('btnPkReload')) $('btnPkReload').onclick = loadPackageDetail;
 
 async function loadPackageDetail() {
   if (!pkUID) return;
+  // 弹窗可被连续点开：请求前快照 uid + 序号，旧账号/旧请求的响应一律丢弃。
+  const uid = pkUID;
+  const seq = reqSeqNext('packageDetail');
   const st = $('pkState'), body = $('pkBody');
   st.hidden = false;
   st.className = 'state';
@@ -5043,14 +5156,16 @@ async function loadPackageDetail() {
   try {
     // 折叠条数复用配置里的 package_detail_limit；config 拉不到就用默认值。
     const [d, c] = await Promise.all([
-      api('packages?uid=' + encodeURIComponent(pkUID)),
+      api('packages?uid=' + encodeURIComponent(uid)),
       api('config').catch(() => null),
     ]);
+    if (reqSeqStale('packageDetail', seq) || pkUID !== uid) return;
     const a = (d.accounts || [])[0];
     if (!a) throw new Error('该账号无数据');
     st.hidden = true;
     body.innerHTML = packageDetailHtml(a, pkDetailLimit(c && c.config));
   } catch (e) {
+    if (reqSeqStale('packageDetail', seq) || pkUID !== uid) return;
     st.hidden = false;
     st.className = 'state err';
     st.textContent = '查询失败：' + e.message;
@@ -5138,9 +5253,9 @@ function packageDetailHtml(a, detailLimit) {
     (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
     ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条（按到期升序）</span>' +
     '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
-    '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
-    '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-    '<th class="num">发放</th><th class="num">到期</th>' +
+    '<th scope="col" class="mark" aria-hidden="true"></th><th scope="col">包名 / 来源</th>' +
+    '<th scope="col" class="num">面额</th><th scope="col" class="num">剩余</th><th scope="col" class="num">已用</th>' +
+    '<th scope="col" class="num">发放</th><th scope="col" class="num">到期</th>' +
     '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
 }
 
@@ -5268,8 +5383,11 @@ function mergeServerNotesToLocal() {
 }
 
 async function loadMeta(quiet) {
+  // 请求序号：打开备注弹窗时的加载与保存/迁移并发时，只允许最后一次请求写回 metaAll。
+  const seq = reqSeqNext('meta');
   try {
     const d = await api('meta');
+    if (reqSeqStale('meta', seq)) return false;
     metaAll = normalizeMeta(d);
     metaLoaded = true;
     mergeServerNotesToLocal();
@@ -5277,6 +5395,7 @@ async function loadMeta(quiet) {
     loadAccTags(true);   // v2.3.1：备注/标签加载后同步标签筛选下拉（静默）
     return true;
   } catch (e) {
+    if (reqSeqStale('meta', seq)) return false;
     // 接口未就绪/网络失败：界面继续用 localStorage（remarkOf 已回落），不阻塞面板。
     if (!quiet) toast('读取账号备注失败，已回落本机缓存：' + e.message, 'err');
     return false;

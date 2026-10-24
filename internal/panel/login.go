@@ -210,6 +210,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
+	// v2.6.0 P1：auth_dir 未配置时明确拒绝（否则 MkdirAll("") 的 500 语义含糊，
+	// 且 FilePath 会回落 CWD）。
+	if p.cfg.AuthDir == "" {
+		writeErr(w, http.StatusInternalServerError, "auth_dir not configured（无法落盘凭证，请检查面板装配）")
+		return
+	}
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
 		return

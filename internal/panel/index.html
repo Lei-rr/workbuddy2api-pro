@@ -791,9 +791,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th scope="col" class="mark" aria-hidden="true"></th>
+            <th scope="col">账号</th><th scope="col">状态</th><th scope="col">积分</th>
+            <th scope="col">成功 / 失败</th><th scope="col">在途</th><th scope="col">用量</th><th scope="col">最近成功</th><th scope="col" class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -834,8 +834,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
-            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
-            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+            <th scope="col">模型</th><th scope="col">域</th><th scope="col">状态</th><th scope="col">可选 / 总数</th>
+            <th scope="col">锁定账号</th><th scope="col">最早解锁</th><th scope="col">全池解锁</th><th scope="col">原因</th>
           </tr></thead>
           <tbody id="mlBody"></tbody>
         </table>
@@ -948,7 +948,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">模型</th><th scope="col">积分倍率</th><th scope="col">默认档</th><th scope="col">支持的思考档位</th><th scope="col">上下文长度</th><th scope="col">最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>
@@ -1352,9 +1352,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
-              <th>来源 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+              <th scope="col">时间</th><th scope="col">结果</th><th scope="col">模型</th><th scope="col">账号</th>
+              <th scope="col">来源 IP</th><th scope="col">User-Agent</th>
+              <th scope="col" class="num">耗时</th><th scope="col" class="num">Token</th><th scope="col" class="num">积分</th><th scope="col">请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>
@@ -1422,7 +1422,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
-              <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
+              <th scope="col">时间</th><th scope="col">账号</th><th scope="col" class="num">变动</th><th scope="col" class="num">变动后余额</th><th scope="col">说明</th>
             </tr></thead>
             <tbody id="creditBody"></tbody>
           </table>
@@ -1441,7 +1441,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
           <table class="acc" id="auditTable" hidden>
-            <thead><tr><th>时间</th><th>来源 IP</th><th>动作</th><th>账号</th><th>结果</th><th>详情</th></tr></thead>
+            <thead><tr><th scope="col">时间</th><th scope="col">来源 IP</th><th scope="col">动作</th><th scope="col">账号</th><th scope="col">结果</th><th scope="col">详情</th></tr></thead>
             <tbody id="auditBody"></tbody>
           </table>
         </div>
@@ -1460,8 +1460,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap">
           <table class="acc" id="runsTable" hidden>
             <thead><tr>
-              <th>开始</th><th>结束</th><th>类型</th><th>触发</th>
-              <th class="num">总数</th><th class="num">完成</th><th class="num">失败</th><th class="num">跳过</th><th>错误</th>
+              <th scope="col">开始</th><th scope="col">结束</th><th scope="col">类型</th><th scope="col">触发</th>
+              <th scope="col" class="num">总数</th><th scope="col" class="num">完成</th><th scope="col" class="num">失败</th><th scope="col" class="num">跳过</th><th scope="col">错误</th>
             </tr></thead>
             <tbody id="runsBody"></tbody>
           </table>
@@ -1475,17 +1475,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="nav-veil" id="navVeil"></div>
 
 <!-- 积分任务 -->
-<div class="veil" id="taskVeil">
-  <div class="dlg" style="width:940px">
+<div class="veil" id="taskVeil" role="dialog" aria-modal="true" aria-labelledby="taskVeilTitle">
+  <div class="dlg" tabindex="-1" style="width:940px">
     <header>
-      <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
+      <h3 id="taskVeilTitle">积分任务 <span class="hint" id="taskWho"></span></h3>
       <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
     </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
         <table class="acc md" id="taskTable" hidden>
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
+          <thead><tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">任务</th><th scope="col">进度</th><th scope="col">奖励</th><th scope="col">状态</th><th scope="col" class="c-acts"></th></tr></thead>
           <tbody id="taskBody"></tbody>
         </table>
       </div>
@@ -1501,10 +1501,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 开学季券码 -->
-<div class="veil" id="vcVeil">
-  <div class="dlg">
+<div class="veil" id="vcVeil" role="dialog" aria-modal="true" aria-labelledby="vcVeilTitle">
+  <div class="dlg" tabindex="-1">
     <header>
-      <h3>开学季 · 我的券码</h3>
+      <h3 id="vcVeilTitle">开学季 · 我的券码</h3>
       <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
     </header>
     <div class="body" id="vcBody"></div>
@@ -1518,10 +1518,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 添加账号 -->
-<div class="veil" id="addVeil">
-  <div class="dlg">
+<div class="veil" id="addVeil" role="dialog" aria-modal="true" aria-labelledby="addVeilTitle">
+  <div class="dlg" tabindex="-1">
     <header>
-      <h3>添加账号</h3>
+      <h3 id="addVeilTitle">添加账号</h3>
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
@@ -1567,10 +1567,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 密钥 -->
 <!-- 单号积分构成（packages?uid= 只查 1 个账号 1 次上游请求） -->
-<div class="veil" id="pkVeil">
-  <div class="dlg" style="width:980px">
+<div class="veil" id="pkVeil" role="dialog" aria-modal="true" aria-labelledby="pkVeilTitle">
+  <div class="dlg" tabindex="-1" style="width:980px">
     <header>
-      <h3>积分构成 <span class="hint" id="pkWho"></span></h3>
+      <h3 id="pkVeilTitle">积分构成 <span class="hint" id="pkWho"></span></h3>
       <div class="hint">单账号逐包明细，实时查询上游（每次打开只查这 1 个账号）。「其余未用完」「已用完」默认折叠，点分组行展开。</div>
     </header>
     <div class="body">
@@ -1585,10 +1585,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<div class="veil" id="keyVeil" data-lock="1">
-  <div class="dlg" style="width:420px">
+<div class="veil" id="keyVeil" data-lock="1" role="dialog" aria-modal="true" aria-labelledby="keyVeilTitle">
+  <div class="dlg" tabindex="-1" style="width:420px">
     <header>
-      <h3>需要访问密钥</h3>
+      <h3 id="keyVeilTitle">需要访问密钥</h3>
       <div class="hint">该面板已启用密钥鉴权。请输入<b>面板密钥</b>（config.json 的 <code>panel.api_key</code>）；未单独配置面板密钥时，回落到网关 <code>api_key</code>。</div>
     </header>
     <div class="body">
@@ -1603,10 +1603,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 账号备注/标签（v2.3.0 #12）：服务端 data/account-meta.json 权威，localStorage 仅作降级缓存 -->
-<div class="veil" id="remarkVeil">
-  <div class="dlg" style="width:640px">
+<div class="veil" id="remarkVeil" role="dialog" aria-modal="true" aria-labelledby="remarkVeilTitle">
+  <div class="dlg" tabindex="-1" style="width:640px">
     <header>
-      <h3>账号备注 / 标签</h3>
+      <h3 id="remarkVeilTitle">账号备注 / 标签</h3>
       <div class="hint">备注与标签保存在服务端（data/account-meta.json），换浏览器/设备同步；本机 localStorage 仅作降级缓存。标签用逗号或空格分隔（最多 10 个、每个 ≤32 字）；备注留空并清空标签即删除该账号记录。</div>
     </header>
     <div class="body">
@@ -1621,7 +1621,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<div id="toasts"></div>
+<div id="toasts" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script src="app.js"></script>
 <script src="mobile.js"></script>

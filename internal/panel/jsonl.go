@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 )
 
@@ -144,20 +143,9 @@ func (l *jsonlLog) readLast(limit int) ([]json.RawMessage, error) {
 	return out, nil
 }
 
-// tailLimit 解析 ?limit（默认 def、上限 max、非法/<=0 回落 def）。
+// tailLimit 兼容旧调用点（v2.6.0 起等价 parseLimit；保留符号给既有测试/调用方）。
 func tailLimit(r *http.Request, def, max int) int {
-	n := def
-	if r != nil {
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if x, err := strconv.Atoi(v); err == nil && x > 0 {
-				n = x
-			}
-		}
-	}
-	if n > max {
-		n = max
-	}
-	return n
+	return parseLimit(r, def, max)
 }
 
 // panelDataDir 推导面板自有 JSONL 的落盘目录（审计/任务历史与 state 文件同目录）。

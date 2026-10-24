@@ -23,6 +23,7 @@
 package panel
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -41,18 +42,39 @@ type TaskSweepStats struct {
 	Errors   int   `json:"errors"`   // 本轮出错（不中断）的次数
 }
 
-// RunTaskSweepOnce 对所有账号做一轮幂等补领清扫（账号间并发、账号内串行）。
-// 由 scheduler 的 ticker 调用（详见 scheduler.StartTaskSweep）。
+// RunTaskSweepOnce 对所有账号做一轮幂等补领清扫（账号间有界并发、账号内串行）。
+// 由 scheduler 的 ticker 调用（详见 scheduler.StartTaskSweep）；scheduler 侧回调
+// 签名是 func()（见 scheduler.TaskSweepHook），故本入口用 context.Background()；
+// 需要取消语义的调用方（测试/未来 scheduler 接线）用 RunTaskSweepCtx。
 //
 // v2.2.0 #9：本轮确有动作/错误时（与日志同条件，避免空转轮次刷屏）写一条任务
 // 执行历史：kind=catch_up、trigger=schedule；done = 接受成功数 + 领奖成功数。
+//
+// v2.6.0 P0：账号级扇出改为固定 worker 池（fanOutAccounts，默认 8、可配
+// panel.Config.TaskSweepConcurrency）——10k 账号不再瞬时起 1 万 goroutine。
 func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
+	return p.RunTaskSweepCtx(context.Background())
+}
+
+// RunTaskSweepCtx 可取消版本的补领清扫：ctx 取消后不再派发新账号（在跑账号
+// 收尾后返回），账号级并发受 fanOutConcurrency 限制。
+func (p *Panel) RunTaskSweepCtx(ctx context.Context) TaskSweepStats {
+	if p == nil || p.cfg.Pool == nil {
+		return TaskSweepStats{}
+	}
 	started := time.Now()
 	var st TaskSweepStats
 	var mu sync.Mutex
-	var wg sync.WaitGroup
 
-	for _, ps := range p.cfg.Pool.List() {
+	// 先筛候选（禁用/global/企业版零上游请求），再交给固定 worker 池。
+	type sweepJob struct {
+		a   *auth.Auth
+		uid string
+	}
+	snapshot := p.poolSnapshot()
+	jobs := make([]sweepJob, 0, len(snapshot))
+	for i := range snapshot {
+		ps := &snapshot[i]
 		if ps.Disabled {
 			continue // 禁用账号不参与（与任务中心扫描同口径）
 		}
@@ -60,22 +82,24 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		if a == nil || a.IsGlobal() || a.IsEnterprise() {
 			continue // 无个人成长体系：零上游请求
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			r := p.sweepAccount(a, uid)
-			mu.Lock()
-			defer mu.Unlock()
-			st.Accounts += r.accounts
-			st.Skipped += r.skipped
-			st.Accepted += r.accepted
-			st.Claimed += r.claimed
-			st.Credits += r.credit
-			st.Energy += r.energy
-			st.Errors += r.errors
-		}(a, ps.UID)
+		jobs = append(jobs, sweepJob{a: a, uid: ps.UID})
 	}
-	wg.Wait()
+	concurrency := p.fanOutConcurrency()
+	logFanOut("任务补领清扫", len(jobs), concurrency)
+
+	fanOutAccounts(ctx, len(jobs), concurrency, func(_ context.Context, i int) {
+		j := jobs[i]
+		r := p.sweepAccount(j.a, j.uid)
+		mu.Lock()
+		st.Accounts += r.accounts
+		st.Skipped += r.skipped
+		st.Accepted += r.accepted
+		st.Claimed += r.claimed
+		st.Credits += r.credit
+		st.Energy += r.energy
+		st.Errors += r.errors
+		mu.Unlock()
+	})
 
 	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 {
 		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 接受 %d · 领奖 %d · +%d 分 +%d 能 · 出错 %d",

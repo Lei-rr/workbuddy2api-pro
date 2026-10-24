@@ -15,4 +15,11 @@ config.json
 PLAN.md
 SPEC.md
 LOOP.md
+# 文档与工具不进构建上下文（v2.6.0 审计：避免无关文件让 COPY . . 层缓存失效）
 README.md
+CHANGELOG.md
+MAINTAINERS.md
+UPGRADE_PROPOSALS.md
+PERF.md
+tools/
+.github/

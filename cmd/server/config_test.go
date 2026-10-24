@@ -1047,7 +1047,15 @@ func TestConfigExampleJSONParsesAndHasV201Keys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse config.example.json: %v", err)
 	}
-	// 示例文件 api_key 是占位符 test_key：panel.api_key 留空（回落），不触发启动校验。
+	// v2.6.0 审计 P0：示例文件 api_key 必须为空（不能再用 test_key 之类的可预测占位值；
+	// Docker 会把它原样复制为 /app/config.json，非回环 + 空 key 由启动安全校验 fail-fast）。
+	if c.APIKey != "" {
+		t.Errorf("example api_key=%q want empty（P0：示例不得含默认可用密钥）", c.APIKey)
+	}
+	// v2.6.0：/v1 请求体上限默认 64MiB（example 必须与 Default 同步）。
+	if c.Server.MaxBodyMB != 64 {
+		t.Errorf("example server.max_body_mb=%d want 64", c.Server.MaxBodyMB)
+	}
 	if c.Panel.PollIntervalSec != 5 {
 		t.Errorf("example panel.poll_interval_sec=%d want 5", c.Panel.PollIntervalSec)
 	}
@@ -1084,5 +1092,95 @@ func TestConfigExampleJSONParsesAndHasV201Keys(t *testing.T) {
 	_ = json.Unmarshal(probe["security"], &sec)
 	if _, ok := sec["allow_anonymous"]; !ok {
 		t.Error("config.example.json missing security.allow_anonymous")
+	}
+	// v2.6.0：example 的 server 块必须含 max_body_mb 键（前端/文档按 JSON 键名接线）。
+	var srv map[string]json.RawMessage
+	_ = json.Unmarshal(probe["server"], &srv)
+	if _, ok := srv["max_body_mb"]; !ok {
+		t.Error("config.example.json missing server.max_body_mb")
+	}
+}
+
+// TestWeakAPIKeyGuard 弱/示例密钥启动守卫（v2.6.0 审计 P0）：
+//   - 非回环监听 + 命中弱名单（api_key 或 panel.api_key）→ 启动/保存失败；
+//   - 回环监听 + 弱密钥 → 仅 WARN 放行；
+//   - 强密钥 / 空密钥 → 放行（空 = 不鉴权，由 validateListenSecurity 在启动时处理）。
+func TestWeakAPIKeyGuard(t *testing.T) {
+	weak := []string{"test_key", "TEST_KEY", "test-key", "changeme", "ChangeMe", "password", "123456", "example", "admin", "  test_key  "}
+	for _, key := range weak {
+		c := Default() // listen :7863 = 非回环
+		c.APIKey = key
+		if err := c.normalize(); err == nil {
+			t.Fatalf("api_key=%q 非回环监听应被拒绝启动", key)
+		}
+		c = Default()
+		c.Panel.APIKey = key
+		if err := c.normalize(); err == nil {
+			t.Fatalf("panel.api_key=%q 非回环监听应被拒绝启动", key)
+		}
+	}
+	// 回环监听：弱密钥仅 WARN 放行（本机自用）。
+	for _, key := range []string{"test_key", "password"} {
+		c := Default()
+		c.Listen = "127.0.0.1:7863"
+		c.APIKey = key
+		if err := c.normalize(); err != nil {
+			t.Fatalf("回环 + 弱密钥 %q 应放行，got %v", key, err)
+		}
+	}
+	// 强随机密钥 / 空密钥：非回环也放行（空由启动安全校验决定）。
+	for _, key := range []string{"sk-3f9c2b1d8a7e6f504142434445464748", ""} {
+		c := Default()
+		c.APIKey = key
+		if err := c.normalize(); err != nil {
+			t.Fatalf("api_key=%q 应放行，got %v", key, err)
+		}
+	}
+}
+
+// TestServerMaxBodyMB /v1 请求体上限（v2.6.0）：默认 64；<=0 回落默认；clamp [1,1024]；
+// env WB2A_MAX_BODY_MB 覆盖（非整数忽略，与其它 int env 同风格）。
+func TestServerMaxBodyMB(t *testing.T) {
+	cases := []struct {
+		in, want int
+	}{
+		{0, 64},      // 未设置/0 → 默认
+		{-5, 64},     // 负值 → 默认
+		{1, 1},       // 下边界
+		{64, 64},     // 默认值
+		{128, 128},   // 正常配置
+		{2000, 1024}, // 上界 clamp
+	}
+	for _, tc := range cases {
+		c := Default()
+		c.Server.MaxBodyMB = tc.in
+		if err := c.normalize(); err != nil {
+			t.Fatalf("max_body_mb=%d normalize: %v", tc.in, err)
+		}
+		if c.Server.MaxBodyMB != tc.want {
+			t.Errorf("max_body_mb=%d → %d want %d", tc.in, c.Server.MaxBodyMB, tc.want)
+		}
+	}
+	// Default() 本身就是 64。
+	if got := Default().Server.MaxBodyMB; got != 64 {
+		t.Errorf("Default server.max_body_mb=%d want 64", got)
+	}
+	// 环境变量覆盖。
+	t.Setenv("WB2A_MAX_BODY_MB", "256")
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Server.MaxBodyMB != 256 {
+		t.Errorf("WB2A_MAX_BODY_MB=256 → %d", c.Server.MaxBodyMB)
+	}
+	// 非法环境变量忽略（回落默认），不阻断启动。
+	t.Setenv("WB2A_MAX_BODY_MB", "not-a-number")
+	c, err = Load("")
+	if err != nil {
+		t.Fatalf("Load with invalid env: %v", err)
+	}
+	if c.Server.MaxBodyMB != 64 {
+		t.Errorf("invalid env → %d want 64", c.Server.MaxBodyMB)
 	}
 }

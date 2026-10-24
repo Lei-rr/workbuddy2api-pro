@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -184,15 +183,7 @@ func (p *Panel) jobsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "jobs registry not available")
 		return
 	}
-	limit := jobsDefaultListLimit
-	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > jobsMaxListLimit {
-		limit = jobsMaxListLimit
-	}
+	limit := parseLimit(r, jobsDefaultListLimit, jobsMaxListLimit)
 	list := p.cfg.Jobs.List(limit)
 	if list == nil {
 		list = []*jobs.Job{}

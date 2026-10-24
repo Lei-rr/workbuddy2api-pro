@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,23 +16,23 @@ import (
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
-	ID            string `json:"id"`
-	Email         string `json:"email"`
-	UID           string `json:"uid"`
-	Nickname      string `json:"nickname"`
-	AccessToken   string `json:"access_token"`
-	RefreshToken  string `json:"refresh_token"`
-	TokenType     string `json:"token_type"`
-	ExpiresAt     int64  `json:"expires_at"`
-	Domain        string `json:"domain"`
-	DosageNotify  string `json:"dosage_notify_code"`
-	PaymentType   string `json:"payment_type"`
-	Status        string `json:"status"`
-	UsageUpdatedAt int64 `json:"usage_updated_at"`
-	LastCheckin   int64  `json:"last_checkin_time"`
-	CheckinStreak int    `json:"checkin_streak"`
-	CreatedAt     int64  `json:"created_at"`
-	LastUsed      int64  `json:"last_used"`
+	ID             string `json:"id"`
+	Email          string `json:"email"`
+	UID            string `json:"uid"`
+	Nickname       string `json:"nickname"`
+	AccessToken    string `json:"access_token"`
+	RefreshToken   string `json:"refresh_token"`
+	TokenType      string `json:"token_type"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Domain         string `json:"domain"`
+	DosageNotify   string `json:"dosage_notify_code"`
+	PaymentType    string `json:"payment_type"`
+	Status         string `json:"status"`
+	UsageUpdatedAt int64  `json:"usage_updated_at"`
+	LastCheckin    int64  `json:"last_checkin_time"`
+	CheckinStreak  int    `json:"checkin_streak"`
+	CreatedAt      int64  `json:"created_at"`
+	LastUsed       int64  `json:"last_used"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
@@ -41,10 +42,29 @@ type cockpitAccount struct {
 //	Body: file=<json>
 //
 // 返回 {ok, total, imported, skipped, errors}。
+//
+// v2.6.0 P1：
+//   - auth_dir 未配置时拒绝（否则 filepath.Join("", "workbuddy-uid.json") 会把
+//     凭证写进进程 CWD，重启后池与 auths/ 不一致）；
+//   - 整个 multipart body 限 32MB（http.MaxBytesReader），并显式清理临时文件。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if p.cfg.AuthDir == "" {
+		writeErr(w, http.StatusBadRequest, "auth_dir not configured：请先在配置中设置 auth_dir 再导入凭证")
+		return
+	}
+	const importBodyMax = 32 << 20 // 32MB：cockpit 导出文件远小于此
+	r.Body = http.MaxBytesReader(w, r.Body, importBodyMax)
+	if err := r.ParseMultipartForm(importBodyMax); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "import file too large（上限 32MB）")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
+	}
+	if r.MultipartForm != nil {
+		defer func() { _ = r.MultipartForm.RemoveAll() }()
 	}
 	file, _, err := r.FormFile("file")
 	if err != nil {
