@@ -56,6 +56,12 @@ type ModelLockRow struct {
 //
 // 只读：持 RLock 遍历，不改任何状态。无锁时返回 nil（JSON 里是 null，面板按空态渲染）。
 func (p *Pool) ModelLockView() []ModelLockRow {
+	// v2.5.0 Perf-2：模型锁条目计数为 0 时 O(1) 返回 nil（无锁原子读，不拿池锁、
+	// 不全池遍历、不逐号 Realm）。计数由写入路径（6004/11102/清除/复活/state 恢复）
+	// 维护；过期条目由 pick 惰性清理时扣减，扫描时再按实际条目数自愈。
+	if p.modelLockEntries.Load() <= 0 {
+		return nil
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -68,8 +74,10 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	}
 	rows := make(map[string]*agg)
 	routable := make(map[string]int) // realm → 参与选号的账号数
+	entries := 0
 
 	for _, e := range p.byUID {
+		entries += len(e.modelCooldowns)
 		realm := e.a.Realm()
 		if e.disabled || e.paused {
 			continue
@@ -95,6 +103,9 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			}
 		}
 	}
+	// 自愈计数：按实际内存条目数回写（过期条目仍留在 map 内，计数保持 >0 只是
+	// 多扫一次；绝不出现「有条目但计数 0」导致快路径漏报）。
+	p.modelLockEntries.Store(int64(entries))
 	if len(rows) == 0 {
 		return nil
 	}

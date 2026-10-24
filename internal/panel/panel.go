@@ -138,6 +138,10 @@ type Panel struct {
 	// 仅作 /metrics 的 workbuddy_panel_requests_total 展示）。
 	apiRequests atomic.Int64
 
+	// accountsETag 账号列表 ETag/304 缓存（v2.5.0 Perf-3）：按归一化查询 LRU，
+	// 池/元数据版本未变时 5s 轮询可直接 304（不构 rows），显著降低常态开销。
+	accountsETag *accountsETagCache
+
 	// dataDir 面板自有 JSONL 落盘目录（审计/任务历史与 state 文件同目录）；空 = 未装配，
 	// 两项旁路功能自动关闭（测试与只读装配不产生副作用文件）。
 	dataDir string
@@ -196,6 +200,7 @@ func New(cfg Config) *Panel {
 		logs:         NewRing(500),
 		logins:       map[string]loginSession{},
 		authFailures: newAuthFailLimiter(authFailLimiterMaxIPs),
+		accountsETag: newAccountsETagCache(),
 		dataDir:      dataDir,
 		auditLog:     newJSONLLog(joinDataFile(dataDir, auditFileName)),
 		taskRunsLog:  newJSONLLog(joinDataFile(dataDir, taskRunsFileName)),
@@ -335,7 +340,9 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 缓冲后统一决定是否压缩：面板无流式接口，缓冲让 Content-Length/1KB 阈值判断
 	// 都能如实进行；HEAD/204/304/已编码响应在 close 里跳过压缩。
-	gw := &gzipResponseWriter{ResponseWriter: w, req: r}
+	// 缓冲 bytes.Buffer 来自 sync.Pool（v2.5.0 Perf-3）：大响应（10k 账号页/全量
+	// overview）每次请求数 MB 的缓冲复用，避免反复扩容分配。
+	gw := &gzipResponseWriter{ResponseWriter: w, req: r, buf: acquireGzipBuffer()}
 	defer gw.close(acceptsGzip(r))
 	p.mux.ServeHTTP(gw, r)
 }
@@ -412,55 +419,101 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // 只读接口
 // ---------------------------------------------------------------------------
 
-// overview 总览：池计数 + 每账号状态 + 面板元信息。
+// overview 总览：池计数 + 面板元信息（可选 accounts 全量）。
 //
 // v2.1 #1：?lite=1 只回汇总（计数/元信息/model_locks/积分合计，约 1-2 KB），供前端
 // 5s 轮询；不带 lite（默认）时除新增 credits_sum/credits_total_sum 两个汇总字段外
 // 与旧版逐字段等价（含 accounts 全量）——旧脚本零破坏。
+//
+// v2.5.0 Perf-3：汇总数据改由 pool.Summary()（O(1) 缓存）一次取齐，不再做
+// CountsDetailedWithPaused / CreditsSums / ModelLockView 三次全池扫描；10k 账号下
+// lite 从 ~12ms 降到亚毫秒。另新增 ?accounts=0（轻量模式，响应与 lite 等价）：全量
+// overview 的调用方可显式关闭 accounts 数组；默认仍带 accounts 保持旧契约。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
-	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
-	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
-	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
+	sum := p.poolSummary()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
-	// 积分合计（「积分剩余 / 总额」统计条）：v2.1 #1 前端改 lite 轮询后不再拿到
-	// accounts 数组，无法本地求和；后端直接透出，lite 与全量都带。用 pool 的只读
-	// 求和（O(n)、零分配）而不是 List() 遍历——lite 分支因此仍不构造全量快照。
-	creditsSum, creditsTotalSum := p.cfg.Pool.CreditsSums()
+	// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
+	// Summary.ModelLocks 只给条目数（O(1)）；无锁时直接 null（与原行为一致），
+	// 有锁时才取一次明细（低频，避免常态全池遍历 + 逐号 Realm()）。
+	var modelLocks any
+	if sum.ModelLocks > 0 && p.cfg.Pool != nil {
+		modelLocks = p.cfg.Pool.ModelLockView()
+	}
 	resp := map[string]any{
-		"version":       p.cfg.Version,
-		"uptime_sec":    int(time.Since(p.started).Seconds()),
+		"version":    p.cfg.Version,
+		"uptime_sec": int(time.Since(p.started).Seconds()),
+		// auth_required 面板密钥是否启用（前端据此决定是否弹密钥输入）。
 		"auth_required": p.apiKey() != "",
 		// poll_interval_sec 面板前端轮询间隔（秒，2-60；v2.0.1 #2）：前端据此安排
 		// 5s 默认轮询并可在线改配置，后端不感知前端实现。
 		"poll_interval_sec": p.pollIntervalSec(),
 		"redis_mode":        p.cfg.RedisMode,
 		"sticky_sessions":   sticky,
-		"total":             total,
-		"healthy":           healthy,
-		"cooling":           cooling,
-		"disabled":          disabled,
-		"paused":            paused,
-		"in_flight_full":    inFlightFull,
+		// 计数口径 = WithPaused：paused 独立于 disabled 展示（issue #125）。
+		"total":    sum.Total,
+		"healthy":  sum.Healthy,
+		"cooling":  sum.Cooling,
+		"disabled": sum.Disabled,
+		"paused":   sum.Paused,
+		// in_flight_full 全池在途请求数（Summary 内部 atomic 维护，不再 List 累加）。
+		"in_flight_full": sum.InFlight,
 		// credits_sum = 全池 credits 之和；credits_total_sum = 全池总额度之和（未知
 		// 0/企业无限量 -1 按 0 计）。与旧前端「从 accounts 数组求和」口径一致，
 		// 全量 overview 下也恒有该字段（向后兼容，只增不减）。
-		"credits_sum":       creditsSum,
-		"credits_total_sum": creditsTotalSum,
-		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
-		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
-		"model_locks": p.cfg.Pool.ModelLockView(),
+		"credits_sum":       sum.CreditsSum,
+		"credits_total_sum": sum.CreditsTotalSum,
+		// model_locks 模型级限流全清单（无锁时 null）。
+		"model_locks": modelLocks,
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
 	}
-	if !overviewLite(r) {
-		resp["accounts"] = p.cfg.Pool.List()
+	if !overviewLite(r) && !overviewAccountsDisabled(r) {
+		// accounts 与 /panel/api/accounts 的数据源同一份缓存快照（只读，不排序）。
+		resp["accounts"] = p.poolSnapshot()
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// overviewAccountsDisabled 解析 ?accounts=0（v2.5.0 Perf-3）：显式关闭 accounts 数组的
+// 轻量模式（响应等价于 ?lite=1）。空值/非法值一律按默认（带 accounts）处理，
+// 旧调用方零破坏；默认 overview 契约仍包含 accounts。
+func overviewAccountsDisabled(r *http.Request) bool {
+	v := strings.TrimSpace(r.URL.Query().Get("accounts"))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	return err == nil && !b
+}
+
+// poolSnapshot 返回池的缓存只读快照（按 uid 升序；调用方不得排序/修改）。
+// nil 池（嵌入式/测试装配）返回 nil，与旧 List() 语义一致。
+func (p *Panel) poolSnapshot() []pool.Status {
+	if p.cfg.Pool == nil {
+		return nil
+	}
+	return p.cfg.Pool.Snapshot()
+}
+
+// poolVersion 返回池内容代际号（v2.5.0 Perf-3 ETag 缓存失效判断用）。
+func (p *Panel) poolVersion() uint64 {
+	if p.cfg.Pool == nil {
+		return 0
+	}
+	return p.cfg.Pool.Version()
+}
+
+// poolSummary 返回池一次性摘要（计数/积分合计/在途/模型锁数；O(1) 缓存）。
+func (p *Panel) poolSummary() pool.Summary {
+	if p.cfg.Pool == nil {
+		return pool.Summary{}
+	}
+	return p.cfg.Pool.Summary()
 }
 
 // overviewLite 解析 ?lite=1（兼容 1/true 等布尔写法，大小写不敏感）。
@@ -821,10 +874,203 @@ func accountsETag(in accountsETagInput) (etag string, ok bool) {
 	return `W/"acct-` + hex.EncodeToString(sum[:]) + `"`, true
 }
 
+// ---------------------------------------------------------------------------
+// v2.5.0 Perf-3：accounts ETag/304 缓存（进程内 LRU，容量 32）
+// ---------------------------------------------------------------------------
+//
+// 背景（基线）：10k 账号下 accounts 每次请求 ~31ms，其中 ~29ms 用在「全池快照 +
+// 过滤 + 排序 + 稳定投影 hash」，而面板 5s 轮询在无运维变化时几乎全是 304。
+// 缓存语义：
+//   - key = 归一化 accountsQuery（与 ETag 输入同源；语义等价写法共享条目）；
+//   - value = {etag, poolVersion, metaVersion, builtAt}；
+//   - 请求先查缓存：pool.Version()/accountMeta 代际号都未变且未超 TTL 时，
+//     If-None-Match 命中缓存 etag → 直接 304（不读快照、不构 rows，<0.1ms）；
+//   - 未命中 304 但版本一致 → 慢路径仍要构造响应 body（200 必须给最新 now/
+//     in_flight/cool_remaining 等瞬态值，不能复用旧 body——v2.1 契约与
+//     TestAccountsETagVolatileNormalization 钉住了该行为），但可复用缓存 etag，
+//     省掉稳定投影 JSON+sha256；
+//   - 版本变化/TTL 到期 → 淘汰条目重算（内容变化 ETag 必变）。
+//   - TTL=10s 只兜底「纯时间流逝」的状态翻转（冷却到期等没有写操作可感知）。
+const (
+	// accountsETagCacheCap ETag 缓存容量：前端只轮询少量查询组合（默认页/翻页/
+	// 字段档位/筛选；多标签页 + 脚本），32 条足够，LRU 淘汰。
+	accountsETagCacheCap = 32
+	// accountsETagCacheTTL 条目最长可信时间（见上）。
+	accountsETagCacheTTL = 10 * time.Second
+)
+
+// accountsETagCacheEntry 一条 ETag 缓存（只存 ETag 与失效依据，不缓存 body：
+// 200 响应必须反映当前 now/瞬态字段，旧 body 复用会违反 v2.1 轮询契约）。
+type accountsETagCacheEntry struct {
+	etag        string
+	poolVersion uint64
+	metaVersion uint64
+	builtAt     time.Time
+}
+
+// accountsETagCacheItem list 元素（带 key 便于淘汰时同步删 map）。
+type accountsETagCacheItem struct {
+	key   string
+	entry accountsETagCacheEntry
+}
+
+// accountsETagCache 固定容量 LRU（container/list + map，并发安全）。
+type accountsETagCache struct {
+	mu sync.Mutex
+	l  *list.List
+	m  map[string]*list.Element
+}
+
+// newAccountsETagCache 构建空缓存。
+func newAccountsETagCache() *accountsETagCache {
+	return &accountsETagCache{
+		l: list.New(),
+		m: make(map[string]*list.Element, accountsETagCacheCap),
+	}
+}
+
+// lookup 版本一致且未超 TTL 时返回条目（提升为最近使用）；版本变化/TTL 到期
+// 淘汰条目并报告未命中（调用方走慢路径重算并覆盖）。
+func (c *accountsETagCache) lookup(key string, poolVersion, metaVersion uint64) (accountsETagCacheEntry, bool) {
+	if c == nil {
+		return accountsETagCacheEntry{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.m[key]
+	if !ok {
+		return accountsETagCacheEntry{}, false
+	}
+	item := el.Value.(*accountsETagCacheItem)
+	if item.entry.poolVersion != poolVersion ||
+		item.entry.metaVersion != metaVersion ||
+		time.Since(item.entry.builtAt) >= accountsETagCacheTTL {
+		c.l.Remove(el)
+		delete(c.m, key)
+		return accountsETagCacheEntry{}, false
+	}
+	c.l.MoveToFront(el)
+	return item.entry, true
+}
+
+// store 写入/覆盖条目并维护容量（超限淘汰最旧）。
+func (c *accountsETagCache) store(key string, entry accountsETagCacheEntry) {
+	if c == nil {
+		return
+	}
+	entry.builtAt = time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.m[key]; ok {
+		el.Value.(*accountsETagCacheItem).entry = entry
+		c.l.MoveToFront(el)
+		return
+	}
+	c.m[key] = c.l.PushFront(&accountsETagCacheItem{key: key, entry: entry})
+	for c.l.Len() > accountsETagCacheCap {
+		oldest := c.l.Back()
+		if oldest == nil {
+			break
+		}
+		item := oldest.Value.(*accountsETagCacheItem)
+		c.l.Remove(oldest)
+		delete(c.m, item.key)
+	}
+}
+
+// cacheKey 归一化查询的稳定缓存键（\x00 分隔，避免字段内容互相拼歧义）。
+func (q accountsQuery) cacheKey() string {
+	return strings.Join([]string{
+		strconv.Itoa(q.Page), strconv.Itoa(q.PageSize), q.Q, q.State, q.Realm,
+		q.Enterprise, q.Tag, q.Sort, q.Fields,
+	}, "\x00")
+}
+
+// accountsProjectionRow 单行投影（light 省略两个重/易变字段；full 原样返回副本）。
+func accountsProjectionRow(st pool.Status, fields string) pool.Status {
+	if fields == accountsFieldsFull {
+		return st
+	}
+	return lightStatus(st)
+}
+
+// sortAccountIndexes 按归一化排序键就地排序「快照索引」切片（v2.5.0 Perf-3：
+// 只排索引（8B/项），避免对 10k 个 527B 的 Status 全量拷贝/移动）。
+// 排序口径与旧 sortAccounts 完全一致（SliceStable + uid 兜底，保证同值输出确定、
+// ETag 稳定）：credits 降序、last_success 降序（零值最后）、cool_remaining 升序。
+func sortAccountIndexes(idxs []int, snapshot []pool.Status, sortBy string) {
+	switch sortBy {
+	case "credits":
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a, b := &snapshot[idxs[i]], &snapshot[idxs[j]]
+			if a.Credits != b.Credits {
+				return a.Credits > b.Credits
+			}
+			return a.UID < b.UID
+		})
+	case "last_success":
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a, b := &snapshot[idxs[i]], &snapshot[idxs[j]]
+			if !a.LastSuccessTime.Equal(b.LastSuccessTime) {
+				if a.LastSuccessTime.IsZero() {
+					return false
+				}
+				if b.LastSuccessTime.IsZero() {
+					return true
+				}
+				return a.LastSuccessTime.After(b.LastSuccessTime)
+			}
+			return a.UID < b.UID
+		})
+	case "cool_remaining":
+		sort.SliceStable(idxs, func(i, j int) bool {
+			a, b := &snapshot[idxs[i]], &snapshot[idxs[j]]
+			if a.CoolRemaining != b.CoolRemaining {
+				return a.CoolRemaining < b.CoolRemaining
+			}
+			return a.UID < b.UID
+		})
+	default: // uid
+		sort.SliceStable(idxs, func(i, j int) bool {
+			return snapshot[idxs[i]].UID < snapshot[idxs[j]].UID
+		})
+	}
+}
+
+// pageSliceIndexes 按 page/page_size 计算索引切片范围（语义与 pageAccounts 一致：
+// page_size<=0 = 全部（上限 accountsMaxPageSize）、超界 page 钳到末页、空结果 pages=0）。
+func pageSliceIndexes(n, page, pageSize int) (start, end, effPage, pages int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		if n == 0 {
+			return 0, 0, 1, 0
+		}
+		if n > accountsMaxPageSize {
+			return 0, accountsMaxPageSize, 1, 1
+		}
+		return 0, n, 1, 1
+	}
+	pages = (n + pageSize - 1) / pageSize
+	if pages == 0 {
+		return 0, 0, 1, 0
+	}
+	if page > pages {
+		page = pages
+	}
+	start = (page - 1) * pageSize
+	end = start + pageSize
+	if end > n {
+		end = n
+	}
+	return start, end, page, pages
+}
+
 // accounts 账号池列表（v2.1 #1）：服务端筛选/排序/分页/字段裁剪 + ETag/304。
 //
-// 数据源与 /overview 的 accounts 相同（pool.List() 快照，锁外筛选/排序/序列化），
-// 但只序列化当前页——旧接口默认行为完全不变，本接口供账号页按需拉取：
+// 数据源与 /overview 的 accounts 相同（pool.Snapshot() 缓存只读快照，锁外筛选/
+// 排序/序列化），但只序列化当前页——旧接口默认行为完全不变，本接口供账号页按需拉取：
 //
 //	GET /panel/api/accounts?page=1&page_size=100&q=&state=&realm=&enterprise=&tag=&sort=&fields=
 //
@@ -832,6 +1078,13 @@ func accountsETag(in accountsETagInput) (etag string, ok bool) {
 // 与 q/state/realm/enterprise AND；未知标签返回空 rows（200），未装配元数据存储时
 // 同样视为无匹配。ETag 输入是归一化 accountsQuery（含 tag），因此同 tag 稳定 304、
 // 不同 tag/改 meta 后 ETag 变化。
+//
+// v2.5.0 Perf-3：10k 账号下从 ~31ms 降到个位数毫秒——
+//   - 数据源用 pool.Snapshot()（缓存、uid 升序、只读）：默认 sort=uid 零排序；
+//   - 过滤只收集「快照索引」，不拷贝 527B/个的 Status；
+//   - 非 uid 排序只排 []int（8B/项），仍保持旧排序口径（SliceStable + uid 兜底）；
+//   - 当前页才做字段投影；ETag/304 走 LRU 缓存 + 池/元数据代际号校验，
+//     5s 轮询在无变化时 <1ms 直接 304（不构造 rows）。
 //
 // 响应：{"ok":true,"now":<unix秒>,"total":N,"filtered":M,"page":1,"page_size":100,
 // "pages":P,"rows":[Status...]}。now 供前端校正时钟后在本地按 until 倒计时。
@@ -841,7 +1094,28 @@ func accountsETag(in accountsETagInput) (etag string, ok bool) {
 func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	q := parseAccountsQuery(r)
+	h := w.Header()
+	h.Set("Cache-Control", accountsCacheControl)
 
+	poolVersion := p.poolVersion()
+	metaVersion := accountMetaVersionNow()
+	cacheKey := q.cacheKey()
+
+	// ---- 快速路径：池/元数据代际未变且条目未超 TTL ----
+	// If-None-Match 命中缓存 ETag → 304（不读快照、不构 rows，5s 轮询常态）。
+	// 未命中 304 时记录 cachedEtag：慢路径构造 body 后可直接复用该 ETag，
+	// 省掉稳定投影 JSON+sha256（200 的 now/瞬态字段仍取本次请求的实时值）。
+	cachedEtag := ""
+	if cached, ok := p.accountsETag.lookup(cacheKey, poolVersion, metaVersion); ok {
+		h.Set("ETag", cached.etag)
+		if ifNoneMatch(r, cached.etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		cachedEtag = cached.etag
+	}
+
+	// ---- 慢路径：快照 → 索引过滤 → 索引排序 → 分页 → 当前页投影 ----
 	// 标签筛选：一次查内存反向索引拿 uid 集合（不逐号加锁、不读盘）。
 	// q.Tag 为空时 tagUIDs 为 nil = 不筛选；有 tag 但无存储/无匹配时为空/nil map
 	// → 后续 map 取值为零值 false → 空 rows（符合「未知标签返回空」契约）。
@@ -849,41 +1123,57 @@ func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
 	if q.Tag != "" {
 		tagUIDs = p.accountMetaUIDsForTag(q.Tag)
 	}
-
-	var snapshot []pool.Status
-	if p.cfg.Pool != nil {
-		snapshot = p.cfg.Pool.List()
-	}
+	snapshot := p.poolSnapshot()
 	total := len(snapshot)
-	filtered := make([]pool.Status, 0, len(snapshot))
-	for _, st := range snapshot {
+	idxs := make([]int, 0, len(snapshot))
+	for i := range snapshot {
+		st := &snapshot[i]
 		if q.Tag != "" {
 			if _, ok := tagUIDs[st.UID]; !ok {
 				continue
 			}
 		}
-		if accountsMatch(st, q, now) {
-			filtered = append(filtered, st)
+		if accountsMatch(*st, q, now) {
+			idxs = append(idxs, i)
 		}
 	}
-	sortAccounts(filtered, q.Sort)
-	pageRows, effPage, pages := pageAccounts(filtered, q.Page, q.PageSize)
+	if q.Sort != "uid" { // 默认 uid：Snapshot 已按 uid 升序，无需排序
+		sortAccountIndexes(idxs, snapshot, q.Sort)
+	}
+	filtered := len(idxs)
+	start, end, effPage, pages := pageSliceIndexes(filtered, q.Page, q.PageSize)
 	q.Page = effPage // 生效页码（越界钳到末页 / 全部模式规范化 1）
 
-	// 先算 ETag（只序列化稳定投影）：304 命中时连响应 body 都省掉，是 5s 轮询常态。
-	// q.Page 已替换为生效页码，语义等价的越界请求（如 page=99 钳到末页）共享 ETag。
-	h := w.Header()
-	h.Set("Cache-Control", accountsCacheControl)
-	if etag, ok := accountsETag(accountsETagInput{
-		Query:    q,
-		Total:    total,
-		Filtered: len(filtered),
-		Page:     q.Page,
-		PageSize: q.PageSize,
-		Pages:    pages,
-		Rows:     accountsStableProjection(pageRows, q.Fields),
-	}); ok {
+	rows := make([]pool.Status, 0, end-start)
+	for _, idx := range idxs[start:end] {
+		rows = append(rows, accountsProjectionRow(snapshot[idx], q.Fields))
+	}
+
+	// ETag：命中未超 TTL 的缓存条目时直接复用（版本一致 → 内容必不变）；
+	// 否则序列化当前页稳定投影后 sha256。
+	etag := cachedEtag
+	if etag == "" {
+		var etagOK bool
+		etag, etagOK = accountsETag(accountsETagInput{
+			Query:    q,
+			Total:    total,
+			Filtered: filtered,
+			Page:     q.Page,
+			PageSize: q.PageSize,
+			Pages:    pages,
+			Rows:     accountsStableProjection(rows, q.Fields),
+		})
+		if !etagOK {
+			etag = ""
+		}
+	}
+	if etag != "" {
 		h.Set("ETag", etag)
+		p.accountsETag.store(cacheKey, accountsETagCacheEntry{
+			etag:        etag,
+			poolVersion: poolVersion,
+			metaVersion: metaVersion,
+		})
 		if ifNoneMatch(r, etag) {
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -894,11 +1184,11 @@ func (p *Panel) accounts(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"now":       now.Unix(),
 		"total":     total,
-		"filtered":  len(filtered),
+		"filtered":  filtered,
 		"page":      q.Page,
 		"page_size": q.PageSize,
 		"pages":     pages,
-		"rows":      accountsProjection(pageRows, q.Fields),
+		"rows":      rows,
 	})
 }
 
@@ -1719,6 +2009,36 @@ var gzipWriterPool = sync.Pool{
 	New: func() any { return gzip.NewWriter(nil) },
 }
 
+// gzipBufPool 复用响应缓冲（v2.5.0 Perf-3）：大响应（首页/账号页，几十 KB~7MB）
+// 的生产者是 json.Marshal 一次性 Write，若每次新建 bytes.Buffer 则反复扩容+GC。
+// 缓冲在 close 写出后 Reset 归还；上限保护见 releaseGzipBuffer。
+var gzipBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// gzipBufMaxKeep 归还缓冲上限：超过 1MiB 的缓冲不还池（避免极少数全量 overview
+// 的 7MB 缓冲长期常驻，把 sync.Pool 变成内存囤积点）；正常账号页 ~50-100KB 会复用。
+const gzipBufMaxKeep = 1 << 20
+
+// acquireGzipBuffer 取一个空缓冲（来自池）。
+func acquireGzipBuffer() *bytes.Buffer {
+	buf := gzipBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+// releaseGzipBuffer 归还缓冲（超上限直接丢弃，交给 GC）。
+func releaseGzipBuffer(buf *bytes.Buffer) {
+	if buf == nil {
+		return
+	}
+	if buf.Cap() > gzipBufMaxKeep {
+		return
+	}
+	buf.Reset()
+	gzipBufPool.Put(buf)
+}
+
 // acceptsGzip 解析 Accept-Encoding，是否接受 gzip（含 q=0 显式拒绝）。
 func acceptsGzip(r *http.Request) bool {
 	if r == nil {
@@ -1772,7 +2092,7 @@ func isCompressibleContentType(ct string) bool {
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	req    *http.Request
-	buf    bytes.Buffer
+	buf    *bytes.Buffer
 	status int
 	wrote  bool
 }
@@ -1790,6 +2110,9 @@ func (g *gzipResponseWriter) Write(p []byte) (int, error) {
 		g.status = http.StatusOK
 		g.wrote = true
 	}
+	if g.buf == nil { // 防御：非 ServeHTTP 路径直接构造时惰性取池
+		g.buf = acquireGzipBuffer()
+	}
 	return g.buf.Write(p)
 }
 
@@ -1800,7 +2123,12 @@ func (g *gzipResponseWriter) close(compressOK bool) {
 		status = http.StatusOK
 	}
 	h := g.Header()
-	body := g.buf.Bytes()
+	// 缓冲归还池：body 需在归还前写出/压缩完（defer close 只调一次）。
+	defer releaseGzipBuffer(g.buf)
+	var body []byte
+	if g.buf != nil {
+		body = g.buf.Bytes()
+	}
 
 	noBody := g.req != nil && g.req.Method == http.MethodHead
 	// 304/204 无实体；已编码（如上游/未来中间件自己压过）不二次压缩。

@@ -23,6 +23,7 @@ func lockViewPool(t *testing.T) *Pool {
 }
 
 // setModelCooldown 直接写模型级冷却（与 modelblocked_test.go 同法）。
+// v2.5.0：白盒直写绕过写入路径的条目计数，这里重算一次保持 O(1) 快路径计数自洽。
 func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string, auditOnly bool) {
 	p.mu.Lock()
 	e := p.byUID[uid]
@@ -30,6 +31,7 @@ func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
 	e.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason, AuditOnly: auditOnly}
+	p.refreshModelLockEntryCountLocked()
 	p.mu.Unlock()
 }
 

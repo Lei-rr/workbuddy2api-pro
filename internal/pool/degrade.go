@@ -25,6 +25,7 @@ func (p *Pool) NoteFailures(uid string) {
 		return
 	}
 	e.consecutiveFails++
+	p.bumpVersionLocked() // consecutiveFails/degradeUntil 是 Status 可见字段
 	if e.consecutiveFails < p.degradeThreshold {
 		p.dirty.Store(true)
 		return

@@ -61,7 +61,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
-		e.pruneExpiredModelCooldowns(now)
+		// 删除的模型冷却条目同步扣减 O(1) 空池快路径计数（ModelLockView）。
+		if removed := e.pruneExpiredModelCooldowns(now); removed > 0 {
+			p.delModelLockEntriesLocked(removed)
+		}
 		e.pruneExpiredModelCosts(now)
 		if !healthyOf(e) {
 			continue

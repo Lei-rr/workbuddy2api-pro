@@ -36,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.4.1-pro"
+const appVersion = "2.5.0-pro"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -55,6 +55,10 @@ func stateSibling(stateFile, name string) string {
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+
+	// v2.5.0 Perf-4：启动分段计时（进程内视角，不含 CreateProcess 开销）。
+	// 便于 perfbench / 线上日志定位「10k 账号启动慢」卡在配置、auth 解析还是池对齐。
+	startupAt := time.Now()
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -132,11 +136,13 @@ func main() {
 	log.Printf("[jobs] 全池任务 Job Runner 已启用: %s（并发上限 %d，保留 %d 条）",
 		stateSibling(cfg.StateFile, "jobs.json"), jobReg.MaxConcurrency(), cfg.Jobs.Retain)
 
+	authLoadAt := time.Now()
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	log.Printf("startup: load auths took %dms (%d accounts)", time.Since(authLoadAt).Milliseconds(), len(auths))
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
@@ -149,8 +155,10 @@ func main() {
 		_ = store.Close()
 	}()
 	p.SetStore(store)
+	poolLoadAt := time.Now()
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	log.Printf("startup: pool load+sync took %dms", time.Since(poolLoadAt).Milliseconds())
 
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 闲置补偿调优（从 config 注入，
 	// 非正值回退默认）。
@@ -474,6 +482,7 @@ func main() {
 	// 会被当成「收费未知」放行并打穿（实测：重启后 2 分钟，97 分的账号打收费
 	// 模型归零；倍率表当时尚未建立）。
 	// 已在上面以「可收敛的后台任务」登记（bgWG）：优雅停机时随 ctx 取消，不得拖住退出。
+	log.Printf("startup: ready took %dms", time.Since(startupAt).Milliseconds())
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,

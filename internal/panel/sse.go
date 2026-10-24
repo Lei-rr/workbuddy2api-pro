@@ -331,7 +331,8 @@ type sseAccountsEvent struct {
 	CreditsTotalSum int64     `json:"credits_total_sum"`
 }
 
-// buildSSESnapshot 构建轻量快照：只做 O(n) 的计数/求和工作，不构造全量账号列表。
+// buildSSESnapshot 构建轻量快照：用 pool.Summary()（O(1) 缓存）一次取齐计数/积分，
+// 不再做全池扫描（v2.5.0 Perf-3：10k 账号快照 <1ms）。
 func (p *Panel) buildSSESnapshot() sseSnapshot {
 	now := time.Now()
 	s := sseSnapshot{
@@ -343,9 +344,9 @@ func (p *Panel) buildSSESnapshot() sseSnapshot {
 		Jobs:            []sseJob{}, // 空数组（不是 null），前端无需判空
 	}
 	if p.cfg.Pool != nil {
-		total, healthy, cooling, disabled, paused, _ := p.cfg.Pool.CountsDetailedWithPaused()
-		s.Counts = sseCounts{Healthy: healthy, Cooling: cooling, Paused: paused, Disabled: disabled, Total: total}
-		s.CreditsSum, s.CreditsTotalSum = p.cfg.Pool.CreditsSums()
+		sum := p.poolSummary()
+		s.Counts = sseCounts{Healthy: sum.Healthy, Cooling: sum.Cooling, Paused: sum.Paused, Disabled: sum.Disabled, Total: sum.Total}
+		s.CreditsSum, s.CreditsTotalSum = sum.CreditsSum, sum.CreditsTotalSum
 	}
 	if p.cfg.Jobs != nil {
 		list := p.cfg.Jobs.List(10)

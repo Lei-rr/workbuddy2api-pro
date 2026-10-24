@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,15 @@ import (
 
 	"github.com/lei-rr/workbuddy2api-pro/internal/logfmt"
 )
+
+// realmMemoEntry Realm() 记忆化缓存条目（v2.5.0 Perf-4）。
+// version 与 Auth.realmVersion 对应；enabled 记录计算时的 globalEnabled，开关切换
+// 时条目自然失效（无需全局清理）。
+type realmMemoEntry struct {
+	version uint64
+	enabled bool
+	value   string
+}
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
@@ -44,6 +55,13 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// Realm() 记忆化（v2.5.0 Perf-4）：realmVersion 在影响 Realm 结果的字段变更时递增
+	//（BackfillRealm/BackfillRealmFor/SaveAtomic；Domain 由 upstream RefreshToken 在
+	// a.mu 内改写，随后调用方 SaveAtomic 兜底失效）；realmMemo 为 atomic 快照，命中时
+	// Realm() 零锁返回。旧条目靠 version 不匹配自然失效，无需清理。
+	realmVersion atomic.Uint64
+	realmMemo    atomic.Pointer[realmMemoEntry]
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -111,10 +129,38 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 // 否则 "cn"。显式 global 优先于 domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
+//
+// v2.5.0 Perf-4：记忆化快路径——命中时只做一次 atomic 读，无锁返回；未命中（首次 /
+// realm·Domain 变更后 / global 开关切换后）才在 a.mu 下重算并缓存。
+// 这是 List/overview/accounts/scheduler 的高频调用点（pprof 原 ~5.6%）。
 func (a *Auth) Realm() string {
+	if a == nil {
+		return "cn"
+	}
+	gen := globalEnabled.Load()
+	ver := a.realmVersion.Load()
+	if m := a.realmMemo.Load(); m != nil && m.version == ver && m.enabled == gen {
+		return m.value
+	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.realmLocked()
+	v := a.realmLocked()
+	a.mu.Unlock()
+	// 计算期间若发生 realm/Domain 写入（version 递增），本次结果可能已过期：只返回、
+	// 不入缓存，下一次调用重新计算。
+	if a.realmVersion.Load() == ver {
+		a.realmMemo.Store(&realmMemoEntry{version: ver, enabled: gen, value: v})
+	}
+	return v
+}
+
+// InvalidateRealmCache 使 Realm() 记忆化缓存失效。
+// 任何绕过本包直接改写 Domain（如 upstream 刷新 token 写回）的外部代码，在写完后
+// 应调用本方法；包内已知写点已自动失效（BackfillRealm/BackfillRealmFor/SaveAtomic）。
+func (a *Auth) InvalidateRealmCache() {
+	if a == nil {
+		return
+	}
+	a.realmVersion.Add(1)
 }
 
 // realmLocked Realm 的无锁内部实现：仅限**已持 a.mu** 的调用方使用（sync.Mutex 不可重入，
@@ -157,6 +203,7 @@ func (a *Auth) BackfillRealm() (bool, string) {
 	}
 	r := ResolveRealm("", a.Domain)
 	a.realm = r
+	a.realmVersion.Add(1) // Realm() 记忆化失效（v2.5.0）
 	return true, r
 }
 
@@ -185,6 +232,7 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 		return false, nil
 	}
 	a.realm = realm
+	a.realmVersion.Add(1) // Realm() 记忆化失效（v2.5.0）
 	return true, nil
 }
 
@@ -278,71 +326,73 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 //
 //	嵌套形 {"auth":{...},"account":{...}}  （插件 OAuth 输出）
 //	扁平形 {"accessToken":...,"uid":...}   （手写/旧版）
+//
+// v2.5.0 Perf-4：单次主 JSON 解析（auth 键用 RawMessage 捕获，嵌套形才二次解析该
+// 子对象）。旧实现先解到 map[string]json.RawMessage 再二次解析整份文档，LoadDir
+// 冷启动每个文件多付一次完整 JSON 解析；语义保持等价（"auth" 键存在即走嵌套形，
+// 包括 "auth": null 的边角——与原 map probe 判定一致；缺 accessToken 报错）。
 func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
+	var top struct {
+		// Auth 键存在时捕获原始子对象（null 也会得到非 nil 的 "null"），据此保持
+		// 旧实现「键存在即嵌套形」的判定。
+		Auth    json.RawMessage `json:"auth"`
+		Account struct {
+			UID          string `json:"uid"`
+			EnterpriseID string `json:"enterpriseId"`
+			Nickname     string `json:"nickname"`
+		} `json:"account"`
+		// 扁平形字段（auth/account 对象存在时以对象内字段为准）。
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Domain       string `json:"domain"`
+		Realm        string `json:"realm"`
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+		// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
+		DeviceToken string `json:"device_token"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	var a Auth
-	if _, nested := probe["auth"]; nested {
+	if top.Auth != nil {
 		var n struct {
-			Auth struct {
-				AccessToken  string `json:"accessToken"`
-				RefreshToken string `json:"refreshToken"`
-				ExpiresAt    int64  `json:"expiresAt"`
-				Domain       string `json:"domain"`
-				Realm        string `json:"realm"`
-			} `json:"auth"`
-			Account struct {
-				UID          string `json:"uid"`
-				EnterpriseID string `json:"enterpriseId"`
-				Nickname     string `json:"nickname"`
-			} `json:"account"`
-			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
-			DeviceToken string `json:"device_token"`
-		}
-		if err := json.Unmarshal(raw, &n); err != nil {
-			return nil, fmt.Errorf("storage_parse_error: %w", err)
-		}
-		a = Auth{
-			AccessToken:  n.Auth.AccessToken,
-			RefreshToken: n.Auth.RefreshToken,
-			ExpiresAt:    n.Auth.ExpiresAt,
-			Domain:       n.Auth.Domain,
-			realm:        n.Auth.Realm,
-			UID:          n.Account.UID,
-			EnterpriseID: n.Account.EnterpriseID,
-			Nickname:     n.Account.Nickname,
-			DeviceToken:  n.DeviceToken,
-		}
-	} else {
-		var f struct {
 			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
 			ExpiresAt    int64  `json:"expiresAt"`
 			Domain       string `json:"domain"`
 			Realm        string `json:"realm"`
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-			DeviceToken  string `json:"device_token"`
 		}
-		if err := json.Unmarshal(raw, &f); err != nil {
+		if err := json.Unmarshal(top.Auth, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
 		}
 		a = Auth{
-			AccessToken:  f.AccessToken,
-			RefreshToken: f.RefreshToken,
-			ExpiresAt:    f.ExpiresAt,
-			Domain:       f.Domain,
-			realm:        f.Realm,
-			UID:          f.UID,
-			EnterpriseID: f.EnterpriseID,
-			Nickname:     f.Nickname,
-			DeviceToken:  f.DeviceToken,
+			AccessToken:  n.AccessToken,
+			RefreshToken: n.RefreshToken,
+			ExpiresAt:    n.ExpiresAt,
+			Domain:       n.Domain,
+			realm:        n.Realm,
+			UID:          top.Account.UID,
+			EnterpriseID: top.Account.EnterpriseID,
+			Nickname:     top.Account.Nickname,
+			DeviceToken:  top.DeviceToken,
+		}
+	} else {
+		a = Auth{
+			AccessToken:  top.AccessToken,
+			RefreshToken: top.RefreshToken,
+			ExpiresAt:    top.ExpiresAt,
+			Domain:       top.Domain,
+			realm:        top.Realm,
+			UID:          top.UID,
+			EnterpriseID: top.EnterpriseID,
+			Nickname:     top.Nickname,
+			DeviceToken:  top.DeviceToken,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -357,6 +407,9 @@ func Parse(raw []byte) (*Auth, error) {
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 外部代码（upstream.RefreshToken）会在 a.mu 内直接改写 Domain；此处统一让 Realm()
+	// 记忆化失效，确保刷新后不会继续用旧域判定（v2.5.0 Perf-4）。
+	a.realmVersion.Add(1)
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}
@@ -402,34 +455,105 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
+// loadDirWorkers 并行解析的 worker 数（包级 var 便于测试覆盖）。
+// 默认 min(16, NumCPU*2)：启动是「读文件（I/O）+ JSON 解析（CPU）」混合负载，2×CPU
+// 足够打满；上限 16 避免超大机器上启动反而被 goroutine 调度/磁盘寻道拖慢。
+var loadDirWorkers = defaultLoadDirWorkers()
+
+// defaultLoadDirWorkers 计算默认并行度。
+func defaultLoadDirWorkers() int {
+	n := runtime.NumCPU() * 2
+	if n > 16 {
+		n = 16
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// loadDirResult 单文件并行解析结果（下标与 files 对齐，保证收尾顺序确定）。
+type loadDirResult struct {
+	file string
+	auth *Auth
+	err  error
+}
+
+// readAndParseAuthFile 读取并解析单个 auth 文件（并行 worker 的工作单元）。
+func readAndParseAuthFile(file string) loadDirResult {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return loadDirResult{file: file, err: err}
+	}
+	a, err := Parse(raw)
+	if err != nil {
+		return loadDirResult{file: file, err: err}
+	}
+	return loadDirResult{file: file, auth: a}
+}
+
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
+//
+// v2.5.0 Perf-4：文件级并行（读文件 + JSON 解析是 10k 冷启动的主要成本）。结果按 uid
+// 稳定排序返回（确定性）；重复 UID 告警、空 realm 存量回填（SaveAtomic 写盘）仍在
+// 串行收尾阶段按文件名顺序执行，语义与并行化前完全一致。
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
 		return nil, err
 	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	// 1) 并行读取+解析（文件很少或 worker=1 时直接串行，避免无谓 goroutine）。
+	results := make([]loadDirResult, len(files))
+	workers := loadDirWorkers
+	if workers > len(files) {
+		workers = len(files)
+	}
+	if workers <= 1 {
+		for i, f := range files {
+			results[i] = readAndParseAuthFile(f)
+		}
+	} else {
+		var wg sync.WaitGroup
+		jobs := make(chan int)
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					results[i] = readAndParseAuthFile(files[i])
+				}
+			}()
+		}
+		for i := range files {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+
+	// 2) 串行收尾（与原实现同顺序/同语义）：跳过损坏文件、重复 UID 告警、realm 回填。
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
-	var out []*Auth
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
-		if err != nil {
-			continue
+	out := make([]*Auth, 0, len(files))
+	for _, r := range results {
+		if r.err != nil || r.auth == nil {
+			continue // 读失败/解析失败：沿用历史"静默跳过"，不阻断启动
 		}
-		a, err := Parse(raw)
-		if err != nil {
-			continue
-		}
-		a.FilePath = f
+		a := r.auth
+		a.FilePath = r.file
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
-				logfmt.Label(a.UID, a.Nickname), prev, f)
+				logfmt.Label(a.UID, a.Nickname), prev, r.file)
 		}
-		seenUID[a.UID] = f
+		seenUID[a.UID] = r.file
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
@@ -441,5 +565,8 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 		out = append(out, a)
 	}
+
+	// 3) 稳定排序：返回顺序与文件遍历顺序解耦、结果确定；UID 相同保持文件名顺序。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out, nil
 }

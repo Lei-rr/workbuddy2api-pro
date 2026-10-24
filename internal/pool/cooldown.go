@@ -17,6 +17,7 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 		e.credits = credits
 		e.creditsTotal = total
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -43,6 +44,9 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	if !changed {
 		return false
 	}
+	// 昵称是 Status/Snapshot 的可见字段：内存已改即递增内容代际（即使落盘失败，
+	// 本进程读路径已看到新昵称，不能出现「内容变了但 Version 不变」）。
+	p.version.Add(1)
 	if err := a.SaveAtomic(); err != nil {
 		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
 		return false
@@ -60,6 +64,7 @@ func (p *Pool) NoteCheckinDone(uid string) {
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
 			p.dirty.Store(true)
+			p.bumpVersionLocked()
 		}
 	}
 }
@@ -121,6 +126,7 @@ func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 	e.creditsEarliestRemaining = earliestRemaining
 	e.expiryBuckets = buckets
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
 // SetCreditsDetailed 旧入口：只有聚合余额与最早一批，没有按日批次。
@@ -177,6 +183,7 @@ func (p *Pool) ClearExpiringSnapshots() {
 		e.creditsEarliestRemaining = 0
 	}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolHard 余额耗尽 / CoolSoft 固定短冷却）。
@@ -196,8 +203,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.reason = reason
 		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
 		// 模型豁免泄漏到账号级冷却上；AuditOnly 条目不影响路由，保留展示。
-		clearRoutingModelCooldownsLocked(e)
+		p.clearRoutingModelCooldownsLocked(e)
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -223,6 +231,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
+			if _, exists := e.modelCooldowns[model]; !exists {
+				p.addModelLockEntriesLocked(1)
+			}
 			e.modelCooldowns[model] = modelCooldown{
 				Until:   p.cappedSoftUntilLocked(now, resetAt),
 				ResetAt: resetAt,
@@ -238,9 +249,10 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
-			clearRoutingModelCooldownsLocked(e)
+			p.clearRoutingModelCooldownsLocked(e)
 		}
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -268,25 +280,32 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = make(map[string]modelCooldown)
 	}
+	if _, exists := e.modelCooldowns[model]; !exists {
+		p.addModelLockEntriesLocked(1)
+	}
 	e.modelCooldowns[model] = modelCooldown{
 		Until:     until,
 		Reason:    reason,
 		AuditOnly: true,
 	}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
 // clearRoutingModelCooldownsLocked 删除参与选号豁免的模型冷却，保留 AuditOnly 台账。
-// 调用方必须已持有 p.mu 写锁。
-func clearRoutingModelCooldownsLocked(e *entry) {
+// 同步维护模型锁条目计数（O(1) 空池快路径依赖它自洽）。调用方必须已持有 p.mu 写锁。
+func (p *Pool) clearRoutingModelCooldownsLocked(e *entry) {
+	removed := 0
 	for model, mc := range e.modelCooldowns {
 		if !mc.AuditOnly {
 			delete(e.modelCooldowns, model)
+			removed++
 		}
 	}
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
+	p.delModelLockEntriesLocked(removed)
 }
 
 // modelBlock TTL 常量（11102 负缓存退避）：
@@ -332,12 +351,16 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
+	if _, exists := e.modelCooldowns[model]; !exists {
+		p.addModelLockEntriesLocked(1)
+	}
 	e.modelCooldowns[model] = modelCooldown{
 		Until:  now.Add(ttl),
 		Reason: reason,
 		Hits:   hits,
 	}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
 // BlockModelClear 清除 (账号, 模型) 的确定性模型拒绝负缓存（11102/11158；该模型
@@ -358,10 +381,12 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	delete(e.modelCooldowns, model)
+	p.delModelLockEntriesLocked(1)
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
@@ -462,8 +487,9 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
-		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
+		p.clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 

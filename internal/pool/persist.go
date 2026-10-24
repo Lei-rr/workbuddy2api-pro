@@ -151,6 +151,8 @@ func (p *Pool) load() {
 	}
 	p.applyAccountsLocked(sf.Accounts)
 	p.restoreSchedulingLocked(sf.Scheduling)
+	p.bumpVersionLocked()
+	p.bumpMembershipLocked()
 }
 
 // quarantineCorrupt 把损坏的 state.json 改名隔离为 state.json.corrupt-<UnixNano>。
@@ -182,6 +184,8 @@ func (p *Pool) loadBackup(reason string) {
 	}
 	p.applyAccountsLocked(sf.Accounts)
 	p.restoreSchedulingLocked(sf.Scheduling)
+	p.bumpVersionLocked()
+	p.bumpMembershipLocked()
 	p.dirty.Store(true)
 	log.Printf("WARN: pool: 已从 state.json.bak 恢复 %d 个账号（%s）；主文件将按恢复后状态重写",
 		len(sf.Accounts), reason)
@@ -279,6 +283,9 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		p.byUID[uid] = e
+		if n := len(e.modelCooldowns); n > 0 {
+			p.addModelLockEntriesLocked(n) // 模型锁条目计数随 state 恢复
+		}
 	}
 }
 
@@ -293,8 +300,11 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	p.modelLockEntries.Store(0) // 旧条目计数随状态整体替换归零，由 applyAccountsLocked 重建
 	p.applyAccountsLocked(s.Accounts)
 	p.restoreSchedulingLocked(s.Scheduling)
+	p.bumpVersionLocked()
+	p.bumpMembershipLocked()
 }
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {

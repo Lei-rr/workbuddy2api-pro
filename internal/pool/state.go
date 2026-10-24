@@ -17,6 +17,7 @@ func (p *Pool) Disable(uid, reason string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		p.disableLocked(e, reason)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -37,6 +38,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails++
+	p.bumpVersionLocked()
 	if e.sessionDeadFails < sessionDeadThreshold {
 		return false
 	}
@@ -52,6 +54,7 @@ func (p *Pool) ClearSessionDead(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
+		p.bumpVersionLocked()
 	}
 }
 
@@ -67,6 +70,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.reason = ""
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -87,12 +91,13 @@ func (p *Pool) Revive(uid string) bool {
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
+	p.dropModelLockEntriesLocked(e) // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 	return true
 }
 
@@ -108,6 +113,7 @@ func (p *Pool) Pause(uid string) bool {
 		return false
 	}
 	p.pauseLocked(e)
+	p.bumpVersionLocked()
 	return true
 }
 
@@ -120,6 +126,7 @@ func (p *Pool) Resume(uid string) bool {
 		return false
 	}
 	p.resumeLocked(e)
+	p.bumpVersionLocked()
 	return true
 }
 
@@ -146,6 +153,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		e.creditsEarliestRemaining = 0
 		e.expiryBuckets = nil
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -159,6 +167,7 @@ func (p *Pool) NoteError(uid string) {
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -185,6 +194,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
+		p.bumpVersionLocked()
 	}
 }
 
@@ -256,6 +266,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 	}
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
+	p.bumpVersionLocked()
 }
 
 // deductExpiryLocked 按 FEFO 近似扣减到期快照：先从最早的自然日桶扣，扣穿再顺延。
@@ -352,9 +363,10 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 		usage.LastTokensPerSecond = nil
 	}
 	p.dirty.Store(true)
+	p.bumpVersionLocked()
 }
 
-// Status 查询单账号状态。
+// Status 查询单账号状态（O(1)：单号 fillStatus，不触发全池快照）。
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -362,7 +374,10 @@ func (p *Pool) Status(uid string) (Status, bool) {
 	if !ok {
 		return Status{}, false
 	}
-	return p.statusOf(uid, e), true
+	now := time.Now()
+	var st Status
+	p.fillStatus(&st, uid, e, now, now.Format("2006-01-02"))
+	return st, true
 }
 
 // AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
@@ -590,92 +605,14 @@ func (p *Pool) ServableForRealm(realm string) bool {
 }
 
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
+//
+// 语义（v2.5.0 保持旧契约）：每次返回**新的拷贝**，调用方可自由排序/修改。
+// 高频只读消费（panel/SSE）请改用 Snapshot()：缓存快照、命中零分配、返回切片
+// 只读；二者内容一致（Snapshot 的 InFlight/倒计时等时间敏感字段最多 500ms 陈旧）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	out := make([]Status, 0, len(uids))
-	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
-	}
-	return out
-}
-func (p *Pool) statusOf(uid string, e *entry) Status {
-	now := time.Now()
-	st := Status{
-		UID: uid,
-		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
-		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
-		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
-		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
-		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
-		Realm:                    e.a.Realm(),
-		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.Nickname,
-		Credits:                  e.credits,
-		CreditsTotal:             e.creditsTotal,
-		CreditsExpiring:          e.creditsExpiring,
-		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
-		CreditsEarliestRemaining: e.creditsEarliestRemaining,
-		// 拷贝一份：List 返回后 JSON 序列化在锁外进行，不能与 NoteModelCost 的
-		// 原地扣减共享底层数组（数据竞争）。
-		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
-	}
-	// reason 仅在冷却/禁用中透出（issue #171）：软冷却按 until 到期恢复，
-	// 但 until/coolKind/reason 字段按设计不主动清理（NoteSuccess 注释：
-	// 「不碰 until/coolKind，那些是即时冷却，各自到期」）。无条件透出会让
-	// 面板把过期数天的「429 rate limit」与「可用」并排展示，运维无法判断
-	// 是历史残留还是当前限流。禁用原因仍由 DisabledReason 透出。
-	if st.Cooling || st.Disabled {
-		st.Reason = e.reason
-	}
-	if st.Disabled {
-		// 禁用账号透出禁用原因（运维看不到为什么死）。
-		st.DisabledReason = e.reason
-	}
-	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
-		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
-		remaining := int64(0)
-		if now.Before(e.until) {
-			if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
-				remaining = r
-			}
-		}
-		if now.Before(e.breakerUntil) {
-			if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
-				remaining = r
-				st.CoolKind = "breaker"
-			}
-		}
-		st.CoolRemaining = remaining
-		if st.CoolKind == "" {
-			st.CoolKind = e.coolKind.String()
-		}
-	}
-	return st
+	return p.buildStatusesLocked()
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
@@ -684,6 +621,16 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
 	if len(e.modelCost) == 0 {
 		return nil
+	}
+	// 单模型快路径（大池绝大多账号只有 1-2 个模型观测）：省一次排序 + 一次
+	// models 切片分配，只分配输出行本身。
+	if len(e.modelCost) == 1 {
+		for m, mc := range e.modelCost {
+			if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+				return nil
+			}
+			return []ModelCostStatus{{Model: m, CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}}
+		}
 	}
 	models := make([]string, 0, len(e.modelCost))
 	for m, mc := range e.modelCost {
@@ -719,6 +666,25 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
 	if len(e.modelCooldowns) == 0 {
 		return nil
+	}
+	// 单模型快路径：免排序 + 免 models 切片分配（只分配输出行）。
+	// 注意：与 ModelLockView 不同，Status.RateLimitedModels 会展示 AuditOnly 台账
+	//（只审计不拦路由的 6004 也供运维看），故这里不跳过 AuditOnly，只按 Until 过滤。
+	if len(e.modelCooldowns) == 1 {
+		for m, mc := range e.modelCooldowns {
+			if mc.Until.IsZero() || !now.Before(mc.Until) {
+				return nil
+			}
+			kind := "rate_limit"
+			if strings.HasPrefix(mc.Reason, "11102") {
+				kind = "model_unavailable"
+			}
+			row := RateLimitedModel{Model: m, Kind: kind, Until: mc.Until, Reason: mc.Reason}
+			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+				row.ResetAt = mc.ResetAt
+			}
+			return []RateLimitedModel{row}
+		}
 	}
 	// 先排序模型名，保证输出稳定（map 遍历无序）。
 	models := make([]string, 0, len(e.modelCooldowns))

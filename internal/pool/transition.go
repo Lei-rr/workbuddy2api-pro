@@ -29,14 +29,14 @@ package pool
 import "time"
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
-// reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
-// 调用方必须已持有 p.mu。
-func (e *entry) clearCoolingLocked() {
+// reason 一并清空；同步维护模型锁条目计数（见 cache.go）。熔断器
+// （fails/retryCount/breakerUntil）不属冷却域，不动。调用方必须已持有 p.mu。
+func (p *Pool) clearCoolingLocked(e *entry) {
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+	p.dropModelLockEntriesLocked(e) // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
@@ -49,7 +49,7 @@ func (e *entry) clearCoolingLocked() {
 // 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
 // 熔断观测仍有效，不应被禁用覆盖。
 func (p *Pool) disableLocked(e *entry, reason string) {
-	e.clearCoolingLocked()
+	p.clearCoolingLocked(e)
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason

@@ -87,6 +87,23 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// ---- v2.5.0 性能缓存/代际（Perf-2，实现见 cache.go）----
+	// version 内容/状态代际：任何会改变 Snapshot/List/Status 内容的写操作递增
+	//（在途计数除外，理由见 cache.go 文件头）；panel 用它做缓存/ETag 失效。
+	version atomic.Uint64
+	// membership 账号集合代际：仅 Add/Remove/SyncToDir/state 恢复时递增，
+	// 用于 sortedCache（uid 排序只做一次）。
+	membership atomic.Uint64
+	// modelLockEntries 模型级冷却条目总数（O(1) 空池快路径；写入路径维护）。
+	modelLockEntries atomic.Int64
+	// 各读路径缓存（atomic.Pointer 读多写少，无锁命中）。
+	sortedCache   atomic.Pointer[sortedEntriesCache]
+	snapshotCache atomic.Pointer[snapshotCacheEntry]
+	summaryCache  atomic.Pointer[summaryCacheEntry]
+	availCache    atomic.Pointer[availCacheEntry]
+	// snapshotBuildMu Snapshot 重建单飞（防并发缓存击穿）。
+	snapshotBuildMu sync.Mutex
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -356,28 +373,41 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// v2.5.0：账号集合/凭证变化 → Version++（集合变化同时 Membership++）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.upsertLocked(a)
+	if p.upsertLocked(a) {
+		p.bumpMembershipLocked()
+	}
+	p.bumpVersionLocked()
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
+// v2.5.0：集合有增删 → Version++/Membership++（一次操作只递增一次）。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
+	changedMembership := false
 	for _, a := range auths {
 		seen[a.UID] = true
-		p.upsertLocked(a)
+		if p.upsertLocked(a) {
+			changedMembership = true
+		}
 	}
 	changed := false
 	for uid := range p.byUID {
 		if !seen[uid] {
 			delete(p.byUID, uid)
 			changed = true
+			changedMembership = true
 		}
+	}
+	p.bumpVersionLocked()
+	if changedMembership {
+		p.bumpMembershipLocked()
 	}
 	if changed {
 		p.saveLocked()
@@ -395,19 +425,23 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		return nil
 	}
 	delete(p.byUID, uid)
+	p.bumpMembershipLocked()
+	p.bumpVersionLocked()
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.a
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
-// 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(a *auth.Auth) {
+// 返回 true 表示新增了账号（账号集合变化）。调用方必须已持有 p.mu；Add 与
+// SyncToDir 共用此 upsert 逻辑（集合/版本代际由调用方递增）。
+func (p *Pool) upsertLocked(a *auth.Auth) (added bool) {
 	if e, ok := p.byUID[a.UID]; ok {
 		e.a = a // 保留 credits/cooling 状态
-		return
+		return false
 	}
 	p.byUID[a.UID] = &entry{a: a}
+	return true
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

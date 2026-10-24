@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -52,6 +53,14 @@ const (
 	accountMetaMaxTags      = 10
 	accountMetaMaxTagRunes  = 32
 )
+
+// accountMetaSeq 账号元数据的内存代际号（v2.5.0 Perf-3）：每次元数据变更
+// （PUT/DELETE 落盘成功后的标签索引重建）自增，供 /panel/api/accounts 的 ETag
+// 缓存判断「tag 过滤结果可能已变化」。进程内计数，重启归零不影响正确性。
+var accountMetaSeq atomic.Uint64
+
+// accountMetaVersionNow 返回当前元数据代际号（无锁；ETag 缓存键/失效判断用）。
+func accountMetaVersionNow() uint64 { return accountMetaSeq.Load() }
 
 // accountMetaRecord 单个账号的持久化记录（磁盘格式；空值省略让 JSON 紧凑）。
 type accountMetaRecord struct {
@@ -193,6 +202,9 @@ func (s *accountMetaStore) rebuildTagIndexLocked() {
 			}
 		}
 	}
+	// 每次索引重建都视为元数据内容发生变更（含 note-only 变更，属保守过度失效）：
+	// 自增代际号，让 accounts 的 ETag 缓存下次请求重新计算。
+	accountMetaSeq.Add(1)
 }
 
 // quarantineLocked 把损坏文件改名隔离为 <name>.corrupt-<unixnano>，保留现场供人工恢复，
