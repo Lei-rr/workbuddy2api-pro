@@ -11,8 +11,8 @@ import (
 	"testing"
 )
 
-// bndCreditNode 把脚本写到临时文件并用 node 执行（工作目录 = 包目录，读 app.js），
-// 返回去掉首尾空白的 stdout；无 node 时跳过。
+// bndCreditNode 把脚本写到临时文件并用 node 执行（v2.6.1 起 app.js 由 web/*.js
+// 拼接，feAppFile 提供临时单文件路径），返回去掉首尾空白的 stdout；无 node 时跳过。
 func bndCreditNode(t *testing.T, script string) string {
 	t.Helper()
 	node, err := exec.LookPath("node")
@@ -27,7 +27,7 @@ func bndCreditNode(t *testing.T, script string) string {
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("credit history adversarial node test failed: %v\n%s", err, out)
 	}

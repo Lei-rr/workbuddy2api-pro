@@ -1,12 +1,11 @@
-// helpers.go v2.6.0 重构批：跨 handler 的公共小工具（账号级有界扇出/限长
-// JSON 解码/limit 解析/账号查找）。只做行为等价的抽取与收敛，不放业务逻辑；
-// 业务 handler 仍在各自域文件（panel.go/tasks.go/autotask.go/taskcenter.go...）。
+// helpers.go v2.6.0/2.6.1 重构批：跨 handler 的公共小工具（账号级有界扇出/
+// limit 解析/账号查找）。只做行为等价的抽取与收敛，不放业务逻辑；
+// 业务 handler 在各自域文件（accounts.go/accounts_ops.go/tasks.go/...），
+// JSON 响应/解码统一在 httpjson.go。
 package panel
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -29,9 +28,6 @@ const (
 	panelFanOutDefaultConcurrency = 8
 	// panelFanOutMaxConcurrency 配置值上限（防误配置成 1 万）。
 	panelFanOutMaxConcurrency = 64
-	// panelJSONBodyMax 常规面板 POST JSON body 上限（1MB）：tasks/autotask/
-	// taskcenter 等小 body 接口共用；import 走单独的 32MB 上限。
-	panelJSONBodyMax = 1 << 20
 )
 
 // fanOutConcurrency 当前生效的账号级扇出并发：配置 >0 用之（clamp 1..64），
@@ -89,29 +85,6 @@ func fanOutAccounts(ctx context.Context, n, concurrency int, fn func(ctx context
 		}()
 	}
 	wg.Wait()
-}
-
-// readJSONBody 限长解码 JSON body：超限 → 413，格式错误 → 400；成功返回 true。
-// 面板所有 POST JSON body 统一走这里（v2.6.0 P1：补齐输入体上限 + 错误文案一致）。
-func readJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, v any) bool {
-	if r == nil || r.Body == nil {
-		writeErr(w, http.StatusBadRequest, "missing request body")
-		return false
-	}
-	if maxBytes <= 0 {
-		maxBytes = panelJSONBodyMax
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return false
-		}
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-		return false
-	}
-	return true
 }
 
 // parseLimit 解析 ?limit（默认 def、上限 max、非法/<=0 回落 def；容忍首尾空白）。

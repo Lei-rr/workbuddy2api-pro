@@ -40,7 +40,8 @@ func TestPanelAccountPoolTabs(t *testing.T) {
 		t.Errorf("tab 顺序应为 账号池→模型锁池→积分到期，got list=%d models=%d expiry=%d", iList, iModels, iExpiry)
 	}
 
-	js, err := os.ReadFile("app.js")
+	// v2.6.1：app.js 由 web/*.js 拼接后嵌入，测试统一从拼接源码取。
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}

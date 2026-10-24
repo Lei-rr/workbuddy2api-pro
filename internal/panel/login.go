@@ -335,3 +335,13 @@ func (p *Panel) loginRegions(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 }
+
+// loginTTL 授权 URL 的最长有效期：超时的 state 直接回收，
+// 防止"开了添加账号弹窗就走开"的会话永久滞留。
+const loginTTL = 15 * time.Minute
+
+// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
+type loginSession struct {
+	created time.Time
+	realm   string // "cn" / "global"，缺省 cn
+}

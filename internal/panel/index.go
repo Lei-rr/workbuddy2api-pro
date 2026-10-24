@@ -2,7 +2,8 @@
 //
 // 资源经 go:embed 打进二进制（随服务部署，无外部构建步骤）：
 //   - index.html  页面骨架
-//   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
+//   - web/*.js    全部前端逻辑的源码模块（v2.6.1：按业务拆分，启动时按文件名排序
+//     拼接为单个 app.js 提供给浏览器——URL/加载顺序/CSP/缓存行为完全不变）
 //   - mobile.css  手机端（≤760px）适配样式（本仓库自有，上游不维护 → 同步上游不冲突）
 //   - mobile.js   手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
 //
@@ -16,18 +17,49 @@
 package panel
 
 import (
+	"bytes"
 	"crypto/sha256"
-	_ "embed"
+	"embed"
 	"encoding/hex"
+	"io/fs"
 	"net/http"
+	"sort"
 	"strings"
 )
 
 //go:embed index.html
 var indexHTML []byte
 
-//go:embed app.js
-var appJS []byte
+// appJSSources 是前端逻辑的源码模块（internal/panel/web/*.js）。模块本身不直接对外，
+// 只用于在包初始化时拼接出单一 app.js；模块边界即原文件的业务分区。
+//
+//go:embed web/*.js
+var appJSSources embed.FS
+
+// appJS 把 web/*.js 按文件名字典序拼成单一前端脚本，作为 /panel/app.js 的响应体。
+// 顺序有意义：模块间共享全局状态，必须保持拆分前的原始执行顺序（文件名前缀保证）。
+var appJS = concatAppJSSources()
+
+// concatAppJSSources 拼接前端模块；内容来自 go:embed（编译期固定），失败属构建错误。
+func concatAppJSSources() []byte {
+	names, err := fs.Glob(appJSSources, "web/*.js")
+	if err != nil {
+		panic("panel: 读取 web/*.js 模块失败: " + err.Error())
+	}
+	if len(names) == 0 {
+		panic("panel: web/*.js 模块为空")
+	}
+	sort.Strings(names)
+	var buf bytes.Buffer
+	for _, name := range names {
+		b, err := fs.ReadFile(appJSSources, name)
+		if err != nil {
+			panic("panel: 读取 " + name + " 失败: " + err.Error())
+		}
+		buf.Write(b)
+	}
+	return buf.Bytes()
+}
 
 //go:embed mobile.css
 var mobileCSS []byte

@@ -58,8 +58,39 @@ jobs:
       - run: go vet ./...
       # 前端工程化检查（v2.3.1 #18）：JS 语法、DOM id 双向契约、API 路径白名单、体积预算。
       - run: node scripts/panel_frontend_check.mjs
-      # panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行 node harness
-      - run: go test ./...
+      # 覆盖率统计（v2.6.1）：test 仍是门禁；coverprofile 只用于 job summary 展示（非门禁）。
+      - name: go test（含覆盖率 profile，门禁）
+        run: go test -coverprofile=coverage.out ./...
+      # job summary 展示总覆盖率（v2.6.1，仅可见、不参与判定）。
+      - name: coverage summary（非门禁）
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            {
+              echo "## Coverage（非门禁）"
+              echo '```'
+              go tool cover -func=coverage.out | tail -n 1 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "coverage.out 未生成（测试在写 profile 前已失败）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  race:
+    # 并发正确性门禁（v2.6.1）：-race 需要 cgo（ubuntu runner 自带 gcc）。
+    # 与 test 并行；publish 依赖它 → race 红则不发布 Release（失败即红）。
+    # Windows 本地无法跑 -race（无 cgo），以 CI 结果为准；panel 需 node harness 未纳入。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test -race（关键并发包）
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./internal/pool ./internal/session ./internal/scheduler ./internal/server ./cmd/server
 
   build:
     needs: test
@@ -125,7 +156,8 @@ jobs:
 
   # 仅 tag 触发：校验 tag == 源码版本（-ci 演练 tag 豁免）→ 汇总资产 → 建 Release
   publish:
-    needs: build
+    # race 也作为发布门禁（v2.6.1）：并发回归不允许带病发版。
+    needs: [build, race]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

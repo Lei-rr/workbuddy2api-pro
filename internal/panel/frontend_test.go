@@ -7,13 +7,83 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestAppJSSyntax app.js / mobile.js 必须能通过 JS 解析器语法校验。
+// appJSSource 返回 /panel/app.js 的实际响应体：internal/panel/web/*.js 按文件名排序
+// 拼接（v2.6.1 模块化，见 index.go）。前端切片测试统一从 appJS 取源码，不再读取文件。
+func appJSSource() string { return string(appJS) }
+
+// appJSReadFile 兼容旧测试的 os.ReadFile("app.js") 调用（返回拼接源码，err 恒 nil）。
+func appJSReadFile() ([]byte, error) { return []byte(appJSSource()), nil }
+
+// feAppFile 把拼接源码写到测试临时目录，返回 node 可读路径，替代包目录下的 app.js。
+// 每个测试独立临时文件：并发/重跑互不影响（源码约 280KB，写入成本可忽略）。
+func feAppFile(t *testing.T) string {
+	t.Helper()
+	fp := filepath.Join(t.TempDir(), "app.js")
+	if err := os.WriteFile(fp, appJS, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fp
+}
+
+// webModuleNames 返回 web 目录下的模块文件名（ReadDir 已按文件名排序，与拼接顺序一致）。
+func webModuleNames(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("web")
+	if err != nil {
+		t.Fatalf("读取 web 模块目录失败：%v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".js") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestPanelAppJSModulesReconstruct 校验「web/*.js 源码 → go:embed → 拼接 → /panel/app.js」链路：
+//  1. 拼接结果必须与嵌入的 appJS 完全一致（模块与二进制不漂移）；
+//  2. 浏览器实际 GET /panel/app.js 拿到的字节必须等于 appJS（零浏览器变化）。
+func TestPanelAppJSModulesReconstruct(t *testing.T) {
+	names := webModuleNames(t)
+	if len(names) < 10 {
+		t.Fatalf("web 模块只有 %d 个（v2.6.1 拆分后应 ≥10）", len(names))
+	}
+	var buf bytes.Buffer
+	for _, name := range names {
+		b, err := os.ReadFile(filepath.Join("web", name))
+		if err != nil {
+			t.Fatalf("读取模块 %s 失败：%v", name, err)
+		}
+		buf.Write(b)
+	}
+	if !bytes.Equal(buf.Bytes(), appJS) {
+		t.Fatalf("模块拼接与嵌入 appJS 不一致：concat=%d bytes, appJS=%d bytes", buf.Len(), len(appJS))
+	}
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/app.js", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET /panel/app.js 状态码 = %d", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), appJS) {
+		t.Fatalf("/panel/app.js 响应体 %d bytes 与嵌入 appJS %d bytes 不一致", rec.Body.Len(), len(appJS))
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/javascript; charset=utf-8" {
+		t.Fatalf("/panel/app.js Content-Type = %q", got)
+	}
+}
+
+// TestAppJSSyntax app.js（web/*.js 拼接后 go:embed）与 mobile.js 必须通过 JS 解析器校验。
 //
 // 为什么需要：两者都是 go:embed 进二进制的静态资源，Go 编译器不检查其内容——
 // 一次对象字面量键名未加引号（Model_chat_GLM5.2 被解析成属性访问 + 数字字面量）
@@ -24,15 +94,19 @@ func TestAppJSSyntax(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; skipping JS syntax check")
 	}
-	for _, name := range []string{"app.js", "mobile.js"} {
-		path, err := filepath.Abs(name)
+	// 逐模块检查（失败信息直接指到 web/xxx.js），再检查按序拼接后的完整 app.js。
+	for _, name := range webModuleNames(t) {
+		p := filepath.Join("web", name)
+		out, err := exec.Command(node, "--check", p).CombinedOutput()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s syntax error:\n%s", p, out)
 		}
-		out, err := exec.Command(node, "--check", path).CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s syntax error:\n%s", name, out)
-		}
+	}
+	if out, err := exec.Command(node, "--check", feAppFile(t)).CombinedOutput(); err != nil {
+		t.Fatalf("app.js（web/*.js 拼接）syntax error:\n%s", out)
+	}
+	if out, err := exec.Command(node, "--check", "mobile.js").CombinedOutput(); err != nil {
+		t.Fatalf("mobile.js syntax error:\n%s", out)
 	}
 }
 
@@ -119,7 +193,7 @@ try {
 	}
 	hf.Close()
 	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
-		cmd := exec.Command(node, hf.Name(), "app.js")
+		cmd := exec.Command(node, hf.Name(), feAppFile(t))
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
 		out, err := cmd.CombinedOutput()
@@ -169,7 +243,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("credit formatting node test failed: %v\n%s", err, out)
 	}
@@ -213,7 +287,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("rate-limit formatting node test failed: %v\n%s", err, out)
 	}
@@ -264,7 +338,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("request log formatting node test failed: %v\n%s", err, out)
 	}
@@ -321,7 +395,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
 	}
@@ -367,7 +441,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("request filter node test failed: %v\n%s", err, out)
 	}
@@ -430,7 +504,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("model filter node test failed: %v\n%s", err, out)
 	}
@@ -499,7 +573,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("model availability node test failed: %v\n%s", err, out)
 	}
@@ -560,7 +634,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("usage chart node test failed: %v\n%s", err, out)
 	}
@@ -636,7 +710,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("time range node test failed: %v\n%s", err, out)
 	}
@@ -665,7 +739,7 @@ process.stdout.write(JSON.stringify({
 // 少了一个开关而 Go 测试全绿，只有人肉点开配置页才会发现。这里把"表单字段 ↔
 // CFG_MAP"与"关键热改键必须在表单里"两条都钉住。
 func TestConfigFormMatchesCFGMap(t *testing.T) {
-	src, err := os.ReadFile("app.js")
+	src, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,7 +837,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("detail groups node test failed: %v\n%s", err, out)
 	}
@@ -815,7 +889,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry summary node test failed: %v\n%s", err, out)
 	}
@@ -875,7 +949,7 @@ process.stdout.write(JSON.stringify([
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
 	}
@@ -939,7 +1013,7 @@ process.stdout.write(JSON.stringify(names));`
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
 	}
@@ -1021,7 +1095,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
 	}
@@ -1113,7 +1187,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry parity node test failed: %v\n%s", err, out)
 	}
@@ -1173,7 +1247,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry note node test failed: %v\n%s", err, out)
 	}
@@ -1265,7 +1339,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("chart tooltip node test failed: %v\n%s", err, out)
 	}
@@ -1323,7 +1397,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("remark name node test failed: %v\n%s", err, out)
 	}
@@ -1381,7 +1455,7 @@ process.stdout.write(JSON.stringify({fresh: fresh, folded: folded, unfolded: unf
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	out, err := exec.Command(node, f.Name(), feAppFile(t)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("expiry fold node test failed: %v\n%s", err, out)
 	}
@@ -1409,7 +1483,7 @@ func TestPanelRemarkAndFoldWiring(t *testing.T) {
 			t.Fatalf("index.html 的过期列表容器默认带 hidden：%s", strings.TrimSpace(line))
 		}
 	}
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1465,7 +1539,7 @@ func TestRegionSchedulingFormRoundTrip(t *testing.T) {
 	if err = os.WriteFile(fp, []byte(script), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command(node, fp, "app.js").CombinedOutput(); err != nil {
+	if out, err := exec.Command(node, fp, feAppFile(t)).CombinedOutput(); err != nil {
 		t.Fatalf("form round trip: %v\n%s", err, out)
 	}
 }
@@ -1547,8 +1621,8 @@ func feNode(t *testing.T, script string, files ...string) string {
 	if err != nil {
 		t.Skip("node not installed; frontend slice test skipped")
 	}
-	target := "app.js"
-	if len(files) > 0 && files[0] != "" {
+	target := feAppFile(t)
+	if len(files) > 0 && files[0] != "" && files[0] != "app.js" {
 		target = files[0]
 	}
 	fp := filepath.Join(t.TempDir(), "fe-slice.cjs")
@@ -1576,7 +1650,13 @@ func TestAppJSCompensationRemoved(t *testing.T) {
 		"官方补偿", "领取补偿", "compensation",
 	}
 	for _, name := range []string{"app.js", "index.html", "mobile.js", "mobile.css"} {
-		data, err := os.ReadFile(name)
+		var data []byte
+		var err error
+		if name == "app.js" {
+			data, err = appJSReadFile()
+		} else {
+			data, err = os.ReadFile(name)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1936,7 +2016,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("做任务按钮渲染=%s\nwant %s", got, want)
 	}
 	// 接口路径与「执行中」文案在源码里（行为测试已覆盖渲染；路径改名会让按钮静默 404）。
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1998,7 +2078,7 @@ func TestPanelPaginationWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2572,7 +2652,7 @@ func TestPanelConfigNewControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2651,7 +2731,7 @@ func TestPanelConfigNewControls(t *testing.T) {
 //   - visibilitychange 已注册；401 走 onAuthRequired（不直接 openKey 抢焦点）；
 //   - 页面隐藏/401/退避的判断都在 scheduleNextPoll 里。
 func TestPanelPollingWiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3201,7 +3281,7 @@ const accCount = () => calls.filter(u => u.indexOf('/panel/api/accounts?') >= 0)
 // 主链路没接上」）：账号视图轮询必须走 refreshAccountsView、全量 overview 只能从
 // ensureFullOverview/loadOverview 进、列表 tab 不拉全量、旧的全量渲染断言已移除。
 func TestPanelAccountsServerPagingWiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3544,7 +3624,7 @@ const R = ctx.__r;
 // 账号集合变更分支统一走 refreshAccountPoolAfterMutation（会补拉全量 overview）、
 // page_size=0 截断提示元素已接入。
 func TestPanelAuditTaskRunsWiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4016,7 +4096,7 @@ const row = (uid, note, tags, legacy) => ({
 // TestPanelJobMetaWiring v2.3.0 #10/#12/#20 的前端接线（源码级）：
 // Job 进度条/取消/批量按钮、备注标签服务端读写与迁移、移动端样式、旧「仅本机」实现移除。
 func TestPanelJobMetaWiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4180,7 +4260,7 @@ const T = ctx.__tag;
 
 // TestPanelTagFilterWiring v2.3.1 标签筛选的源码/HTML/CSS 接线。
 func TestPanelTagFilterWiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4278,10 +4358,17 @@ func TestPanelFrontendCheckScriptFailsClosed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "scripts", "panel_frontend_check.mjs"), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// app.js：合法语法 + 引用不存在的 id + 超过 350KB 预算；mobile.js：解析错误；
-	// index.html：只含一个未被引用的 id（双向契约都要报错）。
+	// web/：00 合法语法 + 引用不存在的 id + 超过 350KB 预算；10 解析错误；
+	// mobile.js：解析错误；index.html：只含一个未被引用的 id（双向契约都要报错）。
+	webDir := filepath.Join(panelDir, "web")
+	if err := os.MkdirAll(webDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	appJs := "function boot(){ $('missingId'); }\nvar pad = '" + strings.Repeat("a", 360*1024) + "';\n"
-	if err := os.WriteFile(filepath.Join(panelDir, "app.js"), []byte(appJs), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(webDir, "00-pad.js"), []byte(appJs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "10-broken.js"), []byte("function broken( {"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(panelDir, "mobile.js"), []byte("function broken( {"), 0o644); err != nil {
@@ -4465,7 +4552,7 @@ const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve()
 // 以「标记不存在」防止后续误把 auth 登录层/角色矩阵带回来；以「标记存在」钉住保留下来的
 // 功能接线（SSE 客户端、rtBadge、标签筛选、Job 进度、备注标签）。
 func TestPanelV241NoMultiUser(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4954,7 +5041,7 @@ process.stdout.write(JSON.stringify(out));`
 
 // TestPanelV260Wiring v2.6.0：修复接线与清理结果（XSS/超时/序号/降频/可访问性/死代码）。
 func TestPanelV260Wiring(t *testing.T) {
-	js, err := os.ReadFile("app.js")
+	js, err := appJSReadFile()
 	if err != nil {
 		t.Fatal(err)
 	}

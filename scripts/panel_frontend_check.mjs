@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * panel_frontend_check.mjs —— 面板前端工程化检查（v2.3.1 #18，零依赖）
+ * panel_frontend_check.mjs —— 面板前端工程化检查（v2.3.1 #18，零依赖；v2.6.1 模块化）
  *
- * 在 CI 里把「Go 编译器看不见的前端契约」提前拦下来：
- *   1) 解析检查：app.js / mobile.js 必须能被 JS 解析器编译（等价 node --check）；
- *   2) DOM id 契约：index.html 的 id 与 app.js/mobile.js 里 $('id') 引用交叉检查
+ * v2.6.1 起前端源码拆到 internal/panel/web/*.js，由 Go 端按文件名排序拼接成单个
+ * /panel/app.js 提供给浏览器（无构建步骤、浏览器零变化）。本脚本按同样顺序读取模块、
+ * 拼接后再跑以下检查；解析错误会定位到具体模块文件：
+ *   1) 解析检查：app.js 各模块与 mobile.js 必须能被 JS 解析器编译（等价 node --check）；
+ *   2) DOM id 契约：index.html 的 id 与拼接后 app.js/mobile.js 里 $('id') 引用交叉检查
  *      （缺一侧报错；HTML 侧允许白名单——纯 CSS 锚点、按前缀/变量拼出来的元素等）；
  *   3) API 路径白名单：api()/apiCached() 的字面量路径必须命中已知前缀；不允许在
  *      前端硬编码完整 /panel/api/xxx 路径、绝对 URL 或疑似密钥字面量；
- *   4) 体积预算：app.js < 350KB、mobile.js < 25KB、index.html < 130KB。
+ *   4) 体积预算：拼接后 app.js < 350KB（模块总和）、mobile.js < 25KB、index.html < 130KB。
  *
  * 退出码：0 = 全部通过；1 = 任一检查失败（打印 FAIL 原因与实际值）。
  * 用法：node scripts/panel_frontend_check.mjs
@@ -20,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FILES = {
-  appJs: 'internal/panel/app.js',
+  appDir: 'internal/panel/web',
   mobileJs: 'internal/panel/mobile.js',
   indexHtml: 'internal/panel/index.html',
 };
@@ -119,19 +121,47 @@ function read(rel) {
 }
 function kb(n) { return (n / 1024).toFixed(1) + 'KB'; }
 
+/* readAppModules 读取 internal/panel/web/*.js（按文件名字典序；与 Go 端 go:embed
+   拼接顺序一致），返回 { files: [{name, src}], src: 拼接结果 }。 */
+function readAppModules() {
+  const dir = path.join(ROOT, FILES.appDir);
+  if (!fs.existsSync(dir)) {
+    fail(`缺少前端模块目录：${FILES.appDir}`);
+    return { files: [], src: '' };
+  }
+  const names = fs.readdirSync(dir).filter(n => n.endsWith('.js')).sort();
+  if (!names.length) {
+    fail(`${FILES.appDir} 下没有 *.js 模块`);
+    return { files: [], src: '' };
+  }
+  const files = names.map(name => ({ name, src: fs.readFileSync(path.join(dir, name), 'utf8') }));
+  return { files, src: files.map(f => f.src).join('') };
+}
+
 // ── 读取 ────────────────────────────────────────────────────────────────
-const appJs = read(FILES.appJs);
+const appModules = readAppModules();
+const appJs = appModules.src;
 const mobileJs = read(FILES.mobileJs);
 const indexHtml = read(FILES.indexHtml);
 if (errors.length) { report(); }
 
-// ── 1) 解析检查（等价 node --check）─────────────────────────────────────
-for (const [name, src] of [['app.js', appJs], ['mobile.js', mobileJs]]) {
+// ── 1) 解析检查（等价 node --check）：先逐模块定位错误，再检查拼接结果 ─────
+for (const f of appModules.files) {
   try {
-    new vm.Script(src, { filename: name });
+    new vm.Script(f.src, { filename: f.name });
   } catch (e) {
-    fail(`${name} 解析失败：${e && e.message}`);
+    fail(`${FILES.appDir}/${f.name} 解析失败：${e && e.message}`);
   }
+}
+try {
+  new vm.Script(appJs, { filename: 'app.js' });
+} catch (e) {
+  fail(`app.js 拼接结果解析失败：${e && e.message}`);
+}
+try {
+  new vm.Script(mobileJs, { filename: 'mobile.js' });
+} catch (e) {
+  fail(`mobile.js 解析失败：${e && e.message}`);
 }
 
 // ── 2) DOM id 契约 ──────────────────────────────────────────────────────
@@ -251,11 +281,14 @@ for (const s of scanned.strings) {
   if (m) fail(`前端出现疑似硬编码 API key：${m[0].slice(0, 12)}…（第 ${s.line} 行）`);
 }
 
-// ── 4) 体积预算 ─────────────────────────────────────────────────────────
-for (const [label, rel] of [['app.js', FILES.appJs], ['mobile.js', FILES.mobileJs], ['index.html', FILES.indexHtml]]) {
-  const bytes = Buffer.byteLength(label === 'app.js' ? appJs : label === 'mobile.js' ? mobileJs : indexHtml, 'utf8');
-  if (bytes >= SIZE_BUDGET[label === 'app.js' ? 'appJs' : label === 'mobile.js' ? 'mobileJs' : 'indexHtml']) {
-    fail(`${label} 体积超预算：${kb(bytes)}（上限 ${kb(SIZE_BUDGET[label === 'app.js' ? 'appJs' : label === 'mobile.js' ? 'mobileJs' : 'indexHtml'])}）`);
+// ── 4) 体积预算（app.js = web/*.js 拼接后的实际响应体）────────────────────
+for (const [label, bytes, budget] of [
+  ['app.js', Buffer.byteLength(appJs, 'utf8'), SIZE_BUDGET.appJs],
+  ['mobile.js', Buffer.byteLength(mobileJs, 'utf8'), SIZE_BUDGET.mobileJs],
+  ['index.html', Buffer.byteLength(indexHtml, 'utf8'), SIZE_BUDGET.indexHtml],
+]) {
+  if (bytes >= budget) {
+    fail(`${label} 体积超预算：${kb(bytes)}（上限 ${kb(budget)}）`);
   }
 }
 
@@ -271,5 +304,5 @@ const sizes = {
   mobileJs: Buffer.byteLength(mobileJs, 'utf8'),
   indexHtml: Buffer.byteLength(indexHtml, 'utf8'),
 };
-console.log(`panel frontend check: OK (app.js=${kb(sizes.appJs)}, mobile.js=${kb(sizes.mobileJs)}, index.html=${kb(sizes.indexHtml)})`);
+console.log(`panel frontend check: OK (app.js=${kb(sizes.appJs)} [${appModules.files.length} modules], mobile.js=${kb(sizes.mobileJs)}, index.html=${kb(sizes.indexHtml)})`);
 process.exit(0);
